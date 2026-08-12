@@ -1,0 +1,3 @@
+# Minimal sandbox profile: core runtime only.
+# Add DB and optional profiles only when needed.
+-r requirements-core.txt

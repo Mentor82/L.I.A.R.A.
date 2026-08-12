@@ -1,0 +1,24 @@
+# ninja log v6
+151	10305	8078418427593626	CMakeFiles/LiaraEmbeddingService.dir/embedding_server.cpp.obj	3b82dbc3e8001437
+192	9005	8078418427995148	CMakeFiles/LiaraEmbeddingService.dir/embedding_linep.cpp.obj	cea553928c493d6d
+141	3638	8078418427489276	linep/src/scheduler/CMakeFiles/linep_scheduler.dir/scheduler.cpp.obj	21fdb434e95b3864
+173	7305	8078418427822832	CMakeFiles/LiaraEmbeddingService.dir/embedding_engine.cpp.obj	28232f554f7ea7c4
+130	1990	8078418427381473	linep/src/scheduler/CMakeFiles/linep_scheduler.dir/score_engine.cpp.obj	9e0ff4b558b1e4de
+118	2522	8078418427282931	linep/src/tcp/CMakeFiles/linep_tcp.dir/tcp.cpp.obj	227a4e627f8c5e63
+98	1498	8078418427075546	linep/src/udp/CMakeFiles/linep_udp.dir/heartbeat.cpp.obj	b90df29f78671723
+54	896	8078418426635092	linep/src/pal/CMakeFiles/linep_pal.dir/socket_win.cpp.obj	a59eeb9669fae1e5
+182	2814	8078418427914495	CMakeFiles/LiaraEmbeddingService.dir/embedding_config.cpp.obj	368889679aa08685
+75	361	8078418426848965	linep/src/core/CMakeFiles/linep_core.dir/crc.cpp.obj	bf7b3fadf2b1b62d
+65	856	8078418426721371	linep/src/pal/CMakeFiles/linep_pal.dir/clock_win.cpp.obj	760782f38d04e54f
+108	280	8078418427173787	linep/src/tcp/CMakeFiles/linep_tcp.dir/tcp_stub.cpp.obj	44d92f07cd852f6
+125	249	8078418828455787	linep/src/tcp/CMakeFiles/linep_tcp.dir/tcp_stub.cpp.obj	3dce865feb0deace
+88	283	8078418828090642	linep/src/core/CMakeFiles/linep_core.dir/crc.cpp.obj	2b73b1669ec5af52
+99	305	8078418828198062	linep/src/core/CMakeFiles/linep_core.dir/framing.cpp.obj	8548323dea650c7c
+79	658	8078418827994470	linep/src/pal/CMakeFiles/linep_pal.dir/clock_win.cpp.obj	1f703594e88ece9
+67	717	8078418827879052	linep/src/pal/CMakeFiles/linep_pal.dir/socket_win.cpp.obj	a337fa94158e2c63
+112	1144	8078418828331397	linep/src/udp/CMakeFiles/linep_udp.dir/heartbeat.cpp.obj	dabde13f4c73946a
+144	1560	8078418828638845	linep/src/scheduler/CMakeFiles/linep_scheduler.dir/score_engine.cpp.obj	fd3c526c6d4bbd65
+135	1884	8078418828547895	linep/src/tcp/CMakeFiles/linep_tcp.dir/tcp.cpp.obj	42d70856021be2d8
+154	2740	8078418828752203	linep/src/scheduler/CMakeFiles/linep_scheduler.dir/scheduler.cpp.obj	4125b27df42af86
+2741	2905	8078418854581301	linep/linep.lib	d9022e0ee21a63a
+2905	3304	8078418856248056	LiaraEmbeddingService.exe	e3d6f02f8eac5053

@@ -1,0 +1,24 @@
+[server]
+host = "127.0.0.1"
+port = 8030
+
+[model]
+path = "C:/ai/models/OpenVINO/Qwen3-Embedding-0.6B-fp16-ov"
+device = "NPU"
+max_seq_len = 512
+dims = 1024
+normalize_default = true
+
+[runtime]
+cache_dir = "C:/ai/cache/openvino"
+startup_probe = true
+allow_cpu_fallback = true
+
+[linep]
+enabled = true
+heartbeat_host = "127.0.0.1"
+heartbeat_port = 8768
+tcp_port = 8767
+heartbeat_interval_ms = 1000
+worker_id = 30
+slot_id = 0

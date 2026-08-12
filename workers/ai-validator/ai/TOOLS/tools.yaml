@@ -1,0 +1,62 @@
+# tools.yaml
+# Registry of available tools for Codex + Copilot usage.
+
+version: 0.1
+source_of_truth: ai/TOOLS/registry.md
+naming_policy: ai/POLICY/AI-POLICY.md
+tool_contract: ai/TOOLS/contracts/tool-contract.md
+
+tools:
+  - name: run_unit_tests
+    version: 1.0.0
+    status: active
+    owner: testing-infrastructure
+    contract: ai/TOOLS/contracts/run_unit_tests.md
+    permissions: [read, execute]
+    notes: "Execute comprehensive MCP client unit test suite"
+
+  - name: code_quality_check
+    version: 1.0.0
+    status: active
+    owner: testing-infrastructure
+    contract: ai/TOOLS/contracts/code_quality_check.md
+    permissions: [read]
+    notes: "Static code analysis for PEP 8, complexity, docstrings"
+
+  - name: validation_dashboard
+    version: 1.0.0
+    status: active
+    owner: testing-infrastructure
+    contract: ai/TOOLS/contracts/validation_dashboard.md
+    permissions: [read]
+    notes: "Full validation dashboard with all test metrics"
+
+  - name: quick_test_runner
+    version: 1.0.0
+    status: active
+    owner: testing-infrastructure
+    contract: ai/TOOLS/contracts/quick_test_runner.md
+    permissions: [read, execute]
+    notes: "Quick test runner for rapid validation (30 sec)"
+
+  - name: generate_test_report
+    version: 1.0.0
+    status: active
+    owner: testing-infrastructure
+    contract: ai/TOOLS/contracts/generate_test_report.md
+    permissions: [read]
+    notes: "Generate comprehensive testing and validation report"
+  - name: ai_validator
+    version: 1.0.0
+    status: active
+    owner: ai-agent-system
+    type: docker-container
+    image: lab-web/ai-validator:latest
+    dockerfile: Dockerfile.ai-validator
+    contract: ai/TOOLS/contracts/ai_validator_container.md
+    permissions: [read, execute, write_reports]
+    entrypoint: scripts/ai-validator-entrypoint.sh
+    notes: "Isolated container for AI-driven code validation and testing"
+    labels:
+      - use_for_ai: "true"
+      - policy: "ai/POLICY/SECURITY.md"

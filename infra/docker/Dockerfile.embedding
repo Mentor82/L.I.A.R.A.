@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# libgomp1 is required by OpenVINO runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only essentials first (for better layer caching)
+# requirements.txt references other requirement files that must be present
+COPY requirements-core.txt requirements-db.txt requirements-optional.txt requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    "uvicorn[standard]" \
+    "transformers>=4.40" \
+    "optimum[openvino]"
+
+# Copy only necessary source code (services/ and shared/)
+COPY services/ services/
+COPY shared/ shared/
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8030
+
+CMD ["python", "-m", "uvicorn", "services.embedding.app:create_embedding_service_app", "--factory", "--host", "0.0.0.0", "--port", "8030"]

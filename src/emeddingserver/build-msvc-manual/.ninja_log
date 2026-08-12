@@ -1,0 +1,23 @@
+# ninja log v6
+37	133	7994192366284688	linep/src/tcp/CMakeFiles/linep_tcp.dir/tcp_stub.cpp.obj	e590afdb89eb3b1f
+24	153	7994192366151577	linep/src/core/CMakeFiles/linep_core.dir/crc.cpp.obj	f8b2f2a8741a7c03
+27	155	7994192366151577	linep/src/core/CMakeFiles/linep_core.dir/framing.cpp.obj	a98a27a135e269e6
+21	316	7994192366110295	linep/src/pal/CMakeFiles/linep_pal.dir/clock_win.cpp.obj	acbfefdb984b7f2a
+16	338	7994192366075261	linep/src/pal/CMakeFiles/linep_pal.dir/socket_win.cpp.obj	e237b520f96884db
+30	501	7994192366211469	linep/src/udp/CMakeFiles/linep_udp.dir/heartbeat.cpp.obj	583bc2e28e007dbd
+44	676	7994192366354714	linep/src/scheduler/CMakeFiles/linep_scheduler.dir/score_engine.cpp.obj	eb9ff24a1c8d401
+41	837	7994192366314701	linep/src/tcp/CMakeFiles/linep_tcp.dir/tcp.cpp.obj	8fabc74b607f3555
+59	986	7994192366494095	CMakeFiles/LiaraEmbeddingService.dir/embedding_config.cpp.obj	2cc91ce1fca60d0e
+48	1149	7994192366384699	linep/src/scheduler/CMakeFiles/linep_scheduler.dir/scheduler.cpp.obj	9b9e884ebed0c94d
+1149	1195	7994192377407946	linep/linep.lib	47ac52b09172ce6a
+62	2449	7994192366534087	CMakeFiles/LiaraEmbeddingService.dir/embedding_linep.cpp.obj	44871c6ba808e7ae
+56	2495	7994192366464023	CMakeFiles/LiaraEmbeddingService.dir/embedding_engine.cpp.obj	3144dc9ec6d7487b
+52	3081	7994192366431110	CMakeFiles/LiaraEmbeddingService.dir/embedding_server.cpp.obj	d86e21abc21ba888
+3081	3208	7994192396723907	LiaraEmbeddingService.exe	6bd75dfbbfa5d4be
+4	1798	7994193982415334	CMakeFiles/LiaraEmbeddingService.dir/embedding_engine.cpp.obj	3144dc9ec6d7487b
+1799	1935	7994194000359610	LiaraEmbeddingService.exe	6bd75dfbbfa5d4be
+20	975	7994307264641318	CMakeFiles/LiaraEmbeddingService.dir/embedding_config.cpp.obj	2cc91ce1fca60d0e
+11	2394	7994307264562201	CMakeFiles/LiaraEmbeddingService.dir/embedding_engine.cpp.obj	3144dc9ec6d7487b
+27	2784	7994307264701399	CMakeFiles/LiaraEmbeddingService.dir/embedding_linep.cpp.obj	44871c6ba808e7ae
+5	3006	7994307264424963	CMakeFiles/LiaraEmbeddingService.dir/embedding_server.cpp.obj	d86e21abc21ba888
+3011	3193	7994307294526822	LiaraEmbeddingService.exe	6bd75dfbbfa5d4be

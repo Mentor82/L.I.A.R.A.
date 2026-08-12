@@ -1,0 +1,7 @@
+# Database and vector/graph clients (feature-gated).
+# Keep this out of minimal sandbox installs unless memory backends are required.
+psycopg2-binary>=2.9,<3.0
+redis>=5.0,<8.0
+qdrant-client>=1.17.1,<2.0
+neo4j>=5.14,<7.0
+chromadb==1.5.7

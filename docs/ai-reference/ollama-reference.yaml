@@ -1,0 +1,112 @@
+version: 1
+provider: ollama
+scope: liara-inference-provider
+status: active
+purpose:
+  - local llm inference via Ollama HTTP API
+  - normalized telemetry for orchestrator response envelope
+source_of_truth:
+  - path: services/inference/providers/ollama.py
+  - path: services/config/settings.py
+runtime:
+  transport: http
+  endpoint_template: http://{host}:{port}/api/generate
+  default_host: 127.0.0.1
+  default_port: 11434
+  request_timeout_seconds: 120
+configuration:
+  required_env:
+    - OLLAMA_HOST
+    - OLLAMA_PORT
+    - OLLAMA_MODEL
+  defaults:
+    OLLAMA_HOST: "127.0.0.1"
+    OLLAMA_PORT: 11434
+    OLLAMA_MODEL: qwen2.5:3b
+api_contract:
+  request_payload:
+    model: string
+    prompt: string
+    stream: false
+    options:
+      temperature: float
+      num_predict: int
+  response_fields_used:
+    - response
+    - total_duration
+    - prompt_eval_duration
+    - load_duration
+function_map:
+  class: OllamaProvider
+  methods:
+    - name: __init__
+      signature: __init__(host: str, port: int, model: str)
+      responsibility: store endpoint and default model
+    - name: infer
+      signature: infer(request: InferenceRequest) -> InferenceResult
+      responsibility:
+        - select model from request.model or provider default
+        - call Ollama generate endpoint
+        - map provider response to normalized InferenceResult
+telemetry_mapping:
+  gen_ms:
+    source: total_duration
+    transform: ns_to_ms
+    fallback: wall_clock_elapsed_ms
+  ttft_ms:
+    source: prompt_eval_duration
+    transform: ns_to_ms
+  load_ms:
+    source: load_duration
+    transform: ns_to_ms
+  stop_reason_on_success: stop
+  stop_reason_on_error: error
+failure_modes:
+  - name: network_or_http_error
+    behavior:
+      status: failed
+      error: exception_text
+      content: ""
+      provider: ollama
+      stop_reason: error
+  - name: invalid_json_or_schema_drift
+    behavior:
+      status: failed
+      error: exception_text
+      content: ""
+optimization_levers:
+  latency:
+    - keep model warm in Ollama daemon to reduce load_duration
+    - choose smaller model variants for lower total_duration
+    - reduce max_tokens (mapped to options.num_predict)
+  quality:
+    - tune temperature per task type
+    - override model per request for domain-specific prompts
+  reliability:
+    - validate endpoint reachability before high-volume runs
+    - monitor exception rate and failed responses in orchestrator logs
+recommended_profiles:
+  - name: fast_interactive
+    request:
+      temperature: 0.2
+      max_tokens: 256
+    intent: low latency chat and command guidance
+  - name: balanced_general
+    request:
+      temperature: 0.7
+      max_tokens: 1024
+    intent: default assistant responses
+  - name: deep_reasoning
+    request:
+      temperature: 0.5
+      max_tokens: 2048
+    intent: longer technical answers and planning
+integration_notes:
+  - provider is selected by inference gateway based on requested/default provider
+  - output is normalized into shared InferenceResult contract
+  - in hybrid mode, Ollama can be fallback winner if OpenVINO path is unavailable
+observability_checklist:
+  - verify host:port connectivity
+  - verify configured model is installed in Ollama
+  - compare total_duration vs wall clock to detect transport overhead
+  - track failed provider count in hybrid metadata

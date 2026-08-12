@@ -1,0 +1,8 @@
+# Everything EXCEPT services/ and shared/
+**
+
+# Whitelist only what's needed
+!services/
+!shared/
+!requirements*.txt
+!infra/docker/Dockerfile.embedding

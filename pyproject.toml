@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liara"
+version = "0.1.0"
+description = "LLM Infrastructure for Reasoning Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "AI Team", email = "ai@example.com"},
+]
+keywords = ["llm", "reasoning", "agents", "inference"]
+
+dependencies = [
+    "fastapi==0.135.3",
+    "python-multipart>=0.0.9,<1.0",
+    "pydantic>=2.0,<3.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "httpx>=0.28.1,<0.29",
+    "python-dotenv>=1.0,<2.0",
+    "rich>=13.0.0",
+    "typer>=0.12,<1.0",
+    "loguru>=0.7,<1.0",
+    "requests>=2.32,<3.0",
+    "orjson>=3.10,<4.0",
+    "msgspec>=0.19,<1.0",
+    "pyyaml>=6.0,<7.0",
+    "ddgs>=9.0.0",
+    "psutil>=6.0,<8.0",
+]
+
+[project.scripts]
+liara-cli = "services.cli.main:main"
+
+[project.optional-dependencies]
+sandbox = []
+core = []
+db = [
+    "redis==7.4.0",
+    "psycopg2-binary>=2.9,<3.0",
+    "qdrant-client>=1.17.1,<2.0",
+    "neo4j==6.1.0",
+    "chromadb>=0.5,<1.0",
+]
+optional = [
+    "tenacity>=8.2,<10.0",
+    "numpy>=1.26,<3.0",
+    "pillow>=10.0,<12.0",
+    "ollama==0.6.1",
+    "openvino==2026.1.0",
+]
+# Backward-compatible alias names.
+memory = [
+    "redis==7.4.0",
+    "psycopg2-binary>=2.9,<3.0",
+    "qdrant-client>=1.17.1,<2.0",
+    "neo4j==6.1.0",
+    "chromadb>=0.5,<1.0",
+]
+inference = [
+    "ollama==0.6.1",
+    "openvino==2026.1.0",
+]
+speech = [
+    "imageio-ffmpeg==0.6.0",
+]
+dev = ["pytest==9.0.3", "pytest-asyncio==1.3.0", "black>=24.0,<26.0", "mypy>=1.10,<2.0", "python-multipart>=0.0.9,<1.0"]
+all = [
+    "redis==7.4.0",
+    "psycopg2-binary>=2.9,<3.0",
+    "qdrant-client>=1.17.1,<2.0",
+    "neo4j==6.1.0",
+    "chromadb>=0.5,<1.0",
+    "tenacity>=8.2,<10.0",
+    "numpy>=1.26,<3.0",
+    "pillow>=10.0,<12.0",
+    "ollama==0.6.1",
+    "openvino==2026.1.0",
+    "imageio-ffmpeg==0.6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["services*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "artifacts",
+    "backups",
+    "build",
+    "dist",
+    "logs",
+    "scripts",
+    "src",
+    "work",
+]
+markers = [
+    "live_regression: live end-to-end safety regression tests (require RUN_LIVE_REGRESSION=1)",
+    "live: live integration tests that require running services",
+]

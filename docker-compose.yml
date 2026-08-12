@@ -1,0 +1,233 @@
+name: liara
+
+services:
+  liara-postgres:
+    image: postgres:16-alpine
+    container_name: liara-postgres
+    environment:
+      POSTGRES_USER: liara
+      POSTGRES_PASSWORD: liara2026
+      POSTGRES_DB: liara_memory
+    ports:
+      - "5433:5432"
+    volumes:
+      - liara_postgres_data:/var/lib/postgresql/data
+    networks:
+      - liara_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liara -d liara_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  liara-redis:
+    image: redis:7-alpine
+    container_name: liara-redis
+    command: redis-server --requirepass liara2026
+    ports:
+      - "6380:6379"
+    volumes:
+      - liara_redis_data:/data
+    networks:
+      - liara_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "liara2026", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  liara-qdrant:
+    image: qdrant/qdrant:latest
+    container_name: liara-qdrant
+    ports:
+      - "6335:6333"
+      - "6336:6334"
+    volumes:
+      - liara_qdrant_data:/qdrant/storage
+    networks:
+      - liara_network
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  liara-neo4j:
+    image: neo4j:5-community
+    container_name: liara-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/liara2026
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7688:7687"
+      - "7475:7474"
+    volumes:
+      - liara_neo4j_data:/data
+      - liara_neo4j_logs:/logs
+    networks:
+      - liara_network
+    healthcheck:
+      # Container readiness stays lightweight; Memory performs the authenticated
+      # semantic graph query in its backend health contract.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  liara-chroma:
+    image: chromadb/chroma:latest
+    container_name: liara-chroma
+    ports:
+      - "8001:8000"
+    volumes:
+      - liara_chroma_data:/chroma/chroma
+    networks:
+      - liara_network
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/localhost/8000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  liara-memory:
+    profiles:
+      - legacy-docker-app
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.memory
+    container_name: liara-memory
+    environment:
+      POSTGRES_URL: postgresql://liara:liara2026@liara-postgres:5432/liara_memory
+      REDIS_URL: redis://:liara2026@liara-redis:6379/0
+      QDRANT_URL: http://liara-qdrant:6333
+      QDRANT_COLLECTION: liara_retrieval
+      QDRANT_VECTOR_SIZE: "1024"
+      EMBEDDING_SERVICE_BASE_URL: http://host.docker.internal:8030
+      EMBEDDING_SERVICE_TIMEOUT_SECONDS: "10"
+    ports:
+      - "8020:8020"
+    networks:
+      - liara_network
+    depends_on:
+      liara-postgres:
+        condition: service_healthy
+      liara-redis:
+        condition: service_healthy
+      liara-qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8020/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  liara-api:
+    profiles:
+      - legacy-docker-app
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: liara-api
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8010"
+      MEMORY_MODE: service
+      MEMORY_SERVICE_BASE_URL: http://liara-memory:8020
+      MEMORY_SERVICE_TIMEOUT_SECONDS: "10"
+      REDIS_URL: redis://:liara2026@liara-redis:6379/0
+      OLLAMA_HOST: host.docker.internal
+      OLLAMA_PORT: "11434"
+      DEFAULT_LLM_PROVIDER: hybrid
+    ports:
+      - "8010:8010"
+    networks:
+      - liara_network
+    depends_on:
+      liara-memory:
+        condition: service_healthy
+      liara-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  liara-validator:
+    build:
+      context: ./workers/ai-validator
+      dockerfile: Dockerfile.ai-validator
+    container_name: liara-validator
+    image: lab-web/ai-validator:latest
+    environment:
+      # Workspace configuration - mounted from host
+      WORKSPACE: /workspace
+      REPORT_DIR: /reports
+      STRICT_MODE: "false"
+      
+      # Python/Node environment
+      PYTHONUNBUFFERED: 1
+      PYTHONDONTWRITEBYTECODE: 1
+      NODE_ENV: production
+      
+      # LIARA integration
+      LIARA_VALIDATOR_ASYNC: "1"
+      LIARA_VALIDATOR_EXECUTION_MODE: worker
+    
+    # Volumes: workspace (read-only) + reports (persistent)
+    volumes:
+      - .:/workspace:ro
+      - liara_validator_reports:/reports
+    
+    networks:
+      - liara_network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    
+    restart: "no"
+    
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=liara-validator"
+
+networks:
+  liara_network:
+    name: liara_network
+    driver: bridge
+
+volumes:
+  liara_postgres_data:
+    name: liara_postgres_data
+  liara_redis_data:
+    name: liara_redis_data
+  liara_qdrant_data:
+    name: liara_qdrant_data
+  liara_neo4j_data:
+    name: liara_neo4j_data
+  liara_neo4j_logs:
+    name: liara_neo4j_logs
+  liara_chroma_data:
+    name: liara_chroma_data
+  liara_validator_reports:
+    name: liara_validator_reports

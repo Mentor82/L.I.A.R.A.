@@ -1,0 +1,128 @@
+version: 1
+provider: openvino
+scope:
+  - liara-inference-provider
+  - liara-embedding-engine
+status: active
+purpose:
+  - local low-latency inference via openvino_genai LLMPipeline
+  - embedding generation via Optimum Intel OpenVINO feature extraction
+source_of_truth:
+  - path: services/inference/providers/openvino.py
+  - path: services/embedding/engine.py
+  - path: services/config/settings.py
+runtime:
+  inference_backend: openvino_genai.LLMPipeline
+  embedding_backend: optimum.intel.openvino.OVModelForFeatureExtraction
+  default_device: CPU
+configuration:
+  required_env_for_inference:
+    - OPENVINO_GENAI_MODEL_DIR
+    - OPENVINO_GENAI_DEVICE
+  required_env_for_embeddings:
+    - EMBEDDING_MODEL_ID
+    - EMBEDDING_MODEL_DIR
+    - EMBEDDING_DEVICE
+  defaults:
+    OPENVINO_GENAI_MODEL_DIR: ""
+    OPENVINO_GENAI_DEVICE: CPU
+    EMBEDDING_MODEL_ID: OpenVINO/Qwen3-Embedding-0.6B-fp16-ov
+function_map:
+  inference_provider:
+    class: OpenVINOProvider
+    methods:
+      - name: __init__
+        signature: __init__(model_dir: str | None, device: str, model_fallback: str = openvino-default)
+        responsibility: store runtime model path and target device
+      - name: infer
+        signature: infer(request: InferenceRequest) -> InferenceResult
+        responsibility:
+          - fail fast if model_dir is missing
+          - construct LLMPipeline(model_dir, device)
+          - run generate(prompt, max_new_tokens)
+          - map timings to normalized response envelope
+  embedding_engine:
+    class: OpenVINOEmbeddingEngine
+    methods:
+      - name: load
+        responsibility:
+          - eager-load tokenizer and model at startup
+          - prefer OpenVINO backend
+          - optionally degrade to transformers fallback
+      - name: embed
+        responsibility:
+          - tokenize with truncation max_length=512
+          - mean-pool hidden states with attention mask
+          - optional L2 normalization
+timing_semantics:
+  inference_load_ms:
+    definition: pipeline construction time before generate call
+  inference_gen_ms:
+    definition: generation duration after pipeline is ready
+  inference_ttft_ms:
+    current_mapping: equal_to_gen_ms
+    note: placeholder approximation in current provider
+failure_modes:
+  - name: missing_model_dir
+    behavior:
+      status: failed
+      error: OPENVINO model directory not configured
+      stop_reason: error
+  - name: missing_runtime_package
+    behavior:
+      status: failed
+      error: openvino_genai not installed
+      stop_reason: error
+  - name: runtime_generation_exception
+    behavior:
+      status: failed
+      error: exception_text
+      stop_reason: error
+embedding_fallback_strategy:
+  allow_fallback: configurable via EmbeddingEngineConfig.allow_fallback
+  fallback_backend: transformers AutoModel + AutoTokenizer
+  fallback_model_id_default: Qwen/Qwen3-Embedding-0.6B
+  fallback_device_default: cpu
+  degraded_flag: true when fallback path is active
+optimization_levers:
+  inference:
+    - keep model_dir on fast local storage to reduce pipeline load time
+    - choose suitable OPENVINO_GENAI_DEVICE (CPU/GPU/NPU) per hardware
+    - reuse warm process workers to avoid repeated pipeline creation overhead
+    - cap max_tokens for lower latency under interactive workloads
+  embeddings:
+    - preload engine once at startup and avoid lazy loading per request
+    - keep normalize=true for cosine-similarity retrieval consistency
+    - enforce short input chunks to limit tokenization and pooling cost
+  reliability:
+    - activate fallback only where degraded quality is acceptable
+    - surface degraded/load_error signals in health or diagnostics endpoints
+recommended_profiles:
+  - name: openvino_cpu_stable
+    inference:
+      device: CPU
+      max_tokens: 512
+    embeddings:
+      normalize: true
+    intent: predictable production baseline
+  - name: openvino_low_latency
+    inference:
+      device: NPU
+      max_tokens: 256
+    embeddings:
+      normalize: true
+    intent: low-latency interactive responses
+  - name: resilient_fallback
+    embedding_engine:
+      allow_fallback: true
+      fallback_device: cpu
+    intent: prefer availability over strict backend purity
+integration_notes:
+  - OpenVINO provider participates in the same InferenceResult normalization as Ollama
+  - hybrid invocation can fail over to Ollama when OpenVINO is misconfigured
+  - embedding worker and embedding service share the same OpenVINO-first design pattern
+observability_checklist:
+  - verify OPENVINO_GENAI_MODEL_DIR exists and is readable
+  - verify openvino_genai package importability
+  - track load_ms spikes (cold start or storage bottlenecks)
+  - track degraded flag and load_error for embedding runtime

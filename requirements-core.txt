@@ -1,0 +1,22 @@
+# Core baseline for CLI/API runtime and serialization.
+fastapi==0.136.0
+python-multipart>=0.0.9,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx>=0.28.1,<0.29
+pydantic>=2.0,<3.0
+python-dotenv>=1.0,<2.0
+rich>=13.0.0
+typer>=0.12,<1.0
+loguru>=0.7,<1.0
+requests>=2.32,<3.0
+
+# NLP / language detection (no hardcoded word lists).
+langdetect>=1.0.9
+stop-words>=2018.7.23
+
+# Data and serialization helpers.
+orjson>=3.10,<4.0
+msgspec>=0.19,<1.0
+pyyaml>=6.0,<7.0
+ddgs>=9.0.0
+psutil>=6.0,<8.0

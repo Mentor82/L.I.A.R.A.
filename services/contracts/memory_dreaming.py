@@ -1,0 +1,221 @@
+"""Staging and dreaming contracts for memory lifecycle workflows.
+
+This module keeps staging/dreaming schemas decoupled from API/store
+implementations so runtime wiring can evolve independently.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from .memory_lifecycle import (
+    MemoryEvidence,
+    MemoryLifecycleStatus,
+    MemoryPromotionActor,
+    TrustedPromotionException,
+)
+from .service_boundaries import MemoryServiceStatus
+
+
+class MemoryStagingRecord(BaseModel):
+    """One staged memory item pending consolidation/promotion."""
+
+    staging_id: str
+    session_id: str
+    run_id: str | None = None
+    user_id: str | None = None
+    content: str
+    source: str | None = None
+    status: MemoryLifecycleStatus = MemoryLifecycleStatus.staged
+    created_at: str
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
+    access_count: int = Field(default=0, ge=0)
+    ttl_seconds: int | None = Field(default=None, ge=1)
+    source_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryStagingStageRequest(BaseModel):
+    """Create one staged item from short-term/session context."""
+
+    session_id: str
+    content: str
+    run_id: str | None = None
+    user_id: str | None = None
+    source: str | None = None
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
+    access_count: int = Field(default=0, ge=0)
+    ttl_seconds: int | None = Field(default=None, ge=1)
+    source_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryStagingListRequest(BaseModel):
+    """List staged items for a session (or globally in admin mode)."""
+
+    session_id: str | None = None
+    status: MemoryLifecycleStatus | None = MemoryLifecycleStatus.staged
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+class MemoryStagingTouchRequest(BaseModel):
+    """Explicitly mark staged items as recalled/used for consolidation scoring."""
+
+    session_id: str
+    staging_ids: list[str] = Field(default_factory=list)
+    access_increment: int = Field(default=1, ge=1, le=100)
+    touch_reason: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryStagingDiscardRequest(BaseModel):
+    """Discard staged items with an explicit reason for auditability."""
+
+    session_id: str
+    staging_ids: list[str] = Field(default_factory=list)
+    discard_reason: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryStagingResponse(BaseModel):
+    """Response envelope for staging endpoints."""
+
+    items: list[MemoryStagingRecord] = Field(default_factory=list)
+    status: MemoryServiceStatus
+
+
+class MemoryDreamingProposalRecord(BaseModel):
+    """Promotion proposal produced by a dreaming/consolidation run."""
+
+    proposal_id: str
+    session_id: str
+    staging_id: str | None = None
+    target_namespace: str
+    target_key: str
+    proposed_value: Any
+    proposed_status: MemoryLifecycleStatus = MemoryLifecycleStatus.candidate
+    promotion_reason: str
+    evidence: list[MemoryEvidence] = Field(default_factory=list)
+    decision: Literal["pending", "approved", "rejected"] = "pending"
+    created_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryDreamingRunRequest(BaseModel):
+    """Manual/ops-triggered dreaming run request."""
+
+    session_id: str | None = None
+    trigger: Literal["manual", "ops", "scheduled"] = "manual"
+    max_items: int = Field(default=25, ge=1, le=500)
+    dry_run: bool = False
+    include_session_summary: bool = False
+    summary_max_messages: int = Field(default=50, ge=1, le=500)
+    summary_max_chars: int = Field(default=1400, ge=200, le=10000)
+    include_relation_evidence: bool = False
+    relation_limit: int = Field(default=25, ge=1, le=50)
+    include_quality_signals: bool = False
+    require_assurance_for_approval: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryDreamingRunResponse(BaseModel):
+    """Result envelope for one dreaming run."""
+
+    run_id: str
+    trigger: Literal["manual", "ops", "scheduled"]
+    proposals: list[MemoryDreamingProposalRecord] = Field(default_factory=list)
+    status: MemoryServiceStatus
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryDreamingStatusResponse(BaseModel):
+    """Operational status for dreaming subsystem."""
+
+    scheduler_enabled: bool = False
+    mode: Literal["manual_only", "scheduled"] = "manual_only"
+    last_run_id: str | None = None
+    last_run_at: str | None = None
+    last_run_state: Literal["idle", "running", "completed", "failed"] = "idle"
+    pending_staged_items: int = 0
+    pending_proposals: int = 0
+    status: MemoryServiceStatus
+
+
+class MemoryDreamingProposalListRequest(BaseModel):
+    """Query proposals generated by dreaming runs."""
+
+    session_id: str | None = None
+    decision: Literal["pending", "approved", "rejected", "all"] = "all"
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+class MemoryDreamingProposalListResponse(BaseModel):
+    """Response envelope for proposal listings."""
+
+    items: list[MemoryDreamingProposalRecord] = Field(default_factory=list)
+    status: MemoryServiceStatus
+
+
+class MemoryDreamingProposalDecisionRequest(BaseModel):
+    """Approve or reject a dreaming proposal with explicit policy context."""
+
+    proposal_id: str
+    decision: Literal["approved", "rejected"]
+    decided_by: MemoryPromotionActor = MemoryPromotionActor.human
+    decision_reason: str
+    policy_exception: TrustedPromotionException | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryDreamingProposalDecisionResponse(BaseModel):
+    """Response envelope for proposal decision operations."""
+
+    item: MemoryDreamingProposalRecord | None = None
+    status: MemoryServiceStatus
+
+
+class MemoryDreamingProposalAssuranceRequest(BaseModel):
+    """Bind one proposal-scoped validator result as assurance evidence."""
+
+    proposal_id: str
+    validator_job_id: str
+    assessment_reason: str = Field(min_length=3, max_length=512)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryDreamingProposalAssuranceResponse(BaseModel):
+    """Result of evaluating and attaching proposal assurance evidence."""
+
+    item: MemoryDreamingProposalRecord | None = None
+    validator_job_id: str
+    verdict: Literal["pending", "passed", "attention", "failed"]
+    status: MemoryServiceStatus
+
+
+class MemoryDreamingCleanupRequest(BaseModel):
+    """Preview or apply bounded retention cleanup for Dreaming state."""
+
+    session_id: str | None = None
+    dry_run: bool = True
+    now_ts: float | None = Field(default=None, ge=0.0)
+    rejected_retention_seconds: int = Field(default=2_592_000, ge=3_600, le=31_536_000)
+    staging_limit: int = Field(default=500, ge=1, le=500)
+    proposal_limit: int = Field(default=500, ge=1, le=500)
+    cleanup_reason: str = Field(default="retention policy", min_length=3, max_length=512)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryDreamingCleanupResponse(BaseModel):
+    """Retention cleanup result with explicit candidate/removal counts."""
+
+    dry_run: bool
+    staging_candidates: int = 0
+    proposal_candidates: int = 0
+    staging_removed: int = 0
+    proposals_removed: int = 0
+    staging_ids: list[str] = Field(default_factory=list)
+    proposal_ids: list[str] = Field(default_factory=list)
+    policy: dict[str, Any] = Field(default_factory=dict)
+    status: MemoryServiceStatus

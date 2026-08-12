@@ -1,0 +1,7 @@
+Ein Kondensator C = 1mF ist an eine Wechselspannungsquelle u(t) = 10V⋅sin(2πft) angeschlossen.
+Die Frequenz der Wechselspannung beträgt f = 50Hz. Es fließt der Strom i(t) = 1A⋅π⋅cos(2πft).
+
+- Stellen Sie die zeitlichen Verläufe von u(t), i(t) und der Leistung p(t) (= Produkt aus Spannung und Strom) in einem gemeinsamen Diagramm grafisch dar.
+- Zeichnen die Spannung in blauer, den Strom in roter Farbe. Der Verlauf der Leistung soll in grüner Farbe gestrichelt dargestellt werden.
+- Füge den Titel "Spannung, Strom und Leistung" zum Diagramm hinzu.
+- Füge Achsenbeschriftungen und eine Legende zum Diagramm hinzu.

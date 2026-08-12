@@ -1,0 +1,84 @@
+version: '3.9'
+
+# AI Validator - Polyglot Code Validation Container
+# Purpose: Universal, independent validator for Python, JavaScript, Bash, HTML, PHP, C/C++, YAML/JSON
+# Deployment: Local development, CI/CD, Proxmox Cluster (Homelab), Remote Access
+# Policy: ai/POLICY/SECURITY.md
+
+services:
+  ai-validator:
+    container_name: ai-validator
+    build:
+      context: .
+      dockerfile: Dockerfile.ai-validator
+    image: lab-web/ai-validator:latest
+    
+    # Network configuration for multi-device access
+    networks:
+      - ai-validator-network
+    
+    # Expose API/healthcheck (optional: for remote monitoring)
+    expose:
+      - "9090"  # Reserved for future health check API
+    
+    # Optional: For Homelab/Proxmox deployment - expose to network
+    # ports:
+    #   - "9090:9090"  # Uncomment for network-wide access
+    
+    environment:
+      # Workspace configuration (mount override)
+      WORKSPACE: /workspace
+      REPORT_DIR: /reports
+      STRICT_MODE: "false"
+      
+      # Python/Node environment
+      PYTHONUNBUFFERED: 1
+      PYTHONDONTWRITEBYTECODE: 1
+      NODE_ENV: production
+    
+    # Volume mounts - FLEXIBLE for any workspace
+    volumes:
+      # Primary: mount any workspace to validate (read-only)
+      - ${WORKSPACE_PATH:-.}:/workspace:ro
+      
+      # Reports output (persistent volume, separate from workspace)
+      - ai-validator-reports:/reports
+    
+    # Resource limits (for cluster deployment - requires Swarm or Compose v3.8+)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    
+    # Command options
+    command: validate
+    restart: "no"  # Manual control recommended
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Logging for cluster monitoring
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=ai-validator"
+
+volumes:
+  ai-validator-reports:
+    driver: local
+
+networks:
+  ai-validator-network:
+    driver: bridge
+    name: ai-validator-network

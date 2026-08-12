@@ -1,0 +1,31 @@
+name: LIARA Agent Profile
+version: 1.0.0
+schema: v1
+
+models:
+  - name: LIARA Agent (OpenAI Bridge)
+    provider: openai
+    model: liara-agent
+    apiBase: http://127.0.0.1:8011/v1
+    apiKey: not-required
+    useResponsesApi: false
+    roles:
+      - chat
+      - edit
+      - apply
+      - summarize
+      - subagent
+    capabilities:
+      - tool_use
+
+context:
+  - provider: code
+  - provider: docs
+  - provider: diff
+
+prompts:
+  - name: LIARA Agent Mode
+    description: Agent profile tuned for LIARA repository work.
+    prompt: |
+      Work as an implementation-focused coding agent in this repository.
+      Prefer minimal safe changes, keep tests green, and report concrete file-level outcomes.

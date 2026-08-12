@@ -1,0 +1,23 @@
+# Docker Compose Override for Multi-Workspace Deployment
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.multi-workspace.yml run --rm ai-validator quick
+
+version: '3.9'
+
+services:
+  ai-validator:
+    # Override container name per workspace
+    container_name: ${CONTAINER_NAME:-ai-validator}
+    
+    # Override environment variables per workspace
+    environment:
+      WORKSPACE_NAME: ${WORKSPACE_NAME:-default}
+      WORKSPACE_PATH: ${WORKSPACE_PATH:-.}
+      REPORT_DIR: ${REPORT_DIR:-/reports}
+      STRICT_MODE: ${STRICT_MODE:-false}
+      DEBUG_MODE: ${DEBUG_MODE:-false}
+    
+    # Override volumes (note: volume names must be static in override)
+    # Base image already defines volumes, so this just updates the path
+    volumes:
+      - ${WORKSPACE_PATH:-.}:/workspace:ro
+      - ai-validator-reports:/reports

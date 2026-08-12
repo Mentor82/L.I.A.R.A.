@@ -1,0 +1,46 @@
+# Byte-compiled / Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Environment / Credentials
+.env
+.env.local
+
+# Databases & Runtime State / Logs / Large Files
+*.sqlite
+*.sqlite3
+build.log
+logs/
+*.jsonl
+*.log
+.tmp_*
+.liara_scan_tmp/
+.liara_artifacts/
+
+# Large Binaries & Vendor Build Output
+llama-builds-final/
+workers/embedding/exec/bin/
+workers/embedding/exec/lib/
+backups/
+LIAR-docs.zip
+artifacts/
+data/
+
+# System / IDE
+.DS_Store
+._*
+.vscode/
+.idea/

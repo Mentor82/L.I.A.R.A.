@@ -1,0 +1,11 @@
+# Optional runtime extras for specific workloads.
+tenacity>=8.2,<10.0
+numpy>=1.26,<3.0
+scikit-learn>=1.5,<2.0
+pillow>=12.2.0
+ollama>=0.6.1
+openvino==2026.1.0
+transformers>=4.40,<5.0
+prompt-toolkit>=3.0,<4.0
+textual>=8.2.3
+neo4j>=5.14,<7.0

@@ -1,0 +1,30 @@
+[
+  {
+    "column": "Total CPU Usage [%]",
+    "resource": "cpu",
+    "metric": "utilization_ratio",
+    "unit": "ratio",
+    "scale": "0.01"
+  },
+  {
+    "column": "Physical Memory Load [%]",
+    "resource": "ram",
+    "metric": "memory_used_ratio",
+    "unit": "ratio",
+    "scale": "0.01"
+  },
+  {
+    "column": "CPU Package [°C]",
+    "resource": "cpu",
+    "metric": "temperature_c",
+    "unit": "celsius",
+    "device_id": "package"
+  },
+  {
+    "column": "Battery Level [%]",
+    "resource": "battery",
+    "metric": "charge_ratio",
+    "unit": "ratio",
+    "scale": "0.01"
+  }
+]

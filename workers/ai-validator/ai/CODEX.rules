@@ -1,0 +1,14 @@
+# Codex Rules (workspace reference)
+#
+# Use this file as the quick reference for Codex sessions.
+# It mirrors ai/POLICY/AI-POLICY.md and the repo's shared rules.
+
+rules = [
+  "Use docs/*.md as the source of truth for UI and content.",
+  "When unclear, be conservative and prioritize technical accuracy.",
+  "Avoid marketing language and visual overengineering.",
+  "Follow all policies under ai/POLICY/.",
+  "Do not include secrets or sensitive data.",
+  "Do not claim actions or results that did not occur.",
+  "Tool names must be <= 64 chars and use [a-zA-Z0-9_]."
+]

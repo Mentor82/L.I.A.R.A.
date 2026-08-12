@@ -1,0 +1,5 @@
+# Aggregate install profile (backward-compatible).
+# Use profile files directly for sandboxed/minimal installs.
+-r requirements-core.txt
+-r requirements-db.txt
+-r requirements-optional.txt
