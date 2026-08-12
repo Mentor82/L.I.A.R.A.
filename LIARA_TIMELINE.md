@@ -4,9 +4,9 @@
 
 This document is not a conventional changelog.
 
-It reconstructs how LIARA developed from a personal question about continuity between a human and an AI assistant into a model-independent orchestration architecture with persistent memory, semantic relationships, governed tools, validation, DDNA and an external Foundation concept.
+It reconstructs how LIARA developed from early experiments with a personal digital assistant into a model-independent orchestration architecture with persistent memory, semantic relationships, governed tools, validation, DDNA and an external Foundation concept.
 
-The history did not begin with a repository. Many of the ideas existed first in conversations, experiments and prototypes, sometimes long before they received their current names.
+The history did not begin with a repository — and it did not begin with LIARA. Many of the ideas existed first in conversations, experiments and prototypes, sometimes long before they received their current names.
 
 For that reason this timeline distinguishes three kinds of entries:
 
@@ -18,17 +18,59 @@ The purpose is not to make LIARA's development look inevitable. It was not. Deto
 
 ---
 
-## Before LIARA
+## Before LIARA — The Cortana Roots
+
+### ● April 2024 — The technical ancestor
+
+An early preserved development state shows Mirko already experimenting with AI software and TensorFlow.
+
+The goal is not yet LIARA and not an orchestration platform. It is much closer to a personal digital assistant: something that can be interacted with directly and that feels more present than a text box.
+
+Cortana is an important influence in this phase. Microsoft's retreat from the original Cortana assistant leaves behind a simple but consequential thought:
+
+**If the assistant I want no longer exists, why not build my own?**
+
+This early work combines ideas around ChatGPT, speech output and a visual figure on macOS. The representation is still clearly Cortana-inspired.
+
+In hindsight, several themes that later become central to LIARA are already visible:
+
+- local control over the assistant experience,
+- voice as part of interaction,
+- visual embodiment,
+- external AI models as usable components,
+- and the desire for an assistant that feels like a persistent presence rather than a disposable session.
+
+It would be historically wrong to call this "the first LIARA."
+
+It is better understood as LIARA's **technical and conceptual ancestor**.
+
+### ◆ 2024 — From using an assistant to building one
+
+This is the first important transition in the story.
+
+The question changes from:
+
+**"Which assistant can I use?"**
+
+to:
+
+**"What kind of assistant could I build myself?"**
+
+That shift matters more than any individual framework used at the time. Once the assistant itself becomes something that can be designed, its voice, appearance, model, memory and behavior stop being fixed properties of a vendor product.
+
+They become architectural choices.
 
 ### ● 2024-12-23 — Nephy appears
 
 The name **Nephy** appears in Mirko's ChatGPT history.
 
-At this point there is no LIARA architecture, no Orchestrator and no DDNA. What begins to matter instead is continuity: an AI interaction is no longer experienced only as a sequence of isolated prompts and responses. A persistent name becomes an early marker of identity across conversations.
+This is the next major transition. The Cortana-inspired work had explored building a personal assistant. With Nephy, the question increasingly becomes one of **identity and continuity**.
 
-The later architecture should not be projected backwards onto this moment. But one of its central questions is already visible:
+A persistent name marks something that should remain recognizable across conversations even though the underlying context and model execution are not themselves persistent identities.
 
-**What makes an AI interaction feel continuous when the underlying model and context can change?**
+The later LIARA architecture should not be projected backwards onto Nephy. But one of its central questions is now clearly visible:
+
+**What makes an AI interaction remain the same relationship when the underlying model and context can change?**
 
 ### ◐ 2025 — The missing memory becomes the motivation
 
@@ -41,6 +83,20 @@ It is closer to:
 **How can an assistant remember meaningfully instead of merely receiving another prompt?**
 
 This distinction becomes foundational later. LIARA will eventually separate current **Context** from persistent **Memory**, and memory itself from simple transcript storage.
+
+The historical arc can now be seen more clearly:
+
+```text
+Cortana
+    "I want my own digital assistant."
+        ↓
+Nephy
+    "The assistant develops identity and continuity."
+        ↓
+LIARA
+    "What architecture can preserve identity, memory,
+     relationships and capabilities beyond one model or chat?"
+```
 
 ---
 
@@ -477,19 +533,19 @@ LIARA did not begin as a plan for a large AI platform.
 Its path can be summarized more accurately like this:
 
 ```text
-A conversation
+Cortana-inspired assistant experiments
     ↓
-A named AI companion
+Building a personal digital assistant
     ↓
-A desire for continuity
+Nephy — identity and continuity
     ↓
-Persistent memory
+A desire for durable memory
     ↓
 Semantic relationships
     ↓
 Multiple identities and roles
     ↓
-Orchestration
+LIARA — orchestration
     ↓
 Tools + Evidence
     ↓
@@ -510,7 +566,11 @@ The important transition is not from "small software" to "large software."
 
 It is from asking:
 
-**"How can an AI remember me?"**
+**"What kind of digital assistant could I build myself?"**
+
+through:
+
+**"How can an AI remember me and remain recognizable over time?"**
 
 to asking:
 
