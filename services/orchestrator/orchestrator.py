@@ -1031,8 +1031,8 @@ class Orchestrator:
         return extract_validation_score_payload(val)
 
     @staticmethod
-    def _ground_workspace_agent_response(**kwargs: Any) -> str:
-        return kwargs.get("response", "")
+    def _ground_workspace_agent_response(*args: Any, **kwargs: Any) -> str:
+        return generation_pipeline._ground_workspace_agent_response(*args, **kwargs)
 
     @staticmethod
     def _observe_images(**kwargs: Any) -> List[Dict[str, Any]]:

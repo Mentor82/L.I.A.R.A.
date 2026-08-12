@@ -46,6 +46,7 @@ from services.api.routers.operations import router as operations_router
 from services.api.routers.speech import router as speech_router
 from services.api.routers.system import router as system_router
 from services.api.routers.tools import router as tools_router
+from services.api.routers.ai_brain import router as ai_brain_router
 
 
 def _cors_allowed_origins() -> list[str]:
@@ -169,6 +170,7 @@ def create_api_app(
     app.include_router(compute_router)
     app.include_router(operations_router)
     app.include_router(artifacts_router)
+    app.include_router(ai_brain_router)
 
     return app
 

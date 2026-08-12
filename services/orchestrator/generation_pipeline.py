@@ -363,3 +363,47 @@ def judge_traceability(
         "has_response": bool(response_text),
         "tool_count": len(tool_results or []),
     }
+
+
+def _ground_workspace_agent_response(*args: Any, **kwargs: Any) -> str:
+    """Ensure failed workspace agent runs are not reported as successes."""
+    response_text = args[0] if args else kwargs.get("response", "")
+    context = args[1] if len(args) > 1 else kwargs.get("context", {})
+
+    agent_data = context.get("workspace_agent") or {}
+    if not agent_data:
+        history = context.get("workspace_run_history", {})
+        artifact = history.get("artifact", {})
+        if isinstance(artifact, dict):
+            agent_data = artifact
+
+    status = agent_data.get("status")
+    if status in ("failed", "step_failed", "validation_failed"):
+        error_details = []
+        steps = agent_data.get("steps", [])
+        if isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, dict) and step.get("status") == "failed":
+                    s_id = step.get("step_id", "run")
+                    err = step.get("error") or "failed"
+                    error_details.append(f"{s_id} (failed): {err}")
+                    output_ex = step.get("output_excerpt") or step.get("output") or ""
+                    if output_ex:
+                        error_details.append(str(output_ex))
+
+        findings = agent_data.get("validator", {}).get("findings", [])
+        if isinstance(findings, list) and findings:
+            for f in findings:
+                if isinstance(f, dict):
+                    fp = f.get("file_path")
+                    line = f.get("line")
+                    msg = f.get("message")
+                    if fp and line and msg:
+                        error_details.append(f"{fp}:{line}: {msg}")
+                    elif msg:
+                        error_details.append(str(msg))
+
+        detail_str = f" ({'; '.join(error_details)})" if error_details else ""
+        return f"[Hinweis: Der letzte Workspace-Agent-Lauf wurde nicht als erfolgreich abgeschlossen markiert.{detail_str}]"
+    return response_text
+
