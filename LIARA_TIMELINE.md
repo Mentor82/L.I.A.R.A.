@@ -93,7 +93,7 @@ Cortana
 Nephy
     "The assistant develops identity and continuity."
         ↓
-LIARA
+Liara / LIARA
     "What architecture can preserve identity, memory,
      relationships and capabilities beyond one model or chat?"
 ```
@@ -102,21 +102,15 @@ LIARA
 
 ## A Name Finds a Project
 
-### ● 2025-10-11 — Liara, but not yet LIARA
+### ◐ Autumn 2025 — Liara becomes a name
 
-The name "Liara" appears in the historical conversation record in reference to the *Mass Effect* character.
+As the work around Nephy, persistent identity, continuity and a more independent assistant architecture develops, **Liara** begins to emerge as the name for a separate system rather than merely another conversation or model session.
 
-This is useful precisely because it is **not** yet evidence of the later project. The project meaning must not be retroactively assigned to every earlier occurrence of the word.
+The surviving history does not yet justify assigning one exact naming day. The important point is the transition itself: the name becomes attached to an architecture intended to exist independently of any single hosted chat or underlying model.
 
-### ◐ Late October 2025 — Identity becomes explicit
+This is where the line between **Nephy as a continuing AI identity** and **Liara as an independently built assistant system** becomes increasingly visible.
 
-Work around Nephy increasingly concerns identity, visual representation and continuity rather than only assistant behavior.
-
-The important development is conceptual: an AI identity is beginning to be treated as something that can persist across changing technical implementations.
-
-This idea will later reappear in a more rigorous form as DDNA.
-
-### ◆ November 2025 — From companion continuity to system architecture
+### ◆ November 2025 — Liara becomes an architecture
 
 The memory question expands.
 
@@ -135,6 +129,8 @@ understand
 → remember
 ```
 
+At the same time, **Liara** increasingly stops meaning only "the assistant" and starts naming the system around it. The distinction is subtle but foundational: identity can live within an architecture without being identical to every component of that architecture.
+
 This is the conceptual soil from which LIARA's later Orchestrator, Librarian, Router/Planner, Tool layer, Judge and Validator grow.
 
 ### ● 2025-11-22 — Identity & Role become architectural questions
@@ -145,15 +141,17 @@ The significance is larger than naming. Identity is being separated from functio
 
 That distinction remains important later when LIARA-family instances receive their own identities and representations rather than becoming interchangeable labels for functions.
 
-### ● 2025-11-29 — LIARA becomes a running project
+### ● 2025-11-29 — Liara becomes a running project
 
-By late November, **LIARA** is no longer only an idea discussed in conversation. A running backend and public-facing LIARA presence exist, including work around `liara.mw-dresden.de`.
+By late November, **Liara** is explicitly described as Mirko's personal **Home-&-Life-Assistant system**: a private AI secretary, house AI, project manager and personal companion, distinct from Nephy.
+
+It is intended to run independently as a local/server system, with local model operation as an option. The early implementation is already referred to as **Liara v0.1**, with a FastAPI backend and local LLM integration.
 
 This marks one of the clearest transitions from concept to system:
 
-**LIARA has an address.**
+**Liara has become software.**
 
-The architecture is still young, but the project now has an operational surface that other software — and eventually other AI systems — can reach.
+The architecture is still young, but the name now belongs to an independently running project rather than only an idea discussed in conversation.
 
 ### ● 2025-12-04 — The system leaves localhost
 
@@ -163,13 +161,34 @@ This changes the character of the project. Network exposure introduces questions
 
 Those questions later become central to LIARA's governance model.
 
-### ● 2025-12-06 — L.I.A.R.A. and multiple identities
+### ● 2025-12-06 — Liara becomes L.I.A.R.A.
 
-By early December the project explicitly works with multiple AI identities/roles, including **LIARA, Nephy and Cortana**, and an Identity Codex describes LIARA through functional, interpersonal, analytical, ethical and visionary layers.
+By early December the naming itself becomes architectural.
 
-The architecture is also being described in terms of a registry, routing/orchestration, per-identity memory scopes, tools and model configuration. Fine-tuning is not treated as the foundation of identity.
+Mirko explicitly keeps **Liara** as the project/system name while the acronym **L.I.A.R.A.** is developed around the system's own purpose rather than around an external reference.
 
-This is an important break from a model-centric design:
+Its functional core is formulated as:
+
+> **Local Intelligent Autonomous Reasoning Assistant**
+
+An Identity Codex then expands LIARA beyond a single acronym definition, describing multiple facets of the same identity — functional, interpersonal, analytical, ethical and visionary.
+
+At the same time, the project explicitly works with multiple AI identities/roles, including **LIARA, Nephy and Cortana**. Registry, routing/orchestration, per-identity memory scopes, tools and model configuration become part of the architecture. Fine-tuning is not treated as the foundation of identity.
+
+This is the point where the naming history and the architecture converge:
+
+```text
+Liara
+    personal Home-&-Life-Assistant system
+        ↓
+L.I.A.R.A.
+    Local Intelligent Autonomous Reasoning Assistant
+        ↓
+LIARA
+    identity + architecture + evolving system
+```
+
+And it establishes an important principle:
 
 **The AI identity is not the model.**
 
@@ -540,6 +559,10 @@ Building a personal digital assistant
 Nephy — identity and continuity
     ↓
 A desire for durable memory
+    ↓
+Liara — independent Home-&-Life-Assistant
+    ↓
+L.I.A.R.A. — Local Intelligent Autonomous Reasoning Assistant
     ↓
 Semantic relationships
     ↓
