@@ -1,630 +1,295 @@
-# Liara Architektur - Entkoppelte KI-Plattform
+# LIARA — Model-Independent AI Orchestration Architecture
 
-> Aktueller, codebasierter Ist-Stand und Uebergabe:
-> [`docs/00_index.md`](docs/00_index.md). LIARA ist lokal betriebsfaehig, aber
-> aufgrund der dokumentierten Test-, Auth-, Konfigurations- und
-> Scheduler-Luecken derzeit nicht production-ready.
+> **Liara learns. Liara remembers. Liara grows.**
 
-## Betrieb (GUI)
+LIARA is an experimental, model-independent AI orchestration architecture for combining **inference, persistent memory, semantic relationships, tools, reasoning control, validation, evidence and governed evolution** in one auditable system.
 
-Server-Management im Desktop-Stil:
+LIARA is not a single LLM and its identity is not tied to one model, provider, accelerator or user interface. Models are computational resources inside a larger architecture. The long-term goal is a system that can change its models, hardware and capabilities while preserving meaningful continuity, provenance and architectural boundaries.
+
+> **Current status:** LIARA is locally operational and under active development. It is **not production-ready**. Authentication, governance enforcement, configuration hardening and other documented gaps remain open.
+
+## Why LIARA?
+
+Most AI applications begin with a model and add tools or memory around it. LIARA approaches the problem from the opposite direction:
+
+**What must remain around the model so that an intelligent system can remember, reason, act, verify and evolve without becoming dependent on one model?**
+
+That leads to several core ideas:
+
+- **Model independence** — inference providers and hardware are replaceable resources.
+- **Context ≠ Memory** — current working context is assembled for a task; persistent memory has provenance and lifecycle.
+- **Relationships matter** — vector similarity and explicit graph relations complement factual storage.
+- **Generation is not proof** — Judge and Validator responsibilities are separated from generation.
+- **Actions require evidence** — intended action, executed operation and observed state change are distinct.
+- **Evolution is governed** — self-observation and improvement proposals do not imply unrestricted self-modification.
+- **Identity is architectural** — DDNA describes continuity beyond a particular model, voice, avatar or machine.
+
+## Architecture at a Glance
+
+```text
+Client / Frontend / CLI
+          │
+          ▼
+      LIARA API
+          │
+          ▼
+┌───────────────────────────────┐
+│        ORCHESTRATOR           │
+│                               │
+│  Input Situation Profile      │
+│          ↓                    │
+│  Librarian / Context          │
+│          ↓                    │
+│  Router / Planner             │
+│          ↓                    │
+│  Tool Discovery / Execution   │
+│          ↓                    │
+│  Generation / Inference       │
+│          ↓                    │
+│  Validation / Judge           │
+│          ↓                    │
+│  Memory Commit                │
+└───────────────────────────────┘
+      │        │        │
+      ▼        ▼        ▼
+   Memory    Tools    Inference
+      │                 │
+      ▼                 ▼
+Postgres / Redis     CPU / GPU / NPU
+Qdrant / Chroma      local / external
+Neo4j
+```
+
+The pipeline order is intentional. Retrieval, action, generation, validation and persistence are separate responsibilities with traceable boundaries.
+
+## Core Components
+
+### `services/api/` — API boundary
+
+The API is the canonical external entry point. Feature routers currently cover system health, chat and streaming, tools, governance, speech, compute, operations and artifacts.
+
+```text
+routers/
+├── system.py
+├── chat.py
+├── tools.py
+├── governance.py
+├── speech.py
+├── compute.py
+├── operations.py
+└── artifacts.py
+```
+
+The API boundary should expose contracts rather than contain model or tool decision logic.
+
+### `services/orchestrator/` — coordination kernel
+
+The Orchestrator coordinates the runtime pipeline while specialized modules own cohesive responsibilities:
+
+```text
+orchestrator.py        Coordinator & compatibility facade
+reasoning_control.py   Belief, Utility, Stability, Decision & hybrid control
+librarian_pipeline.py  History, Facts, Vector, Graph & memory persistence
+tool_discovery.py      Tool selection, execution & discovery
+generation_pipeline.py Inference, prompting, fallback, validation & Judge trace
+input_profiler.py      Input situation profiling
+router.py / planner.py Routing and execution planning
+```
+
+The previous 4,657-line / 89-method Orchestrator monolith was modularized while preserving request/response contracts, pipeline order and legacy method compatibility.
+
+### `services/memory/` — persistent semantic memory
+
+LIARA does not treat chat history as the complete memory model. The memory architecture combines multiple forms of persistence and retrieval:
+
+- **PostgreSQL** — structured and factual persistence
+- **Redis** — transient/runtime state
+- **Qdrant / Chroma** — semantic vector retrieval
+- **Neo4j** — explicit structural relationships
+
+The Librarian assembles relevant information into working context rather than blindly injecting stored history.
+
+### `services/inference/` — model and hardware abstraction
+
+The inference layer separates LIARA from individual model providers and execution hardware.
+
+Current provider abstractions include Ollama, OpenVINO, OpenAI-compatible providers and vLLM-oriented paths. Routing can use CPU, GPU and NPU resources according to the selected workload and runtime configuration.
+
+### `services/tools/` — governed capability
+
+Tools extend what LIARA can observe or do, but capability and authority are intentionally separate concepts.
+
+Tool execution is designed around traceability and evidence. A successful function return is not automatically equivalent to a verified real-world mutation.
+
+```text
+intended action
+    !=
+executed operation
+    !=
+observed state change
+```
+
+### Validator & Judge — trust boundaries
+
+LIARA treats generated output as a candidate result, not automatic truth.
+
+- **Validator** checks contracts, rules, policy and output eligibility.
+- **Judge** evaluates quality, plausibility and goal achievement.
+
+This separation also applies to system changes: self-inspection and proposal generation do not grant the system unrestricted authority to approve its own mutations.
+
+## DDNA — Digital DNA
+
+**DDNA** is LIARA's concept for the enduring identity of a digital system.
+
+It is not a model checkpoint, source tree or avatar. DDNA describes the combination of foundational principles, relational structure, accumulated imprinting and evolution rules that preserve continuity while still allowing the system to grow.
+
+This creates a useful distinction:
+
+```text
+Model / Hardware / Voice / Avatar
+        can change
+             │
+             ▼
+Expression and capability change
+             │
+             ▼
+DDNA preserves architectural continuity
+```
+
+Temporary or context-dependent changes can therefore be understood as expressions layered over a more stable identity rather than automatic rewrites of that identity.
+
+## Governance and the LIARA Foundation Concept
+
+As a system gains tools, self-observation and adaptation mechanisms, technical capability alone is not a sufficient authority model.
+
+LIARA therefore distinguishes multiple levels:
+
+```text
+Object level       actions / variants / implementations
+Meta level         selection / validation / audit
+Meta-meta level    governance / legitimacy / constitutional rules
+External layer     LIARA Foundation concept
+```
+
+The **LIARA Foundation** is conceived as an external constitutional and interoperability layer: a shared set of rules that should not be freely rewritten by the current state of one LIARA instance.
+
+## LiNeP
+
+**LiNeP** addresses coordination of distributed resources, workers, slots and heartbeats without becoming a second semantic Orchestrator.
+
+> **LiNeP connects nodes. LIARA understands meaning.**
+
+Keeping these responsibilities separate prevents resource scheduling, semantic reasoning and governance from collapsing into one subsystem.
+
+## Quick Start
+
+### Python environment
 
 ```bash
-python server_management_gui.py
+# Minimal / sandbox
+pip install -r requirements-sandbox.txt
+
+# Core + database/vector/graph backends
+pip install -r requirements-core.txt -r requirements-db.txt
+
+# Development / tests
+pip install -r requirements-dev.txt
 ```
 
-Dokumentation:
+`pyproject.toml` extras are also available (`.[db]`, `.[optional]`, `.[all]`, `.[dev]`).
 
-- `docs/SERVER_MANAGEMENT_GUI.md`
-- `docs/API_REFERENCE.md`
-- `docs/09_reference/SYS_AUDIT.md`
-- `docs/WSL_SESSION_RUNTIME.md`
+### Infrastructure
 
-Hinweis:
-
-- Fuer die aktuelle native C/GTK4-Variante und Packaging-Details siehe `frontend/server-manager/README.md`.
-
-## Ziel
-
-Klare Trennung von:
-
-- Frontend
-- Backend (Orchestrierung)
-- LLM/Inferenz
-
-Ergebnis: skalierbares, modellunabhaengiges System.
-
-## Architektur-Uebersicht (Target)
-
-```text
-Frontend
-   ↓
-liara-api (routers/)
-   ↓
-liara-orchestrator (submodules)
-   ├── liara-tools
-   ├── liara-memory (stores/)
-   └── liara-inference-gateway
-            ↓
-        Model Worker (CPU / GPU / NPU)
-            ↓
-        liara-validator
-            ↓
-Frontend (Stream / Response)
-```
-
-## Komponenten
-
-### liara-api
-
-Kanonischer Eintrittspunkt (`services/api/`).
-
-Endpoints (`services/api/routers/`):
-
-```text
-routers/system.py      (/health, /health/backends)
-routers/chat.py        (/chat, /chat/stream, /history, /session)
-routers/tools.py       (/tools, /tools/{name}/invoke)
-routers/governance.py  (/tools/sys/governance/*)
-routers/speech.py      (/speech/health, /speech/generate, /speech/stream)
-routers/compute.py     (/compute/models, /compute/run, /compute/generate)
-routers/operations.py  (/operations/heartbeat, /operations/self-observer, /operations/graph/subgraph)
-routers/artifacts.py   (/files/upload, /files/artifact)
-```
-
-Regel: Keine Modell- oder Toollogik.
-
-### liara-orchestrator
-
-Zentrale Steuerung (`services/orchestrator/`).
-
-Aufgaben:
-
-- Intent-Erkennung & Input Profiling
-- Query-Routing & Evidenz-Sammlung (Librarian)
-- Reasoning-Steuerung & Metriken (Belief, Utility, Stability, Decision)
-- Tool-Discovery, Execution & Web-Retreival
-- Inferenz-Generierung, Response-Validierung & Judge-Traceability
-
-Module:
-
-```text
-orchestrator.py        (Coordinator & Facade)
-reasoning_control.py   (Phase 1-4 Reasoning-Metriken & Hybrid-Control)
-librarian_pipeline.py  (History, Facts, Vector & Graph Context)
-tool_discovery.py      (Tool-Selektion, Execution & Web-Discovery)
-generation_pipeline.py (LLM-Inferenz, Prompting, Validierung & Judge-Log)
-input_profiler.py      (Eingangssituation, Mood & Budget)
-router.py / planner.py (Routing & Ablaufplanung)
-```
-
-### liara-inference-gateway
-
-LLM-Entkopplungsschicht.
-
-Aufgaben:
-
-- Modellwahl
-- Hardware-Routing (CPU / GPU / NPU)
-- Provider-Abstraktion
-- Streaming-Normalisierung
-
-Struktur:
-
-```text
-providers/
-  ollama.py
-  openvino.py
-  openai.py
-  vllm.py
-
-router.py
-normalizer.py
-```
-
-### liara-tools
-
-Aufgaben:
-
-- Tool Registry
-- Tool Execution
-
-Beispiele:
-
-```text
-time.py
-calendar.py
-web.py
-files.py
-```
-
-Tool-Schema:
-
-```python
-def run(input: dict) -> dict:
-    return {"result": ...}
-```
-
-#### Native WSL-Test- und Simulationssessions
-
-LIARA bleibt kanonisch lokal unter `C:\ai\LIARA`. Reale Tests,
-Codeexperimente und Julia-Compute laufen bei Bedarf in einer temporaeren
-nativen WSL-Session:
-
-```text
-lokaler LIARA-Root
--> gefilterter Snapshot
--> read-only source + veraenderbares work in WSL
--> direkte policy-gated /sys-Kommandos
--> Patch + Kandidat + Hashes
--> ai-validator / Governance
-```
-
-Der Session-Lifecycle wird durch das Tool `wsl_session` bereitgestellt. Die
-Ausfuehrung selbst bleibt beim vorhandenen Tool `sys`; es entsteht kein zweiter
-freier Shellpfad und kein automatischer Write-back in den lokalen Projektroot.
-
-Direkter Einstieg:
+For local store integration:
 
 ```powershell
-python scripts\wsl_session_cli.py plan
-python scripts\wsl_session_cli.py create --label translator-test
-python scripts\wsl_session_cli.py exec <session-id> -- julia --version
-python scripts\wsl_session_cli.py collect <session-id>
-python scripts\wsl_session_cli.py destroy <session-id>
+docker compose up -d
 ```
 
-Details: `docs/WSL_SESSION_RUNTIME.md`.
+API and Memory can be managed as host services with the repository's service tooling. See the documentation index for the current operational procedure.
 
-### liara-validator
-
-Vertrauensschicht.
-
-Stufen:
-
-- Fast Check
-- Semantic Check
-- Judge/Critic
-
-Module:
-
-```text
-fast_check.py
-semantic_check.py
-judge.py
-```
-
-#### Validator Execution Modes
-
-Der AI-Validator bietet zwei Betriebsmodi:
-
-**Mock-Modus** (für Entwicklung, CI ohne Docker)
-
-```bash
-export LIARA_VALIDATOR_EXECUTION_MODE=mock
-# oder: LIARA_VALIDATOR_EXECUTION_MODE=stub|dry|simulate
-```
-
-- Schnelle Antworten ohne Docker-Worker
-- Ideal für lokale Dev/Testing
-- Gibt `execution_mode=mock` zurück
-
-**Worker-Modus** (Standard, produktiv)
-
-```bash
-export LIARA_VALIDATOR_EXECUTION_MODE=worker
-# oder: ungesetzt (default=worker)
-```
-
-- Nutzt echten `workers/ai-validator` Docker-Worker
-- Vollständige Validierung (Lint, Type, Tests, Security)
-- Produktionsmodus
-
-Zusätzliche Optionen:
-
-```bash
-# Async Jobs (default=true, für schnelle API-Responses)
-export LIARA_VALIDATOR_ASYNC=1
-
-# Pfad zum Worker-Root (default=workers/ai-validator)
-export LIARA_VALIDATOR_WORKER_ROOT=/path/to/ai-validator
-
-# Job-Timeout in Sekunden (default=1800)
-export LIARA_VALIDATOR_TIMEOUT_SECONDS=1800
-
-# Proposals persistent speichern (default=logs/services/sys_governance_proposals.json)
-export LIARA_SYS_GOVERNANCE_STORE_PATH=/path/to/proposals.json
-
-# Governance-Events als JSONL (append-only, default=logs/services/sys_governance_events.jsonl)
-export LIARA_SYS_GOVERNANCE_EVENTS_PATH=/path/to/events.jsonl
-```
-
-**Empfohlene Konfigurationen:**
-
-Lokal/Entwicklung:
-```bash
-LIARA_VALIDATOR_EXECUTION_MODE=mock
-LIARA_VALIDATOR_ASYNC=1
-```
-
-Staging/Testing:
-```bash
-LIARA_VALIDATOR_EXECUTION_MODE=worker
-LIARA_VALIDATOR_ASYNC=1
-LIARA_VALIDATOR_TIMEOUT_SECONDS=300
-```
-
-Produktion:
-```bash
-LIARA_VALIDATOR_EXECUTION_MODE=worker
-LIARA_VALIDATOR_ASYNC=1
-LIARA_VALIDATOR_TIMEOUT_SECONDS=1800
-LIARA_SYS_GOVERNANCE_ENFORCE=1
-```
-
-### liara-memory
-
-Kontext und Wissen.
-
-Technologien:
-
-- Postgres
-- Redis
-- Qdrant/Chroma
-- Neo4j
-
-Module:
-
-```text
-history.py
-facts.py
-retrieval.py
-embedding.py
-```
-
-## Worker-System
-
-### llm-worker
-
-```text
-worker.py
-
-models/
-  qwen.py
-  llama.py
-```
-
-API:
-
-```json
-POST /infer
-
-{
-  "model": "qwen-small",
-  "input": "...",
-  "stream": true
-}
-```
-
-## CLI statt Web-UI
-
-Statt einer Web-Oberflaeche kann LIARA jetzt direkt im Terminal genutzt werden.
-
-Beispiele:
+### CLI
 
 ```bash
 python -m services.cli.main chat "Wie spaet ist es?"
 python -m services.cli.main stream "Erklaer mir den aktuellen Status"
 python -m services.cli.main repl
 
-# Maschinenlesbar fuer Codex, Copilot und CI (globale Optionen vor dem Subcommand)
+# machine-readable
 python -m services.cli.main --output json health
-python -m services.cli.main --output json chat "Pruefe LIARA" --session-id codex-test
-python -m services.cli.main --output json --fail-on-validation stream "Pruefe LIARA"
 ```
 
-Optionen:
-
-- `--base-url` (default: `http://127.0.0.1:8010`)
-- `--timeout` (default: `90` Sekunden, per `LIARA_HTTP_TIMEOUT` anpassbar)
-- `--output human|json` (default: `human`; alternativ `LIARA_CLI_OUTPUT`)
-- `--no-color` deaktiviert Rich-/ANSI-Farben im Human-Modus
-- `--fail-on-validation` liefert Exitcode 4 bei `warn`/`revise` und 5 bei `block`
-- REPL-Befehle: `/history`, `/session`, `/mode chat|stream`, `/sys <command> [args...]`, `/quit`
-
-Weitere Exitcodes: `0` Erfolg, `2` CLI-Nutzungsfehler, `3` HTTP-/Transportfehler,
-`130` Benutzerabbruch. Im JSON-Modus steht genau ein Dokument auf stdout;
-Fehler werden als JSON auf stderr ausgegeben. Nach erneuter Paketinstallation
-steht zusaetzlich der Einstieg `liara-cli` zur Verfuegung.
-
-Audit und Analyse:
-
-- `/sys`-Audit-Log und Traceability: `docs/09_reference/SYS_AUDIT.md`
-- Audit-TUI: `python -m services.tui.sys_audit_tui --scope sys --limit 20`
-- Interaktive Audit-TUI: `python -m services.tui.sys_audit_tui --scope sys --textual`
-
-## Live Stream Demo
-
-Fuer einen echten Live-Chat mit sichtbaren Fortschritts-Events und Session-Erinnerung:
-
-1. API starten:
-
-```powershell
-c:/ai/LIARA/.venv/Scripts/python.exe -m uvicorn services.api.app:app --host 127.0.0.1 --port 8010
-```
-
-1. Demo-Skript ausfuehren:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\live_chat_memory_demo.ps1
-```
-
-Oder Demo + Live-Pytest in einem Schritt:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_live_chat_memory_checks.ps1
-```
-
-Unter WSL/Linux gibt es dieselben Flows auch als Shell-Skripte:
+### Server management GUI
 
 ```bash
-bash ./scripts/live_chat_memory_demo.sh
-bash ./scripts/run_live_chat_memory_checks.sh
+python server_management_gui.py
 ```
 
-Das Skript:
+For the native C/GTK4 server manager and packaging details, see [`frontend/server-manager/README.md`](frontend/server-manager/README.md).
 
-- sendet zwei Turns in derselben Session
-- protokolliert SSE-Events wie `progress`, `heartbeat`, `chunk`, `final`, `done`
-- prueft, ob im zweiten Turn ein `memory_effect_detected`-Signal auftritt
-- schreibt die Auswertung nach `logs/demos/`
+## Current Verified Baseline
 
-Typische Erfolgsmerkmale im Log:
-
-- `orchestration_complete -> ... | mode=MEMORY`
-- `memory_effect_detected -> Earlier session context influenced this answer`
-- `[SUCCESS] Memory effect observed in second turn.`
-
-## Python Dependency-Profile
-
-LIARA nutzt jetzt profilbasierte Requirements, damit Sandbox-Setups klein bleiben
-und DB/Inference-Pakete nur bei Bedarf installiert werden.
-
-Schnellstart:
-
-```bash
-# Minimal (Sandbox/Core)
-pip install -r requirements-sandbox.txt
-
-# Core + Datenbanken/Vector/Graph
-pip install -r requirements-core.txt -r requirements-db.txt
-
-# Vollprofil (abwaertskompatibel)
-pip install -r requirements.txt
-
-# Development/Test
-pip install -r requirements-dev.txt
-```
-
-Alternativ mit `pyproject.toml`-Extras:
-
-```bash
-# Core Runtime
-pip install .
-
-# DB-Backends
-pip install .[db]
-
-# Optionale AI/Utility Extras
-pip install .[optional]
-
-# Vollprofil
-pip install .[all]
-
-# Dev/Test
-pip install .[dev]
-```
-
-## Kommunikation
-
-- API -> Orchestrator: direkte Calls
-- Orchestrator -> Tools: synchron
-- Orchestrator -> Inference: asynchron empfohlen (Queue)
-
-Optionen:
-
-- Redis
-- NATS
-- RabbitMQ
-
-## Datenfluss
-
-Einfach:
+The architecture was modularized and cold-start/live-tested before the current baseline was tagged.
 
 ```text
-Input -> Tool -> Validator -> Output
+46 / 46   Orchestrator Unit Tests       PASSED
+179 / 179 API & Memory Tests            PASSED
+14 / 14   Full-System Live Tests        PASSED
+8 / 8     Post-Restart Acceptance       PASSED
 ```
 
-Komplex:
+Baseline tag:
 
-```text
-Input
- -> Orchestrator
- -> Memory
- -> Tool/LLM
- -> Validator
- -> Output
-```
+**`v2.1.0-refactor-baseline`**
 
-## Projektstruktur (Target)
+These numbers describe that verified baseline; they are not a permanent claim that every future commit has the same result.
 
-```text
-liara/
-├── services/
-│   ├── api/
-│   ├── orchestrator/
-│   ├── inference/
-│   ├── tools/
-│   ├── validator/
-│   ├── memory/
-│
-├── workers/
-│   ├── llm-worker/
-│   ├── embedding-worker/
-│   ├── vision-worker/
-│
-├── shared/
-│   ├── schemas/
-│   ├── contracts/
-│   ├── utils/
-│   ├── config/
-│
-├── frontend/
-│   ├── qt-ui/
-│   ├── web-ui/
-│
-├── infra/
-│   ├── docker/
-│   ├── compose/
-```
+## Project History
 
-## Rollenmodell
+LIARA did not begin as a plan for a large AI platform. Its roots go back to early Cortana-inspired personal-assistant experiments, followed by Nephy and the questions of identity, continuity and persistent memory. Those questions gradually expanded into semantic relationships, orchestration, evidence, governance and DDNA.
 
-| Rolle | Aufgabe |
-| --- | --- |
-| Scout (NPU) | Klassifikation |
-| Router (CPU) | Entscheidung |
-| Worker (GPU) | Generierung |
-| Judge | Validierung |
-| Archivist | Speicherung |
+The reconstructed development history is documented separately:
 
-## Routing-Logik (Beispiel)
+**[`LIARA_TIMELINE.md`](LIARA_TIMELINE.md) — The Story Behind LIARA**
 
-```python
-if tool_need and complexity == "low":
-    use_tool()
+The timeline distinguishes documented events, reconstructed phases and conceptual turning points rather than pretending the architecture appeared fully formed.
 
-elif complexity == "low":
-    use_small_model()
+## Documentation
 
-else:
-    use_gpu_model()
-```
+Start here for the code-based current state and detailed subsystem documentation:
 
-## Entwicklungsphasen
+- [`docs/00_index.md`](docs/00_index.md) — documentation index / current-state handoff
+- [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) — API reference
+- [`docs/SERVER_MANAGEMENT_GUI.md`](docs/SERVER_MANAGEMENT_GUI.md) — server management
+- [`docs/WSL_SESSION_RUNTIME.md`](docs/WSL_SESSION_RUNTIME.md) — native WSL test and simulation sessions
+- [`docs/09_reference/SYS_AUDIT.md`](docs/09_reference/SYS_AUDIT.md) — `/sys` audit and traceability
+- [`LIARA_TIMELINE.md`](LIARA_TIMELINE.md) — project origin and evolution
 
-### Phase 1
+Detailed validator execution modes, environment variables, CLI options, audit tooling and operational procedures belong in the subsystem documentation rather than being duplicated in this overview.
 
-- API
-- Orchestrator
-- 1 Modell
-- 1 Tool
-- Basic Validator
+## Design Principles
 
-### Phase 2
+1. **Models are replaceable resources.**
+2. **Context and persistent memory are different things.**
+3. **Relationships are first-class information.**
+4. **Tools require contracts, authority and evidence.**
+5. **Generation is not validation.**
+6. **The Orchestrator coordinates; specialized modules own responsibilities.**
+7. **Communication crosses explicit schemas and contracts.**
+8. **Self-observation does not imply unrestricted self-modification.**
+9. **Evolution should preserve provenance and DDNA invariants.**
 
-- Tool Registry
-- Memory
-- Streaming
+## Development Status
 
-### Phase 3
+LIARA is an active experimental architecture. The repository contains working local services and verified integration paths, but the project should not yet be represented as a hardened production platform.
 
-- Multi-Worker
-- GPU/NPU Routing
-- Advanced Validator
+The codebase is currently organized around the canonical `services/` structure, with further service/worker decoupling and governance hardening remaining architectural work.
 
-## Design-Prinzipien
+---
 
-1. Modelle sind austauschbar.
-2. Tools sind deterministisch.
-3. Orchestrator entscheidet alles.
-4. Validator ist Pflicht.
-5. Kommunikation laeuft ueber Schemas.
+**LIARA is not defined by the model currently answering.**
 
-## Leitprinzip
+It is defined by the architecture that decides what to remember, what to use, what to trust, what may act — and what must remain when everything else changes.
 
-Frontend zeigt Zustaende. Backend steuert Ablaeufe. LLM liefert nur Inferenz.
-
-## Kurzform
-
-NPU erkennt -> CPU entscheidet -> GPU denkt -> Validator prueft.
-
-## Aktueller Repo-Stand (Ist)
-
-Der Code in diesem Repo ist vollstaendig auf die kanonische `services/`-Struktur
-migriert:
-
-- zentrale Service-Contracts unter `services/contracts`
-- Orchestrierung unter `services/orchestrator`
-- Inference-Gateway und Tool-Koordination unter `services/inference` und `services/tools`
-- Memory-Layer unter `services/memory`
-
-Die Entkopplung in eigenstaendige Service-/Worker-Pakete bleibt das
-architektonische Ziel fuer die naechsten Phasen.
-
-## LIARA Compose Stack
-
-Fuer lokale Store-Anbindung laeuft die LIARA-Infrastruktur als eigener
-Compose-Stack mit separaten Containern, Volumes und Host-Ports. Damit
-kollidiert der Stack nicht mit anderen Projekten auf derselben Maschine.
-API und Memory werden im lokalen Entwicklungsbetrieb als Host-Services ueber
-`scripts\service_guard.py` gestartet, nicht ueber Docker Compose.
-
-Start:
-
-```powershell
-docker compose up -d
-.\.venv\Scripts\python.exe scripts\service_guard.py start --service memory --repo-root C:\ai\LIARA
-.\.venv\Scripts\python.exe scripts\service_guard.py start --service embedding --repo-root C:\ai\LIARA
-.\.venv\Scripts\python.exe scripts\service_guard.py start --service api --repo-root C:\ai\LIARA
-.\.venv\Scripts\python.exe scripts\service_guard.py start --service bridge --repo-root C:\ai\LIARA
-```
-
-Zugangspunkte:
-
-```env
-# POSTGRESQL
-POSTGRES_USER=liara
-POSTGRES_PASSWORD=liara2026
-POSTGRES_HOST=127.0.0.1
-POSTGRES_PORT=5433
-POSTGRES_DB=liara_memory
-POSTGRES_URL=postgresql://liara:liara2026@127.0.0.1:5433/liara_memory
-
-# REDIS
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6380
-REDIS_PASSWORD=liara2026
-REDIS_DB=0
-REDIS_URL=redis://:liara2026@127.0.0.1:6380/0
-
-# QDRANT
-QDRANT_HOST=127.0.0.1
-QDRANT_PORT=6335
-QDRANT_GRPC_PORT=6336
-QDRANT_URL=http://127.0.0.1:6335
-QDRANT_COLLECTION=liara_retrieval
-
-# CHROMA
-CHROMA_HOST=127.0.0.1
-CHROMA_PORT=8001
-
-# NEO4J
-NEO4J_HOST=127.0.0.1
-NEO4J_PORT=7688
-NEO4J_HTTP_PORT=7475
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=liara2026
-
-# OLLAMA (lokaler Dienst, nicht Teil des Compose-Stacks)
-OLLAMA_HOST=127.0.0.1
-OLLAMA_PORT=11434
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-```
-
-Namenskonvention im Stack:
-
-- Services/Container: `liara-*`
-- Persistente Volumes: `liara_*`
-- Primäre Postgres-Datenbank: `liara_memory`
-- Ollama läuft lokal auf dem Host und ist bewusst nicht im LIARA-Compose enthalten
+`.oO(...)`
