@@ -39,11 +39,11 @@ Ergebnis: skalierbares, modellunabhaengiges System.
 ```text
 Frontend
    ↓
-liara-api
+liara-api (routers/)
    ↓
-liara-orchestrator
+liara-orchestrator (submodules)
    ├── liara-tools
-   ├── liara-memory
+   ├── liara-memory (stores/)
    └── liara-inference-gateway
             ↓
         Model Worker (CPU / GPU / NPU)
@@ -57,44 +57,45 @@ Frontend (Stream / Response)
 
 ### liara-api
 
-Aufgaben:
+Kanonischer Eintrittspunkt (`services/api/`).
 
-- Auth
-- Sessions
-- Streaming (SSE)
-- API-Endpunkte
-
-Endpoints:
+Endpoints (`services/api/routers/`):
 
 ```text
-/chat
-/chat/stream
-/runs
-/status
-/artifacts
+routers/system.py      (/health, /health/backends)
+routers/chat.py        (/chat, /chat/stream, /history, /session)
+routers/tools.py       (/tools, /tools/{name}/invoke)
+routers/governance.py  (/tools/sys/governance/*)
+routers/speech.py      (/speech/health, /speech/generate, /speech/stream)
+routers/compute.py     (/compute/models, /compute/run, /compute/generate)
+routers/operations.py  (/operations/heartbeat, /operations/self-observer, /operations/graph/subgraph)
+routers/artifacts.py   (/files/upload, /files/artifact)
 ```
 
 Regel: Keine Modell- oder Toollogik.
 
 ### liara-orchestrator
 
-Zentrale Steuerung.
+Zentrale Steuerung (`services/orchestrator/`).
 
 Aufgaben:
 
-- Intent-Erkennung
-- Routing
-- Workflow-Planung
-- Tool-/LLM-Entscheidung
-- Validator-Auswahl
-- **Mehrsprachigkeit:** automatische Spracherkennung (DE/EN) — Antwortsprache folgt der Eingabesprache
+- Intent-Erkennung & Input Profiling
+- Query-Routing & Evidenz-Sammlung (Librarian)
+- Reasoning-Steuerung & Metriken (Belief, Utility, Stability, Decision)
+- Tool-Discovery, Execution & Web-Retreival
+- Inferenz-Generierung, Response-Validierung & Judge-Traceability
 
 Module:
 
 ```text
-router.py
-planner.py
-executor.py
+orchestrator.py        (Coordinator & Facade)
+reasoning_control.py   (Phase 1-4 Reasoning-Metriken & Hybrid-Control)
+librarian_pipeline.py  (History, Facts, Vector & Graph Context)
+tool_discovery.py      (Tool-Selektion, Execution & Web-Discovery)
+generation_pipeline.py (LLM-Inferenz, Prompting, Validierung & Judge-Log)
+input_profiler.py      (Eingangssituation, Mood & Budget)
+router.py / planner.py (Routing & Ablaufplanung)
 ```
 
 ### liara-inference-gateway
@@ -122,8 +123,6 @@ normalizer.py
 ```
 
 ### liara-tools
-
-Deterministische Funktionen.
 
 Aufgaben:
 
