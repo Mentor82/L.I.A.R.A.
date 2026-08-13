@@ -457,6 +457,7 @@ class ServerManagerApp:
         self.pid_labels: dict[str, ttk.Label] = {}
         self.health_labels: dict[str, ttk.Label] = {}
         self._health_inflight: set[str] = set()
+        self._process_status_inflight: bool = False
         self.frontend_build_buttons: dict[str, ttk.Button] = {}
 
         self._build_ui()
@@ -764,16 +765,82 @@ class ServerManagerApp:
                     break
                 self._append_log(line)
 
-    def _update_process_status(self) -> None:
+    def _fetch_all_process_statuses(self) -> dict[str, tuple[bool, int | None]]:
+        """Fetch process status for all services in a single background operation."""
+        bulk_guard_map: dict[str, tuple[bool, int | None]] = {}
+        project_root = next((r.config.cwd for r in self.services.values()), os.getcwd())
+        py = _preferred_python_executable(project_root)
+        try:
+            res = subprocess.run(
+                [py, "scripts/service_guard.py", "status", "--repo-root", project_root],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=4.0,
+            )
+            payload = json.loads((res.stdout or "").strip() or "[]")
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict):
+                        svc_name = item.get("service")
+                        pid_running = bool(item.get("pid_running"))
+                        connect_ok = bool(item.get("connect_ok"))
+                        is_ok = pid_running and connect_ok
+                        pid_val = item.get("pid") if isinstance(item.get("pid"), int) and item.get("pid") > 0 else None
+                        if svc_name:
+                            bulk_guard_map[svc_name] = (is_ok, pid_val)
+        except Exception:
+            pass
+
+        results: dict[str, tuple[bool, int | None]] = {}
         for key, runtime in self.services.items():
-            running = runtime.is_process_running()
-            if running:
-                self.status_labels[key].configure(text="PROCESS: up", style="OK.TLabel")
-                pid_label = runtime._last_pid if runtime._last_pid is not None else "?"
-                self.pid_labels[key].configure(text=f"pid: {pid_label}")
+            if runtime._is_guard_managed():
+                guard_name = runtime._guard_service_name()
+                if guard_name in bulk_guard_map:
+                    results[key] = bulk_guard_map[guard_name]
+                else:
+                    results[key] = (False, None)
             else:
-                self.status_labels[key].configure(text="PROCESS: down", style="Err.TLabel")
-                self.pid_labels[key].configure(text="pid: -")
+                port_pid = runtime._port_listen_pid(runtime._health_port())
+                if port_pid > 0 and runtime._pid_running(port_pid):
+                    results[key] = (True, port_pid)
+                else:
+                    results[key] = (False, None)
+        return results
+
+    def _update_process_status(self) -> None:
+        if self._process_status_inflight:
+            return
+
+        self._process_status_inflight = True
+
+        def _worker() -> dict[str, tuple[bool, int | None]]:
+            return self._fetch_all_process_statuses()
+
+        def _done(results: dict[str, tuple[bool, int | None]]) -> None:
+            self._process_status_inflight = False
+            for key, (running, pid_val) in results.items():
+                if key in self.services:
+                    self.services[key]._last_pid = pid_val
+                if key in self.status_labels:
+                    if running:
+                        self.status_labels[key].configure(text="PROCESS: up", style="OK.TLabel")
+                        pid_str = f"pid: {pid_val}" if pid_val is not None else "pid: ?"
+                        self.pid_labels[key].configure(text=pid_str)
+                    else:
+                        self.status_labels[key].configure(text="PROCESS: down", style="Err.TLabel")
+                        self.pid_labels[key].configure(text="pid: -")
+
+        def _bg_target() -> None:
+            try:
+                res = _worker()
+            except Exception:
+                res = {}
+            self.root.after(0, lambda: _done(res))
+
+        threading.Thread(target=_bg_target, daemon=True).start()
 
     def _update_health_status(self) -> None:
         for key, runtime in self.services.items():
