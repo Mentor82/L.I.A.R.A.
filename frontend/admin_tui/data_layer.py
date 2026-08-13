@@ -208,7 +208,40 @@ class AdminDataLayer:
         limit: int = 100,
         event_types: Optional[List[str]] = None,
     ) -> List[AuditEvent]:
-        """Load audit events, optionally filtered by session or type."""
+        """Load audit events from API contract first, with file storage fallback."""
+        # 1. Try fetching via API contract
+        if HTTPX_AVAILABLE:
+            try:
+                client = self._get_http_client()
+                params: Dict[str, Any] = {"limit": limit}
+                if session_id:
+                    params["session_id"] = session_id
+                resp = client.get(f"{self.api_base_url}/admin/sys-audit/summary", params=params)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    items = payload.get("items") or payload.get("recent_events") or []
+                    events: List[AuditEvent] = []
+                    allowed_types = {
+                        str(et).strip().lower() for et in (event_types or []) if str(et).strip()
+                    }
+                    for item in items:
+                        if isinstance(item, dict):
+                            evt = self._to_audit_event(item)
+                            if allowed_types and evt.event_type.lower() not in allowed_types:
+                                continue
+                            events.append(evt)
+                            if limit > 0 and len(events) >= limit:
+                                break
+                    if events:
+                        return events
+            except Exception as api_err:
+                _LOGGER.debug(f"API audit event query failed, falling back to file storage: {api_err}")
+
+        # 2. File storage fallback (development/test mode only)
+        if os.getenv("LIARA_ENV", "development").strip().lower() == "production":
+            _LOGGER.warning("Production mode active: legacy file storage read fallback is disabled.")
+            return []
+
         try:
             from services.tools.builtin.sys_audit import load_entries as load_sys_audit_entries
 

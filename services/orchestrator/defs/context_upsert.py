@@ -88,7 +88,7 @@ async def upsert_temp_context_note(
     run_id: str,
     note_kind: str,
     content: str,
-    metadata: Dict[str, Any] | None,
+    metadata: Dict[str, Any] | None = None,
     get_fn: Callable[..., Any],
     set_fn: Callable[..., Any],
     session_tier: Any,

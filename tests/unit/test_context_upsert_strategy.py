@@ -16,16 +16,20 @@ class _FakeGateway:
     invocation_mode = None
 
 
-class _CaptureMemoryAdapter(MemoryServiceAdapter):
+from services.memory_adapter import InProcessMemoryAdapter, MemoryServiceAdapter
+
+
+class _CaptureMemoryAdapter(InProcessMemoryAdapter):
     def __init__(self):
+        super().__init__(None)
         self.session_values = {}
         self.last_set = None
         self.last_context_upsert = None
 
-    async def get(self, tier: MemoryTier, key: str, default=None):
+    async def get(self, tier, key, default=None):
         return self.session_values.get((tier, key), default)
 
-    async def set(self, tier: MemoryTier, key: str, value, ttl_seconds=None):
+    async def set(self, tier, key, value, ttl_seconds=None):
         self.session_values[(tier, key)] = value
         self.last_set = {
             "tier": tier,
@@ -35,64 +39,9 @@ class _CaptureMemoryAdapter(MemoryServiceAdapter):
         }
         return None
 
-    async def delete(self, tier: MemoryTier, key: str):
-        self.session_values.pop((tier, key), None)
-        return None
-
-    async def exists(self, tier: MemoryTier, key: str) -> bool:
-        return (tier, key) in self.session_values
-
-    async def append_history(self, request):
-        return SimpleNamespace(items=[])
-
-    async def query_history(self, request):
-        return SimpleNamespace(items=[])
-
-    async def upsert_fact(self, request):
-        return SimpleNamespace(items=[])
-
-    async def query_facts(self, request):
-        return SimpleNamespace(items=[])
-
     async def upsert_retrieval(self, request):
-        return SimpleNamespace(items=[])
-
-    async def query_retrieval(self, request):
-        return SimpleNamespace(items=[])
-
-    async def generate_embedding(self, request):
-        return SimpleNamespace(item=None)
-
-    async def context_search(self, request):
-        return ContextSearchResponse(
-            items=[],
-            status=MemoryServiceStatus(status="success", backend="memory-service"),
-        )
-
-    async def context_upsert(self, request):
         self.last_context_upsert = request
-        return ContextSearchResponse(
-            items=[],
-            status=MemoryServiceStatus(status="success", backend="memory-service"),
-        )
-
-    async def relation_upsert(self, request):
         return SimpleNamespace(items=[])
-
-    async def relation_expand(self, request):
-        return SimpleNamespace(items=[])
-
-    async def graph_agent_upsert(self, *, agent_id: str, role: str = "assistant", version: str = "v1"):
-        del agent_id, role, version
-        return SimpleNamespace(ok=True)
-
-    async def graph_task_upsert(self, *, task_id: str, status: str = "completed", agent_id: str | None = None):
-        del task_id, status, agent_id
-        return SimpleNamespace(ok=True)
-
-    async def graph_context_upsert(self, *, context_id: str, context_type: str = "session"):
-        del context_id, context_type
-        return SimpleNamespace(ok=True)
 
     async def graph_fact_upsert(
         self, *, fact_id: str, text: str, source: str, context_id: str | None = None,

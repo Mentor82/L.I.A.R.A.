@@ -152,7 +152,7 @@ def test_operations_heartbeat_is_read_only_and_uses_canonical_proxy(monkeypatch)
             service_health={"status": "ok", "sequence": 42},
         )
 
-    monkeypatch.setattr("services.api.app._fetch_heartbeat_operations", fake_fetch)
+    monkeypatch.setattr("services.api.routers.operations._fetch_heartbeat_operations", fake_fetch)
     app = create_api_app(orchestrator=_FakeOrchestrator(), memory_adapter=_adapter())
     with TestClient(app) as client:
         response = client.get("/operations/heartbeat", params={"window_seconds": 60})
@@ -181,7 +181,7 @@ def test_operations_self_observer_is_read_only_and_bounded(monkeypatch):
             service_health={"status": "ok", "sequence": 7},
         )
 
-    monkeypatch.setattr("services.api.app._fetch_self_observer_operations", fake_fetch)
+    monkeypatch.setattr("services.api.routers.operations._fetch_self_observer_operations", fake_fetch)
     app = create_api_app(orchestrator=_FakeOrchestrator(), memory_adapter=_adapter())
     with TestClient(app) as client:
         response = client.get("/operations/self-observer", params={"history_limit": 12})
@@ -240,7 +240,7 @@ async def test_backed_store_architecture_subgraph_uses_configured_timeout(monkey
     store = BackedMemoryServiceStore.__new__(BackedMemoryServiceStore)
     store.graph_store = _SlowArchitectureGraphStore()
     monkeypatch.setattr(
-        "services.memory.store.Settings.MEMORY_ARCHITECTURE_SUBGRAPH_TIMEOUT_SECONDS",
+        "services.config.settings.Settings.MEMORY_ARCHITECTURE_SUBGRAPH_TIMEOUT_SECONDS",
         0.5,
     )
 

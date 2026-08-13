@@ -205,6 +205,9 @@ def create_pending_sys_governance_proposal(
         now = datetime.now(UTC).isoformat()
         proposal = {
             "proposal_id": proposal_id,
+            "revision": 1,
+            "decision": "pending",
+            "state": "created",
             "tool_name": "sys",
             "command": str(command),
             "parameters": {key: value for key, value in dict(parameters).items() if key != "_governance_authorized"},

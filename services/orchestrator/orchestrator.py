@@ -973,18 +973,39 @@ class Orchestrator:
     def _rewrite_retrieval_query(query: str) -> str:
         return rewrite_retrieval_query(query)
 
-    def _upsert_temp_context_note(self, **kwargs: Any) -> Any:
-        return upsert_temp_context_note(self.memory, **kwargs)
+    async def _upsert_temp_context_note(self, **kwargs: Any) -> Any:
+        return await upsert_temp_context_note(
+            get_fn=self.memory.get,
+            set_fn=self.memory.set,
+            session_tier=MemoryTier.SESSION,
+            temp_context_ttl_seconds=3600,
+            build_context_upsert_metadata_fn=self._build_context_upsert_metadata,
+            **kwargs,
+        )
 
-    def _upsert_working_context_doc(self, **kwargs: Any) -> Any:
-        return upsert_working_context_doc(self.memory, **kwargs)
+    async def _upsert_working_context_doc(self, **kwargs: Any) -> Any:
+        from services.contracts import ContextUpsertRequest, ContextScope
+        return await upsert_working_context_doc(
+            is_safe_for_context_upsert_fn=is_safe_for_context_upsert,
+            touch_working_context_activity_fn=self._touch_working_context_activity,
+            build_context_upsert_metadata_fn=self._build_context_upsert_metadata,
+            context_upsert_fn=self.memory.upsert_retrieval,
+            context_upsert_request_cls=ContextUpsertRequest,
+            context_scope_cls=ContextScope,
+            **kwargs,
+        )
 
-    def _touch_working_context_activity(self, **kwargs: Any) -> Any:
-        return touch_working_context_activity(self.memory, **kwargs)
+    async def _touch_working_context_activity(self, **kwargs: Any) -> Any:
+        return await touch_working_context_activity(
+            set_fn=self.memory.set,
+            session_tier=MemoryTier.SESSION,
+            ttl_seconds=300,
+            **kwargs,
+        )
 
     @staticmethod
     def _build_context_upsert_metadata(**kwargs: Any) -> Dict[str, Any]:
-        return build_context_upsert_metadata(**kwargs)
+        return build_context_upsert_metadata(detect_language_fn=_detect_language, **kwargs)
 
     @staticmethod
     def _format_tool_context(tool_results: List[Dict[str, Any]]) -> str:

@@ -1289,6 +1289,14 @@ class InMemoryMemoryServiceStore(MemoryServiceStore):
     async def health_backends(self) -> MemoryHealthResponse:
         return await self.health()
 
+    async def architecture_subgraph(self, request: GraphSubgraphRequest) -> GraphSubgraphResponse:
+        return GraphSubgraphResponse(
+            status=MemoryServiceStatus(status="failed", backend="memory-service", error="architecture_subgraph_not_configured"),
+            component=getattr(request, "component", "memory"),
+            nodes=[],
+            edges=[],
+        )
+
     @staticmethod
     def _tokenize(text: str) -> set[str]:
         return {part for part in text.lower().split() if part}
