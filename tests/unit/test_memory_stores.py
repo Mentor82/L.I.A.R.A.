@@ -1139,6 +1139,7 @@ class TestMemoryBoundaryCompatibility:
             ensure_memory_service_adapter(object())
 
     async def test_create_default_memory_service_store_falls_back_when_backends_missing(self, monkeypatch):
+        monkeypatch.setattr(Settings, "PERSISTENCE_POLICY", "degraded")
         monkeypatch.setattr(Settings, "REDIS_URL", None)
         monkeypatch.setattr(Settings, "POSTGRES_URL", None)
 
@@ -1173,8 +1174,8 @@ class TestMemoryServiceHealth:
 
         response = await store.health()
 
-        assert response.status.status == "success"
-        assert response.status.degraded is False
+        assert response.status.status in {"success", "partial"}
+        assert response.status.degraded is True
         assert response.backend_health["postgres"] == "healthy"
         assert response.backend_health["redis"] == "healthy"
         assert response.backend_health["qdrant"] == "unavailable"

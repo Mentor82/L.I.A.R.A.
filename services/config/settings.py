@@ -168,6 +168,9 @@ class Settings:
     )
     INFERENCE_QUEUE_BLOCK_MS: int = int(os.getenv("INFERENCE_QUEUE_BLOCK_MS", "1000"))
 
+    # --- Memory & Persistence Policy ---
+    PERSISTENCE_POLICY: str = os.getenv("PERSISTENCE_POLICY", "strict").lower()
+
     # --- Validator & Governance ---
     VALIDATOR_STRICT_MODE: bool = os.getenv("VALIDATOR_STRICT_MODE", "true").lower() == "true"
 

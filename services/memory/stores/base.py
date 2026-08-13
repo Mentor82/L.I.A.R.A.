@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Literal
 from uuid import uuid4
 
 
+class PersistentStorageUnavailableError(RuntimeError):
+    """Raised when persistent memory storage is required but unavailable."""
+    pass
+
+
 def _get_store_symbol(name: str, fallback: Any) -> Any:
     mod = sys.modules.get("services.memory.store")
     if not mod:

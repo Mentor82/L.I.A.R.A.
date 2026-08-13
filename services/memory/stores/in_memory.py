@@ -133,6 +133,32 @@ class InMemoryMemoryServiceStore(MemoryServiceStore):
         self._validator_jobs: Dict[str, Dict[str, Any]] = {}
         self._validator_tasks: Dict[str, asyncio.Task[Any]] = {}
 
+    def get_health(self) -> Dict[str, Any]:
+        """Return status dictionary for in-memory memory store."""
+        from services.config import Settings
+        mode = getattr(self, "_effective_store_mode", "in_memory")
+        fallback_code = getattr(self, "_fallback_reason_code", None)
+        deg_codes = getattr(self, "_degradation_codes", [])
+        pol = str(getattr(Settings, "PERSISTENCE_POLICY", "strict")).lower()
+        return {
+            "effective_store_mode": mode,
+            "persistence_policy": pol,
+            "degraded": mode == "degraded_in_memory" or bool(fallback_code),
+            "fallback_reason_code": fallback_code,
+            "degradation_codes": deg_codes,
+            "available_capabilities": ["session_store", "fact_store", "in_memory"],
+            "unavailable_capabilities": ["postgres", "qdrant", "chroma", "neo4j"],
+            "metadata": {
+                "backend_health": {
+                    "postgres": "unavailable",
+                    "redis": "unavailable",
+                    "qdrant": "unavailable",
+                    "chroma": "unavailable",
+                    "neo4j": "unavailable",
+                }
+            },
+        }
+
     async def _run_validator_job_in_memory(self, job_id: str, traceability: dict[str, Any]) -> None:
         payload = self._validator_jobs.get(job_id)
         if payload is None:

@@ -2097,62 +2097,92 @@ class BackedMemoryServiceStore(MemoryServiceStore):
             "neo4j": await self._probe_neo4j(),
             "embedding": self._embedding_health_state_from_payload(embedding_health_payload),
         }
-        deferred_backends = ["qdrant", "neo4j"]
+        
+        deg_codes: List[str] = []
+        avail_caps: List[str] = []
+        unavail_caps: List[str] = []
 
+        if backend_health.get("postgres") == "healthy":
+            avail_caps.extend(["postgres", "session_store", "fact_store"])
+        else:
+            deg_codes.append("POSTGRES_UNAVAILABLE")
+            unavail_caps.append("postgres")
+
+        if backend_health.get("redis") == "healthy":
+            avail_caps.append("redis")
+        else:
+            deg_codes.append("REDIS_UNAVAILABLE")
+            unavail_caps.append("redis")
+
+        if backend_health.get("qdrant") == "healthy" and self.retrieval_index is not None:
+            avail_caps.append("qdrant_retrieval")
+        else:
+            deg_codes.append("QDRANT_UNAVAILABLE")
+            unavail_caps.append("qdrant_retrieval")
+
+        if backend_health.get("chroma") == "healthy" and self.context_store is not None:
+            avail_caps.append("chroma_context")
+        else:
+            deg_codes.append("CHROMA_UNAVAILABLE")
+            unavail_caps.append("chroma_context")
+
+        if backend_health.get("neo4j") == "healthy" and self.graph_store is not None:
+            avail_caps.append("neo4j_graph")
+        else:
+            deg_codes.append("NEO4J_UNAVAILABLE")
+            unavail_caps.append("neo4j_graph")
+
+        if backend_health.get("embedding") == "healthy":
+            avail_caps.append("embedding_worker")
+        else:
+            deg_codes.append("EMBEDDING_WORKER_UNAVAILABLE")
+            unavail_caps.append("embedding_worker")
+
+        pol = str(getattr(Settings, "PERSISTENCE_POLICY", "strict")).lower()
         if backend_health["postgres"] != "healthy":
+            eff_mode = "degraded_in_memory" if pol == "degraded" else "failed"
             status = MemoryServiceStatus(
-                status="failed",
+                status="failed" if pol == "strict" else "partial",
                 backend="memory-service",
                 degraded=True,
-                error="postgres_unavailable",
-                metadata={"backend_health": backend_health, "deferred_backends": deferred_backends},
+                error="POSTGRES_UNAVAILABLE",
+                metadata={
+                    "backend_health": backend_health,
+                    "effective_store_mode": eff_mode,
+                    "persistence_policy": pol,
+                    "degradation_codes": deg_codes,
+                    "available_capabilities": avail_caps,
+                    "unavailable_capabilities": unavail_caps,
+                },
             )
-        elif self.retrieval_index is not None and backend_health["qdrant"] != "healthy":
+        elif deg_codes:
+            eff_mode = "backed_degraded"
             status = MemoryServiceStatus(
                 status="partial",
                 backend="memory-service",
                 degraded=True,
-                error="qdrant_unavailable",
-                metadata={"backend_health": backend_health, "deferred_backends": ["neo4j"]},
-            )
-        elif self.embedding_service_base_url and backend_health["embedding"] == "unavailable":
-            status = MemoryServiceStatus(
-                status="partial",
-                backend="memory-service",
-                degraded=True,
-                error="embedding_unavailable",
-                metadata={"backend_health": backend_health, "deferred_backends": ["neo4j"]},
-            )
-        elif self.embedding_service_base_url and backend_health["embedding"] == "degraded":
-            status = MemoryServiceStatus(
-                status="partial",
-                backend="memory-service",
-                degraded=True,
-                error="embedding_degraded",
-                metadata={"backend_health": backend_health, "deferred_backends": ["neo4j"]},
-            )
-        elif backend_health["redis"] != "healthy":
-            status = MemoryServiceStatus(
-                status="partial",
-                backend="memory-service",
-                degraded=True,
-                error="redis_unavailable",
-                metadata={"backend_health": backend_health, "deferred_backends": deferred_backends},
+                error=deg_codes[0],
+                metadata={
+                    "backend_health": backend_health,
+                    "effective_store_mode": eff_mode,
+                    "persistence_policy": pol,
+                    "degradation_codes": deg_codes,
+                    "available_capabilities": avail_caps,
+                    "unavailable_capabilities": unavail_caps,
+                },
             )
         else:
+            eff_mode = "backed"
             status = MemoryServiceStatus(
                 status="success",
                 backend="memory-service",
                 metadata={
                     "backend_health": backend_health,
-                    "active_backends": [
-                        "postgres",
-                        "redis",
-                        *([ "qdrant"] if self.retrieval_index is not None else []),
-                        *([ "chroma"] if self.context_store is not None else []),
-                        *([ "neo4j"] if backend_health.get("neo4j") == "healthy" else []),
-                    ],
-                    "deferred_backends": [] if backend_health.get("neo4j") == "healthy" else ["neo4j"],
+                    "effective_store_mode": eff_mode,
+                    "persistence_policy": pol,
+                    "degradation_codes": [],
+                    "available_capabilities": avail_caps,
+                    "unavailable_capabilities": [],
                 },
             )
 
@@ -2168,6 +2198,47 @@ class BackedMemoryServiceStore(MemoryServiceStore):
             configured_model_id=self._embedding_health_detail(embedding_health_payload, "configured_model_id"),
             configured_model_dir=self._embedding_health_detail(embedding_health_payload, "configured_model_dir"),
         )
+
+    def get_health(self) -> Dict[str, Any]:
+        """Synchronous health snapshot for factory probes."""
+        pol = str(getattr(Settings, "PERSISTENCE_POLICY", "strict")).lower()
+        unavail = []
+        avail = ["session_store", "fact_store", "postgres"]
+
+        if self.retrieval_index is None:
+            unavail.append("QDRANT_UNAVAILABLE")
+        else:
+            avail.append("qdrant_retrieval")
+
+        if self.context_store is None:
+            unavail.append("CHROMA_UNAVAILABLE")
+        else:
+            avail.append("chroma_context")
+
+        if self.graph_store is None:
+            unavail.append("NEO4J_UNAVAILABLE")
+        else:
+            avail.append("neo4j_graph")
+
+        mode = "backed_degraded" if unavail else "backed"
+        return {
+            "effective_store_mode": mode,
+            "persistence_policy": pol,
+            "degraded": bool(unavail),
+            "fallback_reason_code": None,
+            "degradation_codes": unavail,
+            "available_capabilities": avail,
+            "unavailable_capabilities": unavail,
+            "metadata": {
+                "backend_health": {
+                    "postgres": "healthy",
+                    "redis": "healthy",
+                    "qdrant": "healthy" if self.retrieval_index is not None else "unavailable",
+                    "chroma": "healthy" if self.context_store is not None else "unavailable",
+                    "neo4j": "healthy" if self.graph_store is not None else "unavailable",
+                }
+            }
+        }
 
     async def health(self) -> MemoryHealthResponse:
         return await self._build_health_response()
