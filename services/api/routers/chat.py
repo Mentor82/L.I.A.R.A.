@@ -16,7 +16,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from services.api.deps import get_memory_adapter, get_orchestrator
+from services.api.deps import get_memory_adapter, get_orchestrator, get_app_symbol
 from services.api.models import SessionResponse, SessionUpdateRequest
 from services.contracts import (
     ChatArtifact,
@@ -74,12 +74,7 @@ _HARMFUL_RESPONSE_MARKERS = (
 )
 
 
-def _get_app_symbol(name: str, fallback: Any) -> Any:
-    app_mod = sys.modules.get("services.api.app")
-    if not app_mod:
-        return fallback
-    sym = getattr(app_mod, name, fallback)
-    return sym if sym is not None else fallback
+
 
 
 def _is_harmful_user_query(text: str) -> bool:
@@ -369,10 +364,9 @@ async def _run_chat(
     *,
     progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[str, ChatResponse]:
-    log_judge_fn = _get_app_symbol("log_judge_pre_action", log_judge_pre_action)
+    log_judge_fn = get_app_symbol("log_judge_pre_action", log_judge_pre_action)
     run_started = time.perf_counter()
-    uuid4_fn = _get_app_symbol("uuid4", uuid4)
-    run_id = str(uuid4_fn())
+    run_id = str(uuid4())
     now = datetime.now(UTC).isoformat()
     api_timings_ms: dict[str, float] = {}
     attachments = list(request.attachments or [])
@@ -940,84 +934,94 @@ async def chat_stream(
         async def _progress_callback(payload: dict[str, Any]) -> None:
             await progress_queue.put(payload)
 
-        run_task = asyncio.create_task(_run_chat(request_body, adapter, orch, progress_callback=_progress_callback))
-        progress_task = asyncio.create_task(progress_queue.get())
+        run_task = None
+        progress_task = None
+        try:
+            run_task = asyncio.create_task(_run_chat(request_body, adapter, orch, progress_callback=_progress_callback))
+            progress_task = asyncio.create_task(progress_queue.get())
 
-        while True:
-            done, _pending = await asyncio.wait(
-                {run_task, progress_task},
-                timeout=heartbeat_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            while True:
+                done, _pending = await asyncio.wait(
+                    {run_task, progress_task},
+                    timeout=heartbeat_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            if progress_task in done:
-                latest_progress = progress_task.result()
+                if progress_task in done:
+                    latest_progress = progress_task.result()
+                    yield (
+                        "event: progress\n"
+                        f"data: {json.dumps(latest_progress)}\n\n"
+                    )
+                    progress_task = asyncio.create_task(progress_queue.get())
+
+                if run_task in done:
+                    break
+
+                if not done:
+                    yield (
+                        "event: heartbeat\n"
+                        f"data: {json.dumps({'ts': datetime.now(UTC).isoformat(), 'stage': latest_progress.get('stage', 'running'), 'elapsed_ms': int((asyncio.get_running_loop().time() - started_at) * 1000)})}\n\n"
+                    )
+
+            if not progress_task.done():
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            while not progress_queue.empty():
+                latest_progress = progress_queue.get_nowait()
                 yield (
                     "event: progress\n"
                     f"data: {json.dumps(latest_progress)}\n\n"
                 )
-                progress_task = asyncio.create_task(progress_queue.get())
 
-            if run_task in done:
-                break
-
-            if not done:
+            try:
+                run_id, chat_response = await run_task
+            except Exception as exc:
                 yield (
-                    "event: heartbeat\n"
-                    f"data: {json.dumps({'ts': datetime.now(UTC).isoformat(), 'stage': latest_progress.get('stage', 'running'), 'elapsed_ms': int((asyncio.get_running_loop().time() - started_at) * 1000)})}\n\n"
+                    "event: error\n"
+                    f"data: {json.dumps({'message': str(exc), 'ts': datetime.now(UTC).isoformat()})}\n\n"
+                )
+                yield "event: done\ndata: {}\n\n"
+                return
+
+            text = chat_response.response
+            chunk_size = 120
+
+            for index in range(0, max(1, len(text)), chunk_size):
+                chunk = text[index:index + chunk_size]
+                yield (
+                    "event: chunk\n"
+                    f"data: {json.dumps({'run_id': run_id, 'index': index // chunk_size, 'text': chunk})}\n\n"
                 )
 
-        if not progress_task.done():
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
-        while not progress_queue.empty():
-            latest_progress = progress_queue.get_nowait()
-            yield (
-                "event: progress\n"
-                f"data: {json.dumps(latest_progress)}\n\n"
-            )
+            artifacts = chat_response.artifacts or []
+            for artifact_index, artifact in enumerate(artifacts):
+                artifact_payload = artifact.model_dump() if hasattr(artifact, "model_dump") else artifact
+                payload = {
+                    "run_id": run_id,
+                    "index": artifact_index,
+                    "artifact": artifact_payload,
+                }
+                yield (
+                    "event: artifact\n"
+                    f"data: {json.dumps(payload)}\n\n"
+                )
 
-        try:
-            run_id, chat_response = await run_task
-        except Exception as exc:
             yield (
-                "event: error\n"
-                f"data: {json.dumps({'message': str(exc), 'ts': datetime.now(UTC).isoformat()})}\n\n"
+                "event: final\n"
+                f"data: {json.dumps(_build_public_stream_final_payload(chat_response), ensure_ascii=False)}\n\n"
             )
             yield "event: done\ndata: {}\n\n"
-            return
-
-        text = chat_response.response
-        chunk_size = 120
-
-        for index in range(0, max(1, len(text)), chunk_size):
-            chunk = text[index:index + chunk_size]
-            yield (
-                "event: chunk\n"
-                f"data: {json.dumps({'run_id': run_id, 'index': index // chunk_size, 'text': chunk})}\n\n"
-            )
-
-        artifacts = chat_response.artifacts or []
-        for artifact_index, artifact in enumerate(artifacts):
-            artifact_payload = artifact.model_dump() if hasattr(artifact, "model_dump") else artifact
-            payload = {
-                "run_id": run_id,
-                "index": artifact_index,
-                "artifact": artifact_payload,
-            }
-            yield (
-                "event: artifact\n"
-                f"data: {json.dumps(payload)}\n\n"
-            )
-
-        yield (
-            "event: final\n"
-            f"data: {json.dumps(_build_public_stream_final_payload(chat_response), ensure_ascii=False)}\n\n"
-        )
-        yield "event: done\ndata: {}\n\n"
+        finally:
+            tasks_to_cleanup = [t for t in (run_task, progress_task) if t is not None and not t.done()]
+            for t in tasks_to_cleanup:
+                t.cancel()
+            if tasks_to_cleanup:
+                await asyncio.gather(*tasks_to_cleanup, return_exceptions=True)
 
     return StreamingResponse(
         _event_stream(),
