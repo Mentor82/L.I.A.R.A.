@@ -180,8 +180,9 @@ class BackedMemoryServiceStore(MemoryServiceStore):
             else float(os.getenv("EMBEDDING_SERVICE_TIMEOUT_SECONDS", "10"))
         )
         self.embedding_client = embedding_client
-        self._context_fallback_store = InMemoryMemoryServiceStore()
-        self._relation_fallback_store = InMemoryMemoryServiceStore()
+        self._outbox_events: List[Dict[str, Any]] = []
+        self._outbox_lock = asyncio.Lock()
+        self._outbox_fencing_token = 0
         self.memory_layer = MemoryLayer(
             session_store=self.session_store,
             fact_store=self.fact_store,
@@ -190,6 +191,90 @@ class BackedMemoryServiceStore(MemoryServiceStore):
         )
         self.adapter = InProcessMemoryAdapter(self.memory_layer)
         self.lifecycle_governance = MemoryLifecycleGovernance()
+
+    async def record_outbox_event(
+        self,
+        *,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Record a data-efficient outbox event for async projection."""
+        async with self._outbox_lock:
+            self._outbox_fencing_token += 1
+            event = {
+                "event_id": f"outbox_{uuid4().hex[:12]}",
+                "aggregate_type": aggregate_type,
+                "aggregate_id": aggregate_id,
+                "payload": payload,
+                "outbox_revision": self._outbox_fencing_token,
+                "claim_owner": None,
+                "claim_lease_until": None,
+                "fencing_token": self._outbox_fencing_token,
+                "status": "PENDING",
+                "retry_count": 0,
+                "last_error_code": None,
+                "created_at": time.time(),
+            }
+            self._outbox_events.append(event)
+            return event
+
+    async def claim_outbox_events(
+        self, owner_id: str, lease_ttl_seconds: float = 30.0, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Claim unprojected outbox events with lease TTL and fencing token."""
+        now = time.time()
+        claimed = []
+        async with self._outbox_lock:
+            for event in self._outbox_events:
+                if len(claimed) >= limit:
+                    break
+                is_pending = event["status"] == "PENDING"
+                is_expired_lease = (
+                    event["status"] == "CLAIMED"
+                    and event["claim_lease_until"] is not None
+                    and event["claim_lease_until"] < now
+                )
+                if is_pending or is_expired_lease:
+                    event["status"] = "CLAIMED"
+                    event["claim_owner"] = owner_id
+                    event["claim_lease_until"] = now + lease_ttl_seconds
+                    event["fencing_token"] += 1
+                    claimed.append(dict(event))
+        return claimed
+
+    async def complete_outbox_event(self, event_id: str, fencing_token: int) -> bool:
+        """Mark outbox event as completed if fencing token matches."""
+        async with self._outbox_lock:
+            for event in self._outbox_events:
+                if event["event_id"] == event_id:
+                    if event["fencing_token"] != fencing_token:
+                        return False
+                    event["status"] = "COMPLETED"
+                    event["claim_owner"] = None
+                    event["claim_lease_until"] = None
+                    return True
+        return False
+
+    async def fail_outbox_event(
+        self, event_id: str, fencing_token: int, error_code: str, max_retries: int = 5
+    ) -> bool:
+        """Record outbox projection failure; mark FAILED_PERMANENT if max_retries exceeded."""
+        async with self._outbox_lock:
+            for event in self._outbox_events:
+                if event["event_id"] == event_id:
+                    if event["fencing_token"] != fencing_token:
+                        return False
+                    event["retry_count"] += 1
+                    event["last_error_code"] = error_code
+                    if event["retry_count"] >= max_retries:
+                        event["status"] = "FAILED_PERMANENT"
+                    else:
+                        event["status"] = "PENDING"
+                    event["claim_owner"] = None
+                    event["claim_lease_until"] = None
+                    return True
+        return False
 
     async def _maybe_link_context_scope(self, *, request: ContextUpsertRequest, metadata: Dict[str, Any]) -> None:
         if not self.lifecycle_governance.phase_enabled("scope_link"):
