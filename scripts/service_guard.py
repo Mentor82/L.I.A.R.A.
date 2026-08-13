@@ -32,9 +32,10 @@ class ServiceDef:
     launcher: str | None = None
 
 
-SERVICE_ORDER = ["memory", "embedding", "openvino_npu", "api", "bridge"]
+SERVICE_ORDER = ["memory", "embedding", "openvino_npu", "api", "proxy", "bridge"]
 SERVICES: Dict[str, ServiceDef] = {
     "api": ServiceDef(name="api", module="services.api.app:app", port=8010),
+    "proxy": ServiceDef(name="proxy", module="scripts.proxy_8080_to_8010:app", port=8080),
     "bridge": ServiceDef(name="bridge", module="scripts.continue_openai_bridge:app", port=8011),
     "memory": ServiceDef(name="memory", module="services.memory.app:app", port=8020),
     "embedding": ServiceDef(name="embedding", module="native:LiaraEmbeddingService", port=8030),

@@ -893,6 +893,23 @@ def build_default_services(project_root: str) -> list[ServiceConfig]:
             guard_service_name="api",
         ),
         ServiceConfig(
+            key="proxy",
+            name="API Proxy Gateway [8080]",
+            category="Core Services",
+            command=[
+                py,
+                "scripts/service_guard.py",
+                "start",
+                "--service",
+                "proxy",
+                "--repo-root",
+                project_root,
+            ],
+            cwd=project_root,
+            health_url="http://127.0.0.1:8080/",
+            guard_service_name="proxy",
+        ),
+        ServiceConfig(
             key="bridge",
             name="OpenAI Bridge",
             category="Core Services",
