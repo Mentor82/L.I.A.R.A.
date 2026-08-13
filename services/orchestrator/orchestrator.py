@@ -216,7 +216,7 @@ class Orchestrator:
         self._legacy_active_run_id: Optional[str] = None
         self._legacy_active_request_source: str = ""
         self._legacy_active_sandbox_root: str = ""
-        self._simulation_mode: Optional[str] = None
+        self._legacy_simulation_mode: Optional[str] = None
         self._legacy_active_input_profile: Optional[InputSituationProfile] = None
 
         self.co_worker_main_provider: str = "ollama"
@@ -301,6 +301,15 @@ class Orchestrator:
     @_active_sandbox_root.setter
     def _active_sandbox_root(self, val: str) -> None:
         self._legacy_active_sandbox_root = val
+
+    @property
+    def _simulation_mode(self) -> Optional[str]:
+        ctx = get_current_run_context()
+        return ctx.simulation_mode if ctx else self._legacy_simulation_mode
+
+    @_simulation_mode.setter
+    def _simulation_mode(self, val: Optional[str]) -> None:
+        self._legacy_simulation_mode = val
 
     @property
     def _active_input_profile(self) -> Optional[InputSituationProfile]:

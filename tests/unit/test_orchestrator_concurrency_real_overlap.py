@@ -142,3 +142,84 @@ async def test_ten_parallel_stress_runs():
     for i, res in enumerate(results):
         assert res.session_id == f"stress_session_{i}"
         assert res.run_id == f"stress_run_{i}"
+
+
+@pytest.mark.asyncio
+async def test_shared_orchestrator_instance_concurrency_no_attribute_leakage():
+    """Verify that 10 concurrent runs on a SINGLE Orchestrator instance never leak instance state (session_id, user_id, simulation_mode, etc.)."""
+    observed_states: Dict[int, Dict[str, Any]] = {}
+    barrier = asyncio.Barrier(10)
+
+    class BarrierInspectingGateway:
+        def __init__(self, orch_ref: list):
+            self.orch_ref = orch_ref
+
+        async def infer(self, req: Any) -> Any:
+            idx = int(req.prompt.split("idx=")[1].split()[0])
+            orch = self.orch_ref[0]
+
+            # Pause all 10 tasks mid-pipeline at the exact same moment to force maximum concurrency overlap
+            await barrier.wait()
+
+            # Record what orchestrator property getters see for this task
+            observed_states[idx] = {
+                "active_session": orch._active_session_id,
+                "active_user": orch._active_user_id,
+                "active_run": orch._active_run_id,
+                "active_sandbox": orch._active_sandbox_root,
+                "simulation_mode": orch._simulation_mode,
+                "current_context": get_current_run_context(),
+            }
+
+            return type(
+                "InferenceResult",
+                (),
+                {
+                    "content": f"Response for idx={idx}",
+                    "provider": "mock",
+                    "metadata": {},
+                    "status": "success",
+                    "error": None,
+                },
+            )()
+
+    orch_ref = []
+    gateway = BarrierInspectingGateway(orch_ref)
+    orchestrator = Orchestrator(
+        tool_coordinator=DummyToolCoordinator(),
+        inference_gateway=gateway,
+        memory_layer=DummyMemoryLayer(),
+    )
+    orch_ref.append(orchestrator)
+
+    async def run_worker(idx: int):
+        sim_mode = f"sim_mode_{idx}"
+        req = OrchestratorRequest(
+            session_id=f"shared_session_{idx}",
+            user_id=f"shared_user_{idx}",
+            run_id=f"shared_run_{idx}",
+            query=f"Query idx={idx} test",
+            request_source=f"source_{idx}",
+            sandbox_root=f"/sandbox/{idx}",
+            simulation_mode=sim_mode,
+        )
+        res = await orchestrator.run(req)
+        assert get_current_run_context() is None
+        return res
+
+    results = await asyncio.gather(*[run_worker(i) for i in range(10)])
+
+    # Validate that all 10 parallel runs observed strictly isolated attributes without cross-leakage
+    for i in range(10):
+        obs = observed_states[i]
+        assert obs["active_session"] == f"shared_session_{i}"
+        assert obs["active_user"] == f"shared_user_{i}"
+        assert obs["active_run"] == f"shared_run_{i}"
+        assert obs["active_sandbox"] == f"/sandbox/{i}"
+        assert obs["simulation_mode"] == f"sim_mode_{i}"
+        assert obs["current_context"].session_id == f"shared_session_{i}"
+        assert obs["current_context"].simulation_mode == f"sim_mode_{i}"
+
+        res = results[i]
+        assert res.session_id == f"shared_session_{i}"
+        assert res.run_id == f"shared_run_{i}"
