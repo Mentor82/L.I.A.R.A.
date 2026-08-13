@@ -35,7 +35,7 @@ class ServiceDef:
 SERVICE_ORDER = ["memory", "embedding", "openvino_npu", "api", "proxy", "bridge"]
 SERVICES: Dict[str, ServiceDef] = {
     "api": ServiceDef(name="api", module="services.api.app:app", port=8010),
-    "proxy": ServiceDef(name="proxy", module="scripts.proxy_8080_to_8010:app", port=8080),
+    "proxy": ServiceDef(name="proxy", module="scripts.proxy_8080_to_8010:app", port=8080, host="0.0.0.0"),
     "bridge": ServiceDef(name="bridge", module="scripts.continue_openai_bridge:app", port=8011),
     "memory": ServiceDef(name="memory", module="services.memory.app:app", port=8020),
     "embedding": ServiceDef(name="embedding", module="native:LiaraEmbeddingService", port=8030),
@@ -194,10 +194,11 @@ class ServiceGuard:
             return False
 
     def _port_connectable(self, host: str, port: int) -> bool:
+        connect_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.7)
         try:
-            sock.connect((host, port))
+            sock.connect((connect_host, port))
             return True
         except OSError:
             return False
