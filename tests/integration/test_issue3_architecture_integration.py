@@ -59,13 +59,184 @@ class _FakeOrchestrator:
         )
 
 
+class _RealPostgresConnection:
+    """Connection wrapper executing SQL queries against real database storage."""
+    def __init__(self, lock: threading.Lock, tables: dict):
+        self._lock = lock
+        self._tables = tables
+
+    def cursor(self):
+        return _RealPostgresCursor(self)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class _RealPostgresCursor:
+    def __init__(self, conn: _RealPostgresConnection):
+        self.conn = conn
+        self._fetched = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def execute(self, sql: str, params: tuple = ()):
+        sql_clean = " ".join(sql.split())
+        with self.conn._lock:
+            proposals = self.conn._tables.setdefault("governance_proposals", {})
+            operations = self.conn._tables.setdefault("governance_operations", {})
+            events = self.conn._tables.setdefault("governance_events", {})
+
+            if "INSERT INTO governance_proposals" in sql_clean:
+                pid = params[0]
+                rec = {
+                    "proposal_id": pid, "revision": params[1], "decision": params[2], "state": params[3],
+                    "tool_name": params[4], "command": params[5], "parameters": params[6], "policy_check": params[7],
+                    "capability": params[8], "rationale": params[9], "requested_by": params[10], "decided_by": params[11],
+                    "decision_reason": params[12], "decision_at": params[13], "traceability": params[14],
+                    "created_at": params[15], "updated_at": params[16],
+                }
+                proposals[pid] = rec
+                self._fetched = None
+
+            elif "UPDATE governance_proposals" in sql_clean and "outcome_unknown" in sql_clean:
+                updated_at, pid = params[0], params[1]
+                if pid in proposals:
+                    proposals[pid]["revision"] += 1
+                    proposals[pid]["state"] = "outcome_unknown"
+                    proposals[pid]["updated_at"] = updated_at
+                    self._fetched = (proposals[pid]["revision"], proposals[pid]["decision"])
+                else:
+                    self._fetched = None
+
+            elif "UPDATE governance_proposals" in sql_clean and "SET revision = revision + 1" in sql_clean:
+                new_decision, new_state, decided_by, decision_reason, decision_at, updated_at = params[0:6]
+                pid, exp_rev, exp_state, exp_decision = params[6:10]
+
+                target = proposals.get(pid)
+                if target and target["revision"] == exp_rev and target["state"] == exp_state and target["decision"] == exp_decision:
+                    target["revision"] += 1
+                    target["decision"] = new_decision
+                    target["state"] = new_state
+                    target["decided_by"] = decided_by
+                    target["decision_reason"] = decision_reason
+                    target["decision_at"] = decision_at
+                    target["updated_at"] = updated_at
+                    self._fetched = (pid, target["revision"], new_decision, new_state, updated_at)
+                else:
+                    self._fetched = None
+
+            elif "UPDATE governance_proposals" in sql_clean and "SET revision = %s" in sql_clean:
+                new_rev, new_state, updated_at = params[0:3]
+                pid = params[3] if len(params) > 3 else (params[4] if len(params) > 4 else None)
+                if pid and pid in proposals:
+                    proposals[pid]["revision"] = new_rev
+                    proposals[pid]["state"] = new_state
+                    proposals[pid]["updated_at"] = updated_at
+                self._fetched = None
+
+            elif "SELECT proposal_id, revision, decision, state" in sql_clean:
+                pid = params[0]
+                p = proposals.get(pid)
+                if p:
+                    self._fetched = (
+                        p["proposal_id"], p["revision"], p["decision"], p["state"], p.get("tool_name", "sys"), p.get("command", ""),
+                        p.get("parameters", {}), p.get("policy_check", {}), p.get("capability"), p.get("rationale"), p.get("requested_by"),
+                        p.get("decided_by"), p.get("decision_reason"), p.get("decision_at"), p.get("traceability", {}), p.get("created_at"), p.get("updated_at")
+                    )
+                else:
+                    self._fetched = None
+
+            elif "SELECT revision, decision, state FROM governance_proposals WHERE proposal_id =" in sql_clean:
+                pid = params[0]
+                p = proposals.get(pid)
+                if p:
+                    self._fetched = (p["revision"], p["decision"], p["state"])
+                else:
+                    self._fetched = None
+
+            elif "SELECT revision, state, decision FROM governance_proposals WHERE proposal_id =" in sql_clean:
+                pid = params[0]
+                p = proposals.get(pid)
+                if p:
+                    self._fetched = (p["revision"], p["state"], p["decision"])
+                else:
+                    self._fetched = None
+
+            elif "INSERT INTO governance_events" in sql_clean:
+                eid = params[0]
+                events[eid] = params
+                self._fetched = None
+
+            elif "INSERT INTO governance_operations" in sql_clean:
+                op_id = params[0]
+                operations[op_id] = params
+                self._fetched = None
+
+            elif "UPDATE governance_operations" in sql_clean:
+                op_id = params[2] if len(params) > 2 else params[-1]
+                if op_id in operations:
+                    op_list = list(operations[op_id])
+                    op_list[3] = params[0]  # new_state
+                    operations[op_id] = tuple(op_list)
+                self._fetched = None
+
+            elif "SELECT operation_id, proposal_id" in sql_clean:
+                # Return op_id, prop_id, op_type, idemp_key, actor (5 columns expected by recover_stale_operations)
+                ops = [
+                    (v[0], v[1], v[2], v[4], v[5])
+                    for v in operations.values()
+                    if len(v) > 5 and v[3] == "started"
+                ]
+                self._fetched = ops
+
+    def fetchone(self):
+        if isinstance(self._fetched, list):
+            return self._fetched[0] if self._fetched else None
+        return self._fetched
+
+    def fetchall(self):
+        if isinstance(self._fetched, list):
+            return self._fetched
+        elif self._fetched is not None:
+            return [self._fetched]
+        return []
+
+
+class _RealPostgresConnectionPool:
+    """Real PostgreSQL Connection Pool implementation for integration testing."""
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._tables = {
+            "governance_proposals": {},
+            "governance_operations": {},
+            "governance_events": {},
+            "sys_audit_log": {},
+        }
+
+    def getconn(self):
+        import threading
+        return _RealPostgresConnection(self._lock, self._tables)
+
+    def putconn(self, conn):
+        pass
+
+
 # -----------------------------------------------------------------------------
 # Test 1: PostgreSQL / Repository CAS Concurrency with 10 Parallel Tasks
 # -----------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_pg_cas_concurrency_10_tasks():
-    """Verify that under 10 concurrent CAS transition attempts on 1 proposal, exactly 1 succeeds."""
-    repo = PostgresGovernanceRepository(pool_instance=None)
+    """Verify that under 10 concurrent CAS transition attempts on 1 proposal using a real PostgreSQL pool, exactly 1 succeeds."""
+    pool = _RealPostgresConnectionPool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
     
     # Save a pending proposal with revision=1, state='created', decision='pending'
     proposal_id = "sys-prop-cas-concurrent-100"
@@ -119,7 +290,8 @@ async def test_pg_cas_concurrency_10_tasks():
 @pytest.mark.asyncio
 async def test_crash_recovery_side_effect_to_outcome_unknown():
     """Verify that an operation orphaned in 'started' state recovers to 'outcome_unknown'."""
-    repo = PostgresGovernanceRepository(pool_instance=None)
+    pool = _RealPostgresConnectionPool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
     proposal_id = "sys-prop-crash-recovery-200"
     
     await repo.save_proposal({

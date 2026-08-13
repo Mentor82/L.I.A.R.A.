@@ -30,7 +30,7 @@ from services.tools.governance import (
 logger = logging.getLogger("liara.governance.repository")
 
 _SENSITIVE_KEY_PATTERN = re.compile(r"(token|secret|password|key|auth|bearer)", re.IGNORECASE)
-MAX_JSONB_BYTES = 64 * 1024  # 64 KB max payload size for JSONB columns
+MAX_JSONB_BYTES = 4 * 1024  # 4 KB max payload size for JSONB columns
 
 
 def redact_and_bound_payload(data: Any, max_bytes: int = MAX_JSONB_BYTES) -> dict[str, Any]:
@@ -469,6 +469,8 @@ class PostgresGovernanceRepository:
                 dict(prop),
                 {"operation_id": operation_id, "state": "started", "idempotency_key": idempotency_key, "reused": False},
             )
+
+        def _sync_claim(conn):
             with conn.cursor() as cur:
                 # 1. Fetch current proposal
                 cur.execute(

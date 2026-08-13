@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 from fastapi import Request
 
+from services.config.settings import Settings
 from services.api.exceptions import UnauthorizedPrincipalError, PolicyViolationError, ForbiddenPrincipalError
 
 
@@ -29,15 +30,15 @@ def get_verified_principal(request: Request) -> Principal:
     Body-supplied actor fields are strictly ignored for authority.
     In production mode (LIARA_ENV=production or LIARA_FAIL_CLOSED_AUTH=true),
     requests lacking valid credentials fail closed with UnauthorizedPrincipalError (401).
-    Arbitrary Bearer tokens are validated against configured admin/user secrets.
+    Arbitrary Bearer tokens are validated against central Settings admin/user tokens.
     """
     auth_header = request.headers.get("Authorization") or ""
     actor_header = request.headers.get("X-LIARA-Actor-ID") or ""
     env_name = (os.getenv("LIARA_ENV") or "development").strip().lower()
-    fail_closed_enabled = env_name == "production" or os.getenv("LIARA_FAIL_CLOSED_AUTH", "false").lower() == "true"
+    fail_closed_enabled = env_name == "production" or Settings.LIARA_FAIL_CLOSED_AUTH or os.getenv("LIARA_FAIL_CLOSED_AUTH", "false").lower() == "true"
 
-    admin_token = os.getenv("LIARA_ADMIN_TOKEN", "liara-admin-secret-key")
-    user_token = os.getenv("LIARA_USER_TOKEN", "")
+    admin_token = os.getenv("LIARA_ADMIN_TOKEN") or getattr(Settings, "LIARA_ADMIN_TOKEN", "liara-admin-secret-key")
+    user_token = os.getenv("LIARA_USER_TOKEN") or getattr(Settings, "LIARA_USER_TOKEN", "")
 
     if auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()

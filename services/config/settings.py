@@ -17,6 +17,11 @@ class Settings:
     HOST: str = os.getenv("HOST", "127.0.0.1")
     PORT: int = int(os.getenv("PORT", "8010"))
 
+    # --- Authentication & Authorization ---
+    LIARA_ADMIN_TOKEN: str = os.getenv("LIARA_ADMIN_TOKEN", "liara-admin-secret-key")
+    LIARA_USER_TOKEN: str = os.getenv("LIARA_USER_TOKEN", "")
+    LIARA_FAIL_CLOSED_AUTH: bool = os.getenv("LIARA_FAIL_CLOSED_AUTH", "false").lower() == "true"
+
     # --- LLM Providers & Timeouts ---
     DEFAULT_LLM_PROVIDER: str = os.getenv("DEFAULT_LLM_PROVIDER", "ll_ol_fallback")
     DEFAULT_LLM_TIMEOUT_SECONDS: float = float(os.getenv("DEFAULT_LLM_TIMEOUT_SECONDS", "240"))
