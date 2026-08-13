@@ -36,15 +36,19 @@ def create_judge_context_for_pre_action(
 
 
 def create_judge_context_for_post_result(
-    run_id: str,
-    query: str,
-    response_content: str,
-    tools_used: List[str],
-    tool_outputs: dict[str, Any],
+    orchestrator: Any = None,
+    *,
+    run_id: str = "",
+    query: str = "",
+    response_content: str = "",
+    tools_used: List[str] = None,
+    tool_outputs: dict[str, Any] = None,
+    **kwargs: Any,
 ) -> JudgeContext:
     """Create a JudgeContext for post-result evaluation of LLM response."""
+    effective_run_id = run_id or kwargs.get("request_id") or getattr(orchestrator, "_active_run_id", "") or ""
     return JudgeContext(
-        request_id=run_id,
+        request_id=effective_run_id,
         stage=JudgeStage.POST_RESULT,
         actor="orchestrator",
         intent="response_validation",
@@ -52,15 +56,15 @@ def create_judge_context_for_post_result(
         input={
             "original_query": query,
             "response": response_content,
-            "tools_used": tools_used,
-            "tool_outputs": tool_outputs,
+            "tools_used": tools_used or [],
+            "tool_outputs": tool_outputs or {},
         },
         metadata={
             "source": "orchestrator",
             "risk_hint": "medium",
-            "session_id": orchestrator._active_session_id,
-            "user_id": orchestrator._active_user_id,
-            "response_length": len(response_content),
+            "session_id": getattr(orchestrator, "_active_session_id", None),
+            "user_id": getattr(orchestrator, "_active_user_id", None),
+            "response_length": len(response_content or ""),
         },
     )
 

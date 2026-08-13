@@ -155,24 +155,10 @@ class TestOrchestratorMigrationContract:
         assert isinstance(response, OrchestratorResponse)
 
         payload = response.model_dump()
-        assert {
-            "run_id",
-            "final_response",
-            "tools_executed",
-            "tool_results",
-            "state_final",
-            "llm_generation",
-            "validation_result",
-            "execution_trace",
-        }.issubset(set(payload.keys()))
-        assert {
-            "content",
-            "provider",
-        }.issubset(set(payload["llm_generation"].keys()))
-        assert {
-            "passed",
-            "issues",
-        }.issubset(set(payload["validation_result"].keys()))
+        expected_keys = set(OrchestratorResponse.model_fields.keys())
+        assert set(payload.keys()) == expected_keys
+        assert "content" in payload["llm_generation"]
+        assert "provider" in payload["llm_generation"]
         assert response.state_final == RunState.COMPLETE.value
 
     async def test_orchestrator_response_schema_stable_queue_fallback_mode(self):
@@ -194,20 +180,9 @@ class TestOrchestratorMigrationContract:
         assert isinstance(response, OrchestratorResponse)
 
         payload = response.model_dump()
-        assert {
-            "run_id",
-            "final_response",
-            "tools_executed",
-            "tool_results",
-            "state_final",
-            "llm_generation",
-            "validation_result",
-            "execution_trace",
-        }.issubset(set(payload.keys()))
-        assert {
-            "content",
-            "provider",
-        }.issubset(set(payload["llm_generation"].keys()))
+        assert set(payload.keys()) == set(OrchestratorResponse.model_fields.keys())
+        assert "content" in payload["llm_generation"]
+        assert "provider" in payload["llm_generation"]
         assert response.state_final == RunState.COMPLETE.value
 
     async def test_direct_and_queue_modes_keep_same_contract_fields(self):
@@ -262,20 +237,9 @@ class TestOrchestratorMigrationContract:
 
         payload = response.model_dump()
         assert response.state_final == RunState.COMPLETE.value
-        assert {
-            "run_id",
-            "final_response",
-            "tools_executed",
-            "tool_results",
-            "state_final",
-            "llm_generation",
-            "validation_result",
-            "execution_trace",
-        }.issubset(set(payload.keys()))
-        assert {
-            "content",
-            "provider",
-        }.issubset(set(payload["llm_generation"].keys()))
+        assert set(payload.keys()) == set(OrchestratorResponse.model_fields.keys())
+        assert "content" in payload["llm_generation"]
+        assert "provider" in payload["llm_generation"]
 
     async def test_queue_error_without_fallback_keeps_schema(self):
         invoker = QueueReadyInferenceInvoker(
@@ -304,20 +268,9 @@ class TestOrchestratorMigrationContract:
 
         payload = response.model_dump()
         assert response.state_final == RunState.COMPLETE.value
-        assert {
-            "run_id",
-            "final_response",
-            "tools_executed",
-            "tool_results",
-            "state_final",
-            "llm_generation",
-            "validation_result",
-            "execution_trace",
-        }.issubset(set(payload.keys()))
-        assert {
-            "content",
-            "provider",
-        }.issubset(set(payload["llm_generation"].keys()))
+        assert set(payload.keys()) == set(OrchestratorResponse.model_fields.keys())
+        assert "content" in payload["llm_generation"]
+        assert "provider" in payload["llm_generation"]
         assert response.llm_generation["content"] == ""
 
     async def test_llm_trace_metadata_has_consistent_mode_context_direct(self):

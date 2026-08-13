@@ -53,7 +53,7 @@ from services.tools.registry import get_tool_registry
 from services.reward_model.scorer import RewardModelScorer
 from services.vision import VisionServiceClient, is_image_attachment
 from services.memory_adapter import ensure_memory_service_adapter
-from .run_context import RunContext, set_current_run_context, get_current_run_context
+from .run_context import RunContext, get_current_run_context, set_current_run_context, reset_current_run_context
 
 from .context_controller import ContextController
 from .evidence_engine import EvidenceEngine
@@ -241,8 +241,21 @@ class Orchestrator:
         self._last_executor_debug: Dict[str, Any] = {}
         self.timing_debug_enabled = True
 
-        # Latency scope writer thread
-        self._latency_scope_queue: Queue[Dict[str, Any]] = Queue(maxsize=100)
+    @property
+    def judge(self) -> Any:
+        return self.judge_engine
+
+    @judge.setter
+    def judge(self, val: Any) -> None:
+        self.judge_engine = val
+
+    @property
+    def memory(self) -> Any:
+        return self.memory_service
+
+    @memory.setter
+    def memory(self, val: Any) -> None:
+        self.memory_service = val
 
     @property
     def _active_session_id(self) -> Optional[str]:
@@ -306,9 +319,6 @@ class Orchestrator:
     async def run(self, request: OrchestratorRequest) -> OrchestratorResponse:
         """Execute the full query pipeline."""
         run_id = request.run_id or str(uuid.uuid4())
-        routing_query = (request.routing_query or request.query or "").strip() or request.query
-        run_started = time.perf_counter()
-
         run_src = (request.request_source or "").strip().lower()
         sandbox_root = request.sandbox_root or ""
         run_ctx = RunContext(
@@ -319,7 +329,22 @@ class Orchestrator:
             sandbox_root=sandbox_root,
             simulation_mode=request.simulation_mode,
         )
-        set_current_run_context(run_ctx)
+        ctx_token = set_current_run_context(run_ctx)
+        try:
+            return await self._execute_run_pipeline(request, run_id=run_id, run_src=run_src, sandbox_root=sandbox_root)
+        finally:
+            reset_current_run_context(ctx_token)
+
+    async def _execute_run_pipeline(
+        self,
+        request: OrchestratorRequest,
+        *,
+        run_id: str,
+        run_src: str,
+        sandbox_root: str,
+    ) -> OrchestratorResponse:
+        routing_query = (request.routing_query or request.query or "").strip() or request.query
+        run_started = time.perf_counter()
 
         self._active_session_id = request.session_id
         self._active_user_id = request.user_id
@@ -473,10 +498,17 @@ class Orchestrator:
                     dec_val = judge_post_payload.get("decision")
                     if hasattr(dec_val, "value"):
                         judge_post_payload["decision"] = dec_val.value
-                    elif dec_val:
-                        judge_post_payload["decision"] = str(dec_val)
             except Exception as exc:
-                _ORCHESTRATOR_LOGGER.debug("Judge post evaluation skipped: %s", exc)
+                _ORCHESTRATOR_LOGGER.warning("Judge post evaluation failed (visibly degraded): %s", exc)
+                if isinstance(val_res, dict):
+                    val_res["status"] = "degraded"
+                    val_res["judge_error"] = str(exc)
+                judge_post_payload = {
+                    "approved": False,
+                    "status": "degraded",
+                    "decision": "degraded",
+                    "error": str(exc),
+                }
 
         retry_count = 0
         retry_limit = 3
@@ -677,7 +709,7 @@ class Orchestrator:
             else (val_res if isinstance(val_res, dict) else {})))
         )
 
-        return OrchestratorResponse(
+        resp = OrchestratorResponse(
             run_id=run_id,
             session_id=request.session_id,
             final_response=response_text,
@@ -693,9 +725,9 @@ class Orchestrator:
                 "input_profile": input_profile.dict() if hasattr(input_profile, "dict") else dict(input_profile),
                 "router_decision": router_decision.dict() if hasattr(router_decision, "dict") else dict(router_decision),
                 "generation_metadata": gen_meta,
-                "validation_result": val_res_dict,
             },
         )
+        return resp
 
     # ----------------------------------------------------
     # Delegating Helper Methods (Static & Instance)

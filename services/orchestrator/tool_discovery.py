@@ -225,17 +225,27 @@ async def execute_tools(
             log_fn = getattr(orch_mod, "log_judge_pre_action", None)
             if not log_fn:
                 from services.tools.builtin.sys_audit import log_judge_pre_action as log_fn
+            
+            dec_str = decision.decision.value if hasattr(decision, "decision") and hasattr(decision.decision, "value") else str(getattr(decision, "decision", decision.get("decision", "allow") if isinstance(decision, dict) else "allow"))
+            is_approved = getattr(decision, "approved", True) if not isinstance(decision, dict) else decision.get("approved", True)
+
             log_fn(
                 tool_name=",".join(selected_tools),
-                decision=decision.decision.value if hasattr(decision, "decision") and hasattr(decision.decision, "value") else str(decision.get("decision", "allow")),
+                decision=dec_str,
                 request_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",
                 session_id=getattr(orchestrator, "_active_session_id", "") or "",
                 run_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",
             )
             if hasattr(orchestrator, "_last_executor_debug") and isinstance(orchestrator._last_executor_debug, dict):
                 orchestrator._last_executor_debug.setdefault("judge_revise_count", 0)
+
+            if dec_str.lower() in {"block", "reject"} or not is_approved:
+                _LOGGER.warning("Pre-action judge blocked execution (fail-closed): %s", dec_str)
+                return {tool: {"status": "blocked", "error": f"Pre-action judge blocked execution: {dec_str}"} for tool in selected_tools}
+
         except Exception as judge_exc:
-            _LOGGER.debug("Judge pre-action evaluation skipped: %s", judge_exc)
+            _LOGGER.error("Pre-action judge failed (fail-closed): %s", judge_exc)
+            return {tool: {"status": "blocked", "error": f"Pre-action judge failure (fail-closed): {judge_exc}"} for tool in selected_tools}
 
     if exec_req is not None:
         try:

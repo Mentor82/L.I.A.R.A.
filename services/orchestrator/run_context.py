@@ -5,7 +5,7 @@ Uses contextvars.ContextVar to guarantee zero cross-session contamination under 
 
 from __future__ import annotations
 from dataclasses import dataclass
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Optional, Any
 
 
@@ -23,9 +23,14 @@ class RunContext:
 _current_run_context: ContextVar[Optional[RunContext]] = ContextVar("current_run_context", default=None)
 
 
-def set_current_run_context(ctx: Optional[RunContext]) -> None:
-    """Set the current async task's isolated RunContext."""
-    _current_run_context.set(ctx)
+def set_current_run_context(ctx: Optional[RunContext]) -> Token[Optional[RunContext]]:
+    """Set the current async task's isolated RunContext and return its token."""
+    return _current_run_context.set(ctx)
+
+
+def reset_current_run_context(token: Token[Optional[RunContext]]) -> None:
+    """Reset the current async task's isolated RunContext using its token (LIFO)."""
+    _current_run_context.reset(token)
 
 
 def get_current_run_context() -> Optional[RunContext]:
