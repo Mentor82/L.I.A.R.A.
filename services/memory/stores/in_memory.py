@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Literal, Tuple
 from uuid import uuid4
@@ -163,7 +164,11 @@ class InMemoryMemoryServiceStore(MemoryServiceStore):
         payload = self._validator_jobs.get(job_id)
         if payload is None:
             return
+        
+        token = payload.get("fencing_token", 1)
         payload["state"] = "running"
+        payload["lease_owner"] = f"worker_{os.getpid()}"
+        payload["lease_expires_at"] = time.time() + 30.0
         payload["updated_at"] = datetime.now(UTC).isoformat()
 
         exec_fn = _get_store_symbol("_execute_validator_job", _execute_validator_job)
@@ -175,34 +180,60 @@ class InMemoryMemoryServiceStore(MemoryServiceStore):
                 scope=str(payload.get("scope") or "quick"),
                 checks=list(payload.get("checks") or []),
                 strict_mode=bool(payload.get("strict_mode", False)),
-                session_id=traceability.get("session_id"),
-                request_id=traceability.get("request_id"),
-                run_id=traceability.get("run_id"),
-                source=traceability.get("source") or "memory.validator",
+                session_id=payload.get("session_id"),
+                request_id=payload.get("request_id"),
+                run_id=payload.get("run_id"),
+                source=payload.get("source"),
             )
+        except asyncio.CancelledError:
+            # Per Rule 4: Upon cancel/shutdown, leave job recoverable via expired lease
+            payload["state"] = "queued"
+            payload["lease_owner"] = None
+            payload["lease_expires_at"] = time.time() - 1
+            raise
         except Exception as exc:
             execution = {
                 "state": "failed",
-                "summary": {
-                    "execution_mode": _validator_execution_backend_name(),
-                    "execution_backend": _validator_execution_backend_name(),
-                    "error": f"validator_execution_exception: {exc}",
-                },
+                "summary": {"error": f"validator_execution_exception: {exc}"},
                 "findings": [{"severity": "error", "message": str(exc)}],
                 "artifacts": [],
             }
-        payload["state"] = execution["state"]
-        payload["summary"] = execution["summary"]
-        payload["findings"] = execution["findings"]
-        payload["artifacts"] = execution["artifacts"]
+
+        # Check fencing token before persisting result
+        if payload.get("fencing_token", 1) != token:
+            # Token changed (zombie execution aborted)
+            return
+
+        payload["state"] = str(execution.get("state") or "completed")
+        payload["summary"] = dict(execution.get("summary") or {})
+        payload["findings"] = list(execution.get("findings") or [])
+        payload["artifacts"] = list(execution.get("artifacts") or [])
+        payload["lease_owner"] = None
+        payload["lease_expires_at"] = None
         payload["updated_at"] = datetime.now(UTC).isoformat()
-        exit_code = 0 if execution["state"] == "completed" else 1
+        exit_code = 0 if execution.get("state") == "completed" else 1
         _audit_memory_executed(
             operation="validator_execute",
             exit_code=exit_code,
             traceability=traceability,
-            args=[f"job_id={job_id}", f"state={execution['state']}"],
+            args=[f"job_id={job_id}", f"state={execution.get('state')}"],
         )
+
+    async def shutdown_validator_jobs(self) -> None:
+        """Cancel running validator tasks gracefully and leave leases expired for recovery."""
+        for job_id, task in list(self._validator_tasks.items()):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            payload = self._validator_jobs.get(job_id)
+            if payload and payload.get("state") == "running":
+                payload["state"] = "queued"
+                payload["lease_owner"] = None
+                payload["lease_expires_at"] = time.time() - 1
+        self._validator_tasks.clear()
 
     async def append_history(self, request: MemoryHistoryAppendRequest) -> MemoryHistoryResponse:
         item = MemoryMessageRecord(
