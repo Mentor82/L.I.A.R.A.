@@ -29,11 +29,18 @@ def test_fail_closed_in_production(monkeypatch):
 
 def test_bearer_token_extraction(monkeypatch):
     monkeypatch.setenv("LIARA_ENV", "production")
+    monkeypatch.setenv("LIARA_ADMIN_TOKEN", "secret_admin_token_12345")
 
-    req = MagicMock()
-    req.headers = {"Authorization": "Bearer secret_token_12345"}
-
-    principal = get_verified_principal(req)
+    # Valid admin token
+    req_admin = MagicMock()
+    req_admin.headers = {"Authorization": "Bearer secret_admin_token_12345"}
+    principal = get_verified_principal(req_admin)
     assert principal.authenticated is True
-    assert principal.source == "bearer_token"
-    assert "secret_token" in principal.actor_id
+    assert principal.source == "bearer_admin"
+    assert principal.has_role("admin") is True
+
+    # Arbitrary unverified token in production fails closed (401)
+    req_invalid = MagicMock()
+    req_invalid.headers = {"Authorization": "Bearer arbitrary_untrusted_token"}
+    with pytest.raises(UnauthorizedPrincipalError):
+        get_verified_principal(req_invalid)

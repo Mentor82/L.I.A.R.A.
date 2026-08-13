@@ -128,6 +128,18 @@ def _extract_identity_display_name(request: ChatRequest, snapshot: dict[str, Any
     return None
 
 
+def _sanitize_public_error_message(exc: Exception) -> str:
+    """Ensure raw exception details, tracebacks, SQL statements, and paths do not leak to HTTP clients."""
+    if isinstance(exc, HTTPException):
+        return str(exc.detail) if isinstance(exc.detail, str) else "Request validation or routing error."
+    err_str = str(exc)
+    if "postgresql" in err_str.lower() or "sql" in err_str.lower() or "database" in err_str.lower():
+        return "A database or persistence error occurred."
+    if "path" in err_str.lower() or "c:" in err_str.lower() or "/" in err_str:
+        return "An internal storage access error occurred."
+    return "An error occurred while processing the request."
+
+
 def _identity_prompt_block(*, user_id: str, display_name: str | None) -> str:
     clean_name = _normalize_display_name(display_name)
     if clean_name:
@@ -981,9 +993,10 @@ async def chat_stream(
             try:
                 run_id, chat_response = await run_task
             except Exception as exc:
+                sanitized_msg = _sanitize_public_error_message(exc)
                 yield (
                     "event: error\n"
-                    f"data: {json.dumps({'message': str(exc), 'ts': datetime.now(UTC).isoformat()})}\n\n"
+                    f"data: {json.dumps({'code': 'STREAM_EXECUTION_ERROR', 'message': sanitized_msg, 'ts': datetime.now(UTC).isoformat()})}\n\n"
                 )
                 yield "event: done\ndata: {}\n\n"
                 return

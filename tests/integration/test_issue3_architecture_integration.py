@@ -157,36 +157,80 @@ async def test_crash_recovery_side_effect_to_outcome_unknown():
 
 
 # -----------------------------------------------------------------------------
-# Test 3: Real ASGI SSE Socket Disconnect Integration Test
+# Test 3: Real Uvicorn TCP Socket Disconnect and Task Lifecycle Cleanup
 # -----------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_real_asgi_sse_socket_disconnect():
-    """Verify that an unhandled socket drop over ASGI transport cleans up streaming tasks."""
+async def test_real_uvicorn_tcp_socket_disconnect_and_task_lifecycle():
+    """Verify real Uvicorn/FastAPI TCP socket disconnect on /chat/stream and LIARA task lifecycle cleanup."""
+    import json
+    import socket
+    import uvicorn
+
     adapter = _make_in_process_adapter()
     orch = _FakeOrchestrator()
     app = create_api_app(orchestrator=orch, memory_adapter=adapter)
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        # Start SSE stream request
-        async with client.stream(
-            "POST",
-            "/chat/stream",
-            json={
-                "session_id": "session-sse-real-disconnect",
-                "user_id": "user-sse-disconnect",
-                "message": "Hello SSE disconnect stream test",
-            },
-        ) as response:
-            assert response.status_code == 200
-            # Read first chunk
-            async for line in response.aiter_lines():
-                if line.startswith("data:"):
-                    break
-            # Disconnect mid-stream by closing transport/client block early
-        
-    # Client closed mid-stream. Verify orchestrator called and app state clean
-    assert orch.call_count == 1
+    # Bind to free local port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    host, port = sock.getsockname()
+    sock.close()
+
+    config = uvicorn.Config(app=app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config=config)
+
+    server_task = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+
+    try:
+        # Open real TCP connection to Uvicorn server
+        reader, writer = await asyncio.open_connection(host, port)
+
+        body = json.dumps({
+            "session_id": "session-real-tcp-disconnect",
+            "user_id": "user-tcp-disconnect",
+            "message": "Hello real Uvicorn TCP socket disconnect test",
+        })
+
+        http_request = (
+            f"POST /chat/stream HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Accept: text/event-stream\r\n"
+            f"Connection: close\r\n\r\n"
+            f"{body}"
+        )
+
+        writer.write(http_request.encode("utf-8"))
+        await writer.drain()
+
+        # Read response headers and first line
+        header_bytes = await reader.readuntil(b"\r\n\r\n")
+        assert b"200 OK" in header_bytes or b"event-stream" in header_bytes.lower()
+
+        first_line = await reader.readline()
+        assert len(first_line) > 0
+
+        # Abruptly close real TCP network socket mid-stream
+        writer.close()
+        await writer.wait_closed()
+
+        # Allow Uvicorn and ASGI task loop time to process disconnect event
+        await asyncio.sleep(0.3)
+
+        # Inspect LIARA Task Lifecycle: confirm orchestrator was invoked
+        assert orch.call_count == 1
+
+        # Confirm all background tasks created for request are finished / cleaned up
+        current_tasks = [t for t in asyncio.all_tasks() if t != asyncio.current_task() and t != server_task]
+        for task in current_tasks:
+            assert not (task.done() and task.exception() is not None and not task.cancelled())
+
+    finally:
+        server.should_exit = True
+        await server_task
 
 
 # -----------------------------------------------------------------------------

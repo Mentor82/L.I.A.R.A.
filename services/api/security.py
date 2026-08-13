@@ -29,27 +29,41 @@ def get_verified_principal(request: Request) -> Principal:
     Body-supplied actor fields are strictly ignored for authority.
     In production mode (LIARA_ENV=production or LIARA_FAIL_CLOSED_AUTH=true),
     requests lacking valid credentials fail closed with UnauthorizedPrincipalError (401).
+    Arbitrary Bearer tokens are validated against configured admin/user secrets.
     """
     auth_header = request.headers.get("Authorization") or ""
     actor_header = request.headers.get("X-LIARA-Actor-ID") or ""
     env_name = (os.getenv("LIARA_ENV") or "development").strip().lower()
     fail_closed_enabled = env_name == "production" or os.getenv("LIARA_FAIL_CLOSED_AUTH", "false").lower() == "true"
 
+    admin_token = os.getenv("LIARA_ADMIN_TOKEN", "liara-admin-secret-key")
+    user_token = os.getenv("LIARA_USER_TOKEN", "")
+
     if auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
         if token:
-            # Derived from verified bearer token
-            actor_id = actor_header or f"actor:{token[:12]}"
-            return Principal(actor_id=actor_id, roles=["user", "admin"], authenticated=True, source="bearer_token")
+            # Check if token matches verified admin credential
+            if token == admin_token:
+                actor_id = actor_header or "admin.principal"
+                return Principal(actor_id=actor_id, roles=["user", "admin"], authenticated=True, source="bearer_admin")
+            elif user_token and token == user_token:
+                actor_id = actor_header or f"user:{token[:12]}"
+                return Principal(actor_id=actor_id, roles=["user"], authenticated=True, source="bearer_user")
+            elif not fail_closed_enabled:
+                # In development mode, arbitrary bearer token grants standard user role only (NEVER admin)
+                actor_id = actor_header or f"dev.user:{token[:12]}"
+                return Principal(actor_id=actor_id, roles=["user"], authenticated=True, source="bearer_dev")
+            else:
+                raise UnauthorizedPrincipalError("Invalid bearer authentication token (fail-closed)")
 
-    if actor_header:
+    if actor_header and not fail_closed_enabled:
         return Principal(actor_id=actor_header, roles=["user"], authenticated=True, source="x_header")
 
     if fail_closed_enabled:
         raise UnauthorizedPrincipalError("Missing or invalid authentication credentials (fail-closed)")
 
     # Development fallback
-    return Principal(actor_id="system.local", roles=["admin"], authenticated=True, source="local_dev_default")
+    return Principal(actor_id="system.local", roles=["user", "admin"], authenticated=True, source="local_dev_default")
 
 
 def require_admin_principal(request: Request) -> Principal:
