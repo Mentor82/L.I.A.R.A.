@@ -190,6 +190,8 @@ async def execute_tools(
     if not selected_tools:
         return {}
 
+    prepared = None
+    exec_req = None
     if hasattr(orchestrator, "executor") and hasattr(orchestrator.executor, "execute"):
         try:
             from services.contracts import ExecutorRequest
@@ -205,6 +207,38 @@ async def execute_tools(
                 if hasattr(orchestrator.executor, "prepare_tool_requests")
                 else None
             )
+        except Exception as prep_exc:
+            _LOGGER.debug("Failed preparing tool requests: %s", prep_exc)
+
+    if hasattr(orchestrator, "judge_engine") and orchestrator.judge_engine is not None:
+        try:
+            input_payload = prepared[0].parameters if (prepared and hasattr(prepared[0], "parameters")) else {}
+            ctx = orchestrator._create_judge_context_for_pre_action(
+                run_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",
+                tool_names=selected_tools,
+                query=query,
+                input=input_payload,
+            )
+            decision = orchestrator.judge_engine.evaluate_pre_action(ctx)
+            import sys
+            orch_mod = sys.modules.get("services.orchestrator.orchestrator")
+            log_fn = getattr(orch_mod, "log_judge_pre_action", None)
+            if not log_fn:
+                from services.tools.builtin.sys_audit import log_judge_pre_action as log_fn
+            log_fn(
+                tool_name=",".join(selected_tools),
+                decision=decision.decision.value if hasattr(decision, "decision") and hasattr(decision.decision, "value") else str(decision.get("decision", "allow")),
+                request_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",
+                session_id=getattr(orchestrator, "_active_session_id", "") or "",
+                run_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",
+            )
+            if hasattr(orchestrator, "_last_executor_debug") and isinstance(orchestrator._last_executor_debug, dict):
+                orchestrator._last_executor_debug.setdefault("judge_revise_count", 0)
+        except Exception as judge_exc:
+            _LOGGER.debug("Judge pre-action evaluation skipped: %s", judge_exc)
+
+    if exec_req is not None:
+        try:
             if prepared is not None:
                 res = await orchestrator.executor.execute(exec_req, prepared_requests=prepared)
             else:

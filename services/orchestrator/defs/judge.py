@@ -9,27 +9,33 @@ def create_judge_context_for_pre_action(
     run_id: str,
     tool_names: List[str],
     query: str,
+    **kwargs: Any,
 ) -> JudgeContext:
     """Create a JudgeContext for pre-action evaluation of tool dispatch."""
+    input_payload = kwargs.get("input")
+    if input_payload is None:
+        if "command" in kwargs:
+            input_payload = {"command": kwargs["command"], "args": kwargs.get("args")}
+        else:
+            input_payload = {"tools": tool_names, "query": query}
+
     return JudgeContext(
         request_id=run_id,
         stage=JudgeStage.PRE_ACTION,
         actor="orchestrator",
         intent="tool_dispatch",
         action=",".join(tool_names),
-        input={"tools": tool_names, "query": query},
+        input=input_payload,
         metadata={
             "source": "orchestrator",
             "risk_hint": "medium" if len(tool_names) > 1 else "low",
-            "session_id": orchestrator._active_session_id,
-            "user_id": orchestrator._active_user_id,
+            "session_id": getattr(orchestrator, "_active_session_id", None),
+            "user_id": getattr(orchestrator, "_active_user_id", None),
         },
     )
 
 
 def create_judge_context_for_post_result(
-    orchestrator: Any,
-    *,
     run_id: str,
     query: str,
     response_content: str,

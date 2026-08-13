@@ -49,11 +49,11 @@ from services.config import Settings
 from services.inference.invocation import ensure_inference_invoker
 from services.shared.types import MemoryTier, RunState, ToolStatus
 from services.judge import JudgeEngine, JudgeContext, JudgeStage
-from services.tools.builtin.sys_audit import log_judge_pre_action
 from services.tools.registry import get_tool_registry
 from services.reward_model.scorer import RewardModelScorer
 from services.vision import VisionServiceClient, is_image_attachment
 from services.memory_adapter import ensure_memory_service_adapter
+from .run_context import RunContext, set_current_run_context, get_current_run_context
 
 from .context_controller import ContextController
 from .evidence_engine import EvidenceEngine
@@ -170,6 +170,7 @@ class Orchestrator:
         else:
             from services.memory.store import create_default_memory_service_store
             self.memory = ensure_memory_service_adapter(create_default_memory_service_store())
+        self.memory_service = self.memory
 
         if inference_gateway is not None:
             self.inference = ensure_inference_invoker(inference_gateway)
@@ -188,6 +189,7 @@ class Orchestrator:
                 self.executor = ToolExecutor(ToolCoordinator())
 
         self.judge = judge_engine or JudgeEngine()
+        self.judge_engine = self.judge
         self.vision = vision_client or VisionServiceClient()
         self.input_profiler = InputSituationProfiler()
         self.librarian = LibrarianRouter()
@@ -208,17 +210,15 @@ class Orchestrator:
 
         self._session_adaptive_thresholds: Dict[str, Any] = {}
         self._session_adaptive_state: Dict[str, Any] = {}
-        self._session_control_state: Dict[str, Any] = {}
 
-        self._active_session_id: Optional[str] = None
-        self._active_user_id: Optional[str] = None
-        self._active_run_id: Optional[str] = None
-        self._active_request_source: str = ""
-        self._active_sandbox_root: str = ""
+        self._legacy_active_session_id: Optional[str] = None
+        self._legacy_active_user_id: Optional[str] = None
+        self._legacy_active_run_id: Optional[str] = None
+        self._legacy_active_request_source: str = ""
+        self._legacy_active_sandbox_root: str = ""
         self._simulation_mode: Optional[str] = None
-        self._active_input_profile: Optional[InputSituationProfile] = None
+        self._legacy_active_input_profile: Optional[InputSituationProfile] = None
 
-        self.co_worker_provider_lock_enabled: bool = False
         self.co_worker_main_provider: str = "ollama"
         self.co_worker_provider_lock_enabled: bool = bool(getattr(Settings, "CO_WORKER_PROVIDER_LOCK_ENABLED", True))
         self.default_inference_provider: str = "openvino"
@@ -243,6 +243,60 @@ class Orchestrator:
 
         # Latency scope writer thread
         self._latency_scope_queue: Queue[Dict[str, Any]] = Queue(maxsize=100)
+
+    @property
+    def _active_session_id(self) -> Optional[str]:
+        ctx = get_current_run_context()
+        return ctx.session_id if ctx else self._legacy_active_session_id
+
+    @_active_session_id.setter
+    def _active_session_id(self, val: Optional[str]) -> None:
+        self._legacy_active_session_id = val
+
+    @property
+    def _active_user_id(self) -> Optional[str]:
+        ctx = get_current_run_context()
+        return ctx.user_id if ctx else self._legacy_active_user_id
+
+    @_active_user_id.setter
+    def _active_user_id(self, val: Optional[str]) -> None:
+        self._legacy_active_user_id = val
+
+    @property
+    def _active_run_id(self) -> Optional[str]:
+        ctx = get_current_run_context()
+        return ctx.run_id if ctx else self._legacy_active_run_id
+
+    @_active_run_id.setter
+    def _active_run_id(self, val: Optional[str]) -> None:
+        self._legacy_active_run_id = val
+
+    @property
+    def _active_request_source(self) -> str:
+        ctx = get_current_run_context()
+        return ctx.request_source if ctx else self._legacy_active_request_source
+
+    @_active_request_source.setter
+    def _active_request_source(self, val: str) -> None:
+        self._legacy_active_request_source = val
+
+    @property
+    def _active_sandbox_root(self) -> str:
+        ctx = get_current_run_context()
+        return ctx.sandbox_root if ctx else self._legacy_active_sandbox_root
+
+    @_active_sandbox_root.setter
+    def _active_sandbox_root(self, val: str) -> None:
+        self._legacy_active_sandbox_root = val
+
+    @property
+    def _active_input_profile(self) -> Optional[InputSituationProfile]:
+        ctx = get_current_run_context()
+        return ctx.input_profile if ctx else self._legacy_active_input_profile
+
+    @_active_input_profile.setter
+    def _active_input_profile(self, val: Optional[InputSituationProfile]) -> None:
+        self._legacy_active_input_profile = val
         self._latency_scope_stop_event = Event()
         self._latency_scope_thread: Optional[Thread] = None
 
@@ -255,10 +309,22 @@ class Orchestrator:
         routing_query = (request.routing_query or request.query or "").strip() or request.query
         run_started = time.perf_counter()
 
+        run_src = (request.request_source or "").strip().lower()
+        sandbox_root = request.sandbox_root or ""
+        run_ctx = RunContext(
+            session_id=request.session_id,
+            user_id=request.user_id,
+            run_id=run_id,
+            request_source=run_src,
+            sandbox_root=sandbox_root,
+            simulation_mode=request.simulation_mode,
+        )
+        set_current_run_context(run_ctx)
+
         self._active_session_id = request.session_id
         self._active_user_id = request.user_id
         self._active_run_id = run_id
-        self._active_request_source = (request.request_source or "").strip().lower()
+        self._active_request_source = run_src
 
         if not self._router_scout_initialized:
             await self.router.initialize_scout_embedding()
@@ -266,11 +332,11 @@ class Orchestrator:
             self._router_scout_initialized = True
 
         execution_trace: List[Dict[str, Any]] = [
-            {"to_state": "routing", "reason": "Request initialized"},
-            {"to_state": "llm_generation", "reason": "Initial generation"},
+            {"to": "routing", "to_state": "routing", "reason": "Request initialized"},
+            {"to": "llm_generation", "to_state": "llm_generation", "reason": "Initial generation"},
         ]
 
-        self._active_sandbox_root = request.sandbox_root or ""
+        self._active_sandbox_root = sandbox_root
         self._simulation_mode = request.simulation_mode
 
         # 1. Profile history & Input Situation Profile
@@ -292,6 +358,16 @@ class Orchestrator:
             simulation_mode=request.simulation_mode,
             max_tokens=request.max_tokens or 2048,
         )
+        run_ctx_full = RunContext(
+            session_id=request.session_id,
+            user_id=request.user_id,
+            run_id=run_id,
+            request_source=run_src,
+            sandbox_root=sandbox_root,
+            simulation_mode=request.simulation_mode,
+            input_profile=input_profile,
+        )
+        set_current_run_context(run_ctx_full)
         self._active_input_profile = input_profile
 
         # 2. Librarian Decision & Context Loading
@@ -348,6 +424,11 @@ class Orchestrator:
         else:
             response_text = str(gen_res or "")
             gen_meta = {}
+
+        for trace_entry in execution_trace:
+            if trace_entry.get("to_state") == "llm_generation" or trace_entry.get("to") == "llm_generation":
+                trace_entry.setdefault("to", "llm_generation")
+                trace_entry["metadata"] = gen_meta if isinstance(gen_meta, dict) else {}
 
         # 6. Response Validation & Reasoning Snapshots
         val_res = await self._validate_response(
@@ -993,13 +1074,11 @@ class Orchestrator:
     def _should_use_npu_helper_offload(self, **kwargs: Any) -> bool:
         return should_use_npu_helper_offload(self, **kwargs)
 
-    @staticmethod
-    def _create_judge_context_for_pre_action(**kwargs: Any) -> JudgeContext:
-        return create_judge_context_for_pre_action(**kwargs)
+    def _create_judge_context_for_pre_action(self, *args: Any, **kwargs: Any) -> JudgeContext:
+        return create_judge_context_for_pre_action(self, *args, **kwargs)
 
-    @staticmethod
-    def _create_judge_context_for_post_result(**kwargs: Any) -> JudgeContext:
-        return create_judge_context_for_post_result(**kwargs)
+    def _create_judge_context_for_post_result(self, *args: Any, **kwargs: Any) -> JudgeContext:
+        return create_judge_context_for_post_result(self, *args, **kwargs)
 
     @staticmethod
     def _serialize_judge_decision(decision: Any) -> Dict[str, Any]:

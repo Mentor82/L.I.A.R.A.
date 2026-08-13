@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from services.config import Settings
+
 from services.contracts import InferenceRequest, InferenceResult, InputSituationProfile
 from services.judge import JudgeContext, JudgeStage
 from services.shared.types import RunState
@@ -135,10 +137,21 @@ async def generate_llm_response(
         "routing": provider_meta,
     }
 
+    mem_service = getattr(orchestrator, "memory_service", getattr(orchestrator, "memory", None))
+    mem_adapter_name = mem_service.__class__.__name__ if mem_service else ""
+    mem_mode = "service" if mem_adapter_name == "RemoteMemoryAdapter" else "in_process"
+    inf_obj = getattr(orchestrator, "inference", None)
+    inf_cls_name = inf_obj.__class__.__name__ if inf_obj else ""
+    inv_mode = "queue" if ("Queue" in inf_cls_name or "queue" in inf_cls_name.lower()) else "direct"
+
     metadata: Dict[str, Any] = {
         "provider": provider_name,
         "prompt_length": len(prompt),
         "context_debug": context_debug,
+        "memory_mode": mem_mode,
+        "memory_adapter": mem_adapter_name,
+        "queue_error_count": 0,
+        "invocation_mode": inv_mode,
     }
 
     try:
@@ -152,7 +165,25 @@ async def generate_llm_response(
         raw_text = getattr(inf_res, "text", getattr(inf_res, "content", "")) or ""
         text = raw_text.strip()
         inf_meta = getattr(inf_res, "metadata", {}) or {}
-        inf_status = getattr(inf_res, "status", "")
+        inf_status = getattr(inf_res, "status", None)
+        inf_err = getattr(inf_res, "error", None)
+
+        if hasattr(inf_res, "metadata") and isinstance(inf_res.metadata, dict):
+            metadata.update(inf_res.metadata)
+
+        if "queue_errors" in metadata and isinstance(metadata["queue_errors"], list):
+            metadata["queue_error_count"] = len(metadata["queue_errors"])
+
+        metadata.setdefault("invocation_mode", inv_mode)
+        if inf_status:
+            metadata["inference_status"] = inf_status
+        elif inf_err:
+            metadata["inference_status"] = "failed"
+        else:
+            metadata["inference_status"] = "success"
+
+        if inf_err is not None:
+            metadata["inference_error"] = inf_err
 
         is_helper_failed = (
             provider_meta.get("helper_offload_used")
@@ -188,6 +219,20 @@ async def generate_llm_response(
         if hasattr(inf_res, "metadata") and isinstance(inf_res.metadata, dict):
             metadata.update(inf_res.metadata)
 
+        metadata.setdefault("invocation_mode", "direct")
+        inf_status = getattr(inf_res, "status", None)
+        inf_err = getattr(inf_res, "error", None)
+        if inf_status:
+            metadata["inference_status"] = inf_status
+        elif inf_err:
+            metadata["inference_status"] = "failed"
+        else:
+            metadata["inference_status"] = "success"
+
+        if inf_err is not None:
+            metadata["inference_error"] = inf_err
+
+        metadata["content"] = text
         if not text:
             text = apply_empty_response_fallback(
                 orchestrator,
@@ -196,7 +241,6 @@ async def generate_llm_response(
             )
             metadata["fallback_applied"] = True
 
-        metadata["content"] = text
         metadata["context_debug"] = context_debug
         metadata["trace"] = {"provider": provider_name, "prompt_length": len(prompt)}
         return text, metadata
