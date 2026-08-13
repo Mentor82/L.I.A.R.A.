@@ -12,11 +12,18 @@ from typing import Any
 from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from services.api.deps import get_app_symbol
 from services.api.models import ToolInvokeRequest
 from services.contracts import ToolExecutionRequest, ToolExecutionResult
 from services.shared.types import MemoryTier
 from services.tools.coordinator import ToolCoordinator
-from services.tools.governance import sys_governance_invocation_digest, sys_governance_mode
+from services.tools.governance import (
+    append_sys_governance_event,
+    load_sys_governance_proposals,
+    persist_sys_governance_proposals,
+    sys_governance_invocation_digest,
+    sys_governance_mode,
+)
 from services.tools.registry import get_tool_registry
 
 
@@ -44,9 +51,7 @@ _SYS_GOVERNANCE_RUNTIME_PARAMETER_KEYS = {
 }
 
 
-def _get_app_symbol(name: str, fallback: Any) -> Any:
-    app_mod = sys.modules.get("services.api.app")
-    return getattr(app_mod, name, fallback) if app_mod else fallback
+
 
 
 def _is_public_tool_name(tool_name: str) -> bool:
@@ -114,8 +119,8 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                 detail="SYS governance mode 'all' requires proposal_id",
             )
         if proposal_id:
-            sync_fn = _get_app_symbol("_sync_sys_governance_store", None)
-            proposals = sync_fn(request.app.state) if sync_fn else request.app.state.sys_tool_proposals
+            sync_fn = get_app_symbol("_sync_sys_governance_store", None)
+            proposals = sync_fn(request.app.state) if sync_fn else getattr(request.app.state, "sys_tool_proposals", {})
             proposal = proposals.get(proposal_id)
             if proposal is None:
                 raise HTTPException(status_code=404, detail=f"Unknown sys proposal: {proposal_id}")
@@ -160,7 +165,7 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                 if sandbox_root:
                     parameters["workdir"] = sandbox_root
 
-    uuid4_fn = _get_app_symbol("uuid4", uuid4)
+    uuid4_fn = get_app_symbol("uuid4", uuid4)
     generated_trace_id = f"api-tool-{uuid4_fn().hex[:12]}"
     if not str(parameters.get("request_id") or "").strip():
         parameters["request_id"] = generated_trace_id
@@ -195,10 +200,10 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
             )
             current["invocation"] = invocation
             current["updated_at"] = invocation["last_attempt_at"]
-            persist_fn = _get_app_symbol("_persist_sys_governance_proposals", None)
+            persist_fn = get_app_symbol("_persist_sys_governance_proposals", None)
             if persist_fn:
                 persist_fn(request.app.state.sys_tool_proposals_path, request.app.state.sys_tool_proposals)
-            append_event_fn = _get_app_symbol("_append_sys_governance_event", None)
+            append_event_fn = get_app_symbol("_append_sys_governance_event", None)
             if append_event_fn:
                 append_event_fn(
                     request.app.state.sys_tool_events_path,
@@ -218,8 +223,7 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                     },
                 )
 
-    coordinator_cls = _get_app_symbol("ToolCoordinator", ToolCoordinator)
-    coordinator = coordinator_cls()
+    coordinator = ToolCoordinator()
     exec_request = ToolExecutionRequest(
         tool_name=tool_name,
         parameters=parameters,
@@ -243,10 +247,12 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                     })
                     current["invocation"] = invocation
                     current["updated_at"] = invocation["last_completed_at"]
-                    persist_fn = _get_app_symbol("_persist_sys_governance_proposals", None)
+                    persist_fn = get_app_symbol("_persist_sys_governance_proposals", None)
                     if persist_fn:
                         persist_fn(request.app.state.sys_tool_proposals_path, request.app.state.sys_tool_proposals)
-                    append_event_fn = _get_app_symbol("_append_sys_governance_event", None)
+                    else:
+                        persist_sys_governance_proposals(request.app.state.sys_tool_proposals, request.app.state.sys_tool_proposals_path)
+                    append_event_fn = get_app_symbol("_append_sys_governance_event", None)
                     if append_event_fn:
                         append_event_fn(
                             request.app.state.sys_tool_events_path,
@@ -263,6 +269,23 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                                     "context": parameters.get("context"),
                                 },
                             },
+                        )
+                    else:
+                        append_sys_governance_event(
+                            {
+                                "event_type": "invocation_failed",
+                                "proposal_id": proposal_id,
+                                "tool_name": "sys",
+                                "error": str(exc),
+                                "traceability": {
+                                    "request_id": parameters.get("request_id"),
+                                    "run_id": parameters.get("run_id"),
+                                    "session_id": parameters.get("session_id"),
+                                    "source": parameters.get("source"),
+                                    "context": parameters.get("context"),
+                                },
+                            },
+                            request.app.state.sys_tool_events_path,
                         )
         raise
 
@@ -286,10 +309,12 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                 )
                 current["invocation"] = invocation
                 current["updated_at"] = invocation["last_completed_at"]
-                persist_fn = _get_app_symbol("_persist_sys_governance_proposals", None)
+                persist_fn = get_app_symbol("_persist_sys_governance_proposals", None)
                 if persist_fn:
                     persist_fn(request.app.state.sys_tool_proposals_path, request.app.state.sys_tool_proposals)
-                append_event_fn = _get_app_symbol("_append_sys_governance_event", None)
+                else:
+                    persist_sys_governance_proposals(request.app.state.sys_tool_proposals, request.app.state.sys_tool_proposals_path)
+                append_event_fn = get_app_symbol("_append_sys_governance_event", None)
                 if append_event_fn:
                     append_event_fn(
                         request.app.state.sys_tool_events_path,
@@ -309,6 +334,26 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                                 "context": parameters.get("context"),
                             },
                         },
+                    )
+                else:
+                    append_sys_governance_event(
+                        {
+                            "event_type": "invocation_completed" if succeeded else "invocation_failed",
+                            "proposal_id": proposal_id,
+                            "tool_name": "sys",
+                            "status": result.status,
+                            "error": result.error,
+                            "execution_ms": result.execution_ms,
+                            "success_count": success_count,
+                            "traceability": {
+                                "request_id": parameters.get("request_id"),
+                                "run_id": parameters.get("run_id"),
+                                "session_id": parameters.get("session_id"),
+                                "source": parameters.get("source"),
+                                "context": parameters.get("context"),
+                            },
+                        },
+                        request.app.state.sys_tool_events_path,
                     )
 
     if governance_proposal and result.metadata:

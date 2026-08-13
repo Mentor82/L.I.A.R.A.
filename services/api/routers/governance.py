@@ -15,7 +15,14 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
-from services.api.deps import get_orchestrator
+from services.api.deps import get_orchestrator, get_governance_service, get_verified_principal
+from services.api.security import Principal
+from services.api.exceptions import (
+    GovernanceConflictError,
+    GovernanceNotFoundError,
+    PolicyViolationError,
+    UnauthorizedPrincipalError,
+)
 from services.api.models import (
     SysToolProposalActionRequest,
     SysToolProposalDecisionRequest,
@@ -47,11 +54,6 @@ from services.workspace import persist_governance_decision
 router = APIRouter(tags=["governance"])
 
 
-def _get_app_symbol(name: str, fallback: Any) -> Any:
-    app_mod = sys.modules.get("services.api.app")
-    return getattr(app_mod, name, fallback) if app_mod else fallback
-
-
 def _sys_governance_store_path(app_state: Any = None) -> Path:
     if app_state and getattr(app_state, "sys_tool_proposals_path", None):
         return Path(app_state.sys_tool_proposals_path)
@@ -65,12 +67,6 @@ def _sys_governance_events_path(app_state: Any = None) -> Path:
 
 
 def _sync_sys_governance_store(app_state: Any) -> dict[str, Any]:
-    fn = _get_app_symbol("_sync_sys_governance_store", None)
-    if fn and fn != _sync_sys_governance_store:
-        try:
-            return fn(app_state)
-        except Exception:
-            pass
     path = _sys_governance_store_path(app_state)
     proposals = load_sys_governance_proposals(path)
     if app_state is not None:
@@ -79,32 +75,14 @@ def _sync_sys_governance_store(app_state: Any) -> dict[str, Any]:
 
 
 def _persist_sys_governance_proposals(path: Path, proposals: dict[str, Any]) -> None:
-    fn = _get_app_symbol("_persist_sys_governance_proposals", None)
-    if fn and fn != _persist_sys_governance_proposals:
-        try:
-            return fn(path, proposals)
-        except Exception:
-            pass
     persist_sys_governance_proposals(proposals, path)
 
 
 def _append_sys_governance_event(path: Path, event: dict[str, Any]) -> None:
-    fn = _get_app_symbol("_append_sys_governance_event", None)
-    if fn and fn != _append_sys_governance_event:
-        try:
-            return fn(path, event)
-        except Exception:
-            pass
     append_sys_governance_event(event, path)
 
 
 def _load_sys_governance_events(path: Path, *, proposal_id: str | None = None) -> list[dict[str, Any]]:
-    fn = _get_app_symbol("_load_sys_governance_events", None)
-    if fn and fn != _load_sys_governance_events:
-        try:
-            return fn(path, proposal_id=proposal_id)
-        except Exception:
-            pass
     if not path.exists():
         return []
     events: list[dict[str, Any]] = []
@@ -241,85 +219,56 @@ def _reversible_sys_target(parameters: dict[str, Any]) -> tuple[str | None, str]
 
 
 @router.post("/tools/sys/governance/proposals")
-async def create_sys_governance_proposal(request_body: SysToolProposalRequest, request: Request, response: Response) -> dict[str, Any]:
+async def create_sys_governance_proposal(
+    request_body: SysToolProposalRequest,
+    request: Request,
+    response: Response,
+    service: Any = Depends(get_governance_service),
+    principal: Principal = Depends(get_verified_principal),
+) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    app_state = request.app.state
-    _sync_sys_governance_store(app_state)
-    proposal_id = f"sys-prop-{uuid4().hex[:12]}"
-    now = datetime.now(UTC).isoformat()
-    policy = _evaluate_sys_policy(request_body.command)
-    request_id = request_body.request_id or proposal_id
-    run_id = request_body.run_id or request_id
-    source = request_body.source or "api"
-    context = request_body.context or "api.tools.sys.governance.proposal"
-
-    proposal = {
-        "proposal_id": proposal_id,
-        "tool_name": "sys",
-        "command": request_body.command,
-        "parameters": dict(request_body.parameters or {}),
-        "invocation_digest": sys_governance_invocation_digest(request_body.command, request_body.parameters or {}),
-        "max_invocations": request_body.max_invocations,
-        "invocation": {"state": "not_invoked", "attempt_count": 0, "success_count": 0},
-        "capability": request_body.capability,
-        "rationale": request_body.rationale,
-        "requested_by": request_body.requested_by,
-        "policy_check": policy,
-        "decision": "pending",
-        "decision_reason": None,
-        "decided_by": None,
-        "created_at": now,
-        "updated_at": now,
-        "traceability": {
-            "request_id": request_id,
-            "run_id": run_id,
-            "session_id": request_body.session_id,
-            "source": source,
-            "context": context,
-        },
-    }
-    app_state.sys_tool_proposals[proposal_id] = proposal
-    _persist_sys_governance_proposals(_sys_governance_store_path(app_state), app_state.sys_tool_proposals)
-    _append_sys_governance_event(
-        _sys_governance_events_path(app_state),
-        {
-            "event_type": "proposal_created",
-            "proposal_id": proposal_id,
-            "tool_name": "sys",
-            "command": request_body.command,
-            "policy_allowed": bool(policy.get("allowed")),
-            "policy_risk_level": str(policy.get("risk_level") or "unknown"),
-            "traceability": {
-                "request_id": request_id,
-                "run_id": run_id,
-                "session_id": request_body.session_id,
-                "source": source,
-                "context": context,
+    try:
+        proposal = await service.create_proposal(
+            command=request_body.command,
+            parameters=dict(request_body.parameters or {}),
+            principal=principal,
+            capability=request_body.capability,
+            rationale=request_body.rationale,
+            max_invocations=request_body.max_invocations,
+            session_id=request_body.session_id,
+            request_id=request_body.request_id,
+            run_id=request_body.run_id,
+            source=request_body.source or "api",
+            context=request_body.context or "api.tools.sys.governance.proposal",
+        )
+        app_state = request.app.state
+        policy = proposal.get("policy_check") if isinstance(proposal.get("policy_check"), dict) else {}
+        _append_sys_governance_event(
+            _sys_governance_events_path(app_state),
+            {
+                "event_type": "proposal_created",
+                "proposal_id": proposal["proposal_id"],
+                "tool_name": "sys",
+                "command": request_body.command,
+                "policy_allowed": bool(policy.get("allowed")),
+                "policy_risk_level": str(policy.get("risk_level") or "unknown"),
+                "traceability": {
+                    "request_id": request_body.request_id or proposal["proposal_id"],
+                    "run_id": request_body.run_id or request_body.request_id or proposal["proposal_id"],
+                    "session_id": request_body.session_id,
+                    "source": request_body.source or "api",
+                    "context": request_body.context or "api.tools.sys.governance.proposal",
+                },
             },
-        },
-    )
-
-    judge_log_fn = _get_app_symbol("log_judge_pre_action", log_judge_pre_action)
-    judge_log_fn(
-        tool_name="sys_governance_proposal",
-        decision="allow" if bool(policy.get("allowed")) else "block",
-        issues=list(policy.get("reasons") or []),
-        constraints={
-            "proposal_id": proposal_id,
-            "risk_level": policy.get("risk_level"),
-            "command": request_body.command,
-        },
-        request_id=request_id,
-        session_id=request_body.session_id,
-        run_id=run_id,
-        source=source,
-        context=context,
-    )
-
-    return {
-        "status": "success",
-        "item": proposal,
-    }
+        )
+        return {
+            "status": "success",
+            "item": proposal,
+        }
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/tools/sys/governance/proposals")
@@ -398,49 +347,37 @@ async def decide_sys_governance_proposal(
     request_body: SysToolProposalDecisionRequest,
     request: Request,
     response: Response,
+    service: Any = Depends(get_governance_service),
+    principal: Principal = Depends(get_verified_principal),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
+    try:
+        proposal = await service.decide_proposal(
+            proposal_id=request_body.proposal_id,
+            decision=request_body.decision,
+            principal=principal,
+            decision_reason=request_body.decision_reason,
+            session_id=request_body.session_id,
+            request_id=request_body.request_id,
+            run_id=request_body.run_id,
+            source=request_body.source or "api",
+            context=request_body.context or "api.tools.sys.governance.decision",
+        )
+    except GovernanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (GovernanceConflictError, PolicyViolationError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except UnauthorizedPrincipalError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
     app_state = request.app.state
-    proposals = _sync_sys_governance_store(app_state)
-    proposal = proposals.get(request_body.proposal_id)
-    if proposal is None:
-        raise HTTPException(status_code=404, detail=f"Unknown sys proposal: {request_body.proposal_id}")
-    if str(proposal.get("decision") or "") != "pending":
-        raise HTTPException(status_code=409, detail=f"Proposal decision is immutable: {request_body.proposal_id}")
-    if request_body.decision == "approved" and not bool((proposal.get("policy_check") or {}).get("allowed")):
-        raise HTTPException(status_code=409, detail=f"Sys proposal is blocked by policy: {request_body.proposal_id}")
-
     now = datetime.now(UTC).isoformat()
-    proposal["decision"] = request_body.decision
-    proposal["decided_by"] = request_body.decided_by
-    proposal["decision_reason"] = request_body.decision_reason
-    proposal["decision_at"] = now
-    proposal["updated_at"] = now
-    _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
-
-    traceability = dict(proposal.get("traceability") or {})
-    request_id = request_body.request_id or str(traceability.get("request_id") or request_body.proposal_id)
-    run_id = request_body.run_id or str(traceability.get("run_id") or request_id)
-    source = request_body.source or str(traceability.get("source") or "api")
+    proposals = _sync_sys_governance_store(app_state)
+    request_id = request_body.request_id or proposal["proposal_id"]
+    run_id = request_body.run_id or request_id
+    session_id = request_body.session_id
+    source = request_body.source or "api"
     context = request_body.context or "api.tools.sys.governance.decision"
-    session_id = request_body.session_id or traceability.get("session_id")
-
-    judge_log_fn = _get_app_symbol("log_judge_pre_action", log_judge_pre_action)
-    judge_log_fn(
-        tool_name="sys_governance_decision",
-        decision="allow" if request_body.decision == "approved" else "block",
-        issues=[request_body.decision_reason],
-        constraints={
-            "proposal_id": request_body.proposal_id,
-            "proposal_decision": request_body.decision,
-            "command": proposal.get("command"),
-        },
-        request_id=request_id,
-        session_id=session_id,
-        run_id=run_id,
-        source=source,
-        context=context,
-    )
 
     _append_sys_governance_event(
         _sys_governance_events_path(app_state),
@@ -449,7 +386,7 @@ async def decide_sys_governance_proposal(
             "proposal_id": request_body.proposal_id,
             "tool_name": "sys",
             "decision": request_body.decision,
-            "decided_by": request_body.decided_by,
+            "decided_by": principal.actor_id,
             "decision_reason": request_body.decision_reason,
             "command": proposal.get("command"),
             "traceability": {

@@ -27,6 +27,9 @@ from services.tools.governance import (
     sys_governance_store_path,
     sys_governance_events_path,
 )
+from services.api.storage.governance_repository import PostgresGovernanceRepository
+from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
+from services.api.services.governance_service import GovernanceService
 from services.workspace import get_workspace_status, list_workspace_artifacts
 
 # Import Subrouters
@@ -160,6 +163,15 @@ def create_api_app(
     app.state.sys_tool_events_path = events_path
     app.state.sys_tool_proposals = load_sys_governance_proposals(proposals_path)
     app.state.sys_tool_governance_lock = asyncio.Lock()
+
+    pool_inst = getattr(getattr(getattr(adapter, "memory_layer", None), "fact_store", None), "_pool", None)
+    gov_repo = PostgresGovernanceRepository(pool_inst, in_memory_store=app.state.sys_tool_proposals, app_state=app.state)
+    audit_repo = PostgresSysAuditRepository(pool_inst)
+    gov_service = GovernanceService(gov_repo, audit_repo)
+
+    app.state.governance_service = gov_service
+    app.state.governance_repository = gov_repo
+    app.state.audit_repository = audit_repo
 
     # Mount subrouters
     app.include_router(system_router)
