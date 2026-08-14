@@ -16,8 +16,12 @@ import logging
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
 
 _DEFAULT_REQUEST_ID = "missing_request_id"
 _DEFAULT_SOURCE = "unknown"
@@ -51,6 +55,7 @@ class SysAuditEntry:
     source: str | None = None
     context: str | None = None
     proposal_id: str | None = None
+    operation_id: str | None = None
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +110,64 @@ if not _audit_logger.handlers:
 
 
 # ---------------------------------------------------------------------------
+# Postgres repository delegation
+# ---------------------------------------------------------------------------
+#
+# Hard cutover (no dual-write flag): once a PostgresSysAuditRepository is
+# configured (i.e. running inside the API, where create_api_app() calls
+# configure_sys_audit_repository() right after constructing one), the write
+# functions below persist to Postgres only and skip the JSONL write.
+# sys_audit.jsonl stays a live target only when no repository is configured
+# (standalone scripts, existing unit tests that never call
+# configure_sys_audit_repository) -- it is not a second writable store once
+# the app is running.
+
+_repo: "PostgresSysAuditRepository | None" = None
+
+
+def configure_sys_audit_repository(repo: "PostgresSysAuditRepository | None") -> None:
+    """Wire a PostgresSysAuditRepository into this module's write functions."""
+    global _repo
+    _repo = repo
+
+
+def _delegate_to_repository(entry: "SysAuditEntry", entry_dict: dict[str, Any], *, fail_closed: bool = False) -> None:
+    """Persist a terminal (blocked/executed) entry to the configured repository."""
+    _repo.log_event_sync(
+        tool_name=entry.command,
+        lifecycle_stage="failed" if entry.policy_decision == "blocked" else "completed",
+        outcome=entry.policy_decision,
+        operation_id=entry.operation_id,
+        proposal_id=entry.proposal_id,
+        request_id=entry.request_id,
+        session_id=entry.session_id,
+        run_id=entry.run_id,
+        context=entry.context,
+        metadata=entry_dict,
+        fail_closed=fail_closed,
+        command=entry.command,
+        command_family=entry_dict.get("command_family"),
+        risk_level=entry_dict.get("risk_level"),
+        is_write=entry_dict.get("is_write"),
+        is_network=entry_dict.get("is_network"),
+        duration_ms=entry.duration_ms,
+    )
+
+
+def _persist_entry(entry: "SysAuditEntry") -> dict[str, Any]:
+    """Write a terminal entry to the configured Postgres repository if one is
+    wired up (hard cutover, no dual-write); otherwise fall back to the JSONL
+    logger (standalone scripts, tests that never call
+    configure_sys_audit_repository)."""
+    entry_dict = entry.to_dict()
+    if _repo is not None:
+        _delegate_to_repository(entry, entry_dict)
+    else:
+        _audit_logger.info(json.dumps(entry_dict))
+    return entry_dict
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -124,6 +187,7 @@ def log_blocked(
     source: str | None = None,
     context: str | None = None,
     proposal_id: str | None = None,
+    operation_id: str | None = None,
 ) -> SysAuditEntry:
     """Log a /sys request that was blocked by policy."""
     normalized_request_id = _derive_request_id(request_id=request_id, run_id=run_id, session_id=session_id)
@@ -150,8 +214,9 @@ def log_blocked(
         source=normalized_source,
         context=context,
         proposal_id=_normalize_optional_string(proposal_id),
+        operation_id=operation_id,
     )
-    _audit_logger.info(json.dumps(entry.to_dict()))
+    _persist_entry(entry)
     return entry
 
 
@@ -174,6 +239,7 @@ def log_executed(
     source: str | None = None,
     context: str | None = None,
     proposal_id: str | None = None,
+    operation_id: str | None = None,
 ) -> SysAuditEntry:
     """Log a /sys request that passed policy and was executed."""
     normalized_request_id = _derive_request_id(request_id=request_id, run_id=run_id, session_id=session_id)
@@ -200,8 +266,9 @@ def log_executed(
         source=normalized_source,
         context=context,
         proposal_id=_normalize_optional_string(proposal_id),
+        operation_id=operation_id,
     )
-    _audit_logger.info(json.dumps(entry.to_dict()))
+    _persist_entry(entry)
     return entry
 
 
@@ -258,8 +325,64 @@ def log_judge_pre_action(
         source=normalized_source,
         context=context or f"judge_pre_action:{decision_norm or 'unknown'}",
     )
-    _audit_logger.info(json.dumps(entry.to_dict()))
+    _persist_entry(entry)
     return entry
+
+
+def log_started(
+    command: str,
+    args: list[str] | None,
+    *,
+    target_path: str | None = None,
+    storage_scope: str | None = None,
+    write_mode: str | None = None,
+    request_id: str | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    source: str | None = None,
+    context: str | None = None,
+    proposal_id: str | None = None,
+) -> str | None:
+    """Fail-closed pre-action lifecycle event for a /sys command about to execute.
+
+    Returns an operation_id to thread into the matching terminal
+    log_executed() call, correlating the "started" and terminal events for
+    the same attempt. Writes to the configured Postgres repository only --
+    JSONL has no lifecycle concept to dual-write.
+
+    When no repository is configured (standalone scripts, existing tests
+    that never call configure_sys_audit_repository), this is a no-op that
+    still returns an operation_id, so callers don't need two code paths.
+    When a repository IS configured, a failed durable pre-action write
+    raises AuditPersistenceError -- callers (SysExecutor.run) must treat
+    that as fail-closed and not proceed to the external side effect.
+    """
+    operation_id = f"op-{uuid4().hex[:12]}"
+    if _repo is None:
+        return operation_id
+
+    normalized_request_id = _derive_request_id(request_id=request_id, run_id=run_id, session_id=session_id)
+    _repo.log_event_sync(
+        tool_name=command,
+        lifecycle_stage="started",
+        operation_id=operation_id,
+        proposal_id=_normalize_optional_string(proposal_id),
+        request_id=normalized_request_id,
+        session_id=_normalize_optional_string(session_id),
+        run_id=_normalize_optional_string(run_id),
+        context=context,
+        metadata={
+            "command": command,
+            "args": args,
+            "target_path": target_path,
+            "storage_scope": storage_scope,
+            "write_mode": write_mode,
+        },
+        fail_closed=True,
+        command=command,
+        command_family=_command_family(command),
+    )
+    return operation_id
 
 
 def load_entries(path: Path | None = None, *, limit: int | None = None) -> list[dict[str, Any]]:

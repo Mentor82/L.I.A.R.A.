@@ -18,13 +18,14 @@ import httpx
 import pytest
 
 from services.api.app import create_api_app
-from services.api.exceptions import GovernanceConflictError
+from services.api.exceptions import AuditPersistenceError, GovernanceConflictError
 from services.api.storage.governance_repository import PostgresGovernanceRepository
 from services.api.storage.schema_runner import apply_governance_schema_sync
 from services.memory_adapter import InProcessMemoryAdapter
 from services.memory.store import EphemeralMemoryStore, NullMemoryStore
 from services.memory.tier_store import MemoryLayer
 from scripts.migrate_legacy_audit_data import run_legacy_audit_migration
+from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
 
 
 def _make_in_process_adapter():
@@ -633,3 +634,101 @@ async def test_production_no_legacy_file_read_fallback(monkeypatch):
     # When API is unavailable in production, fallback must NOT return stale file audit entries
     events = data_layer.load_audit_events()
     assert events == []
+
+
+# -----------------------------------------------------------------------------
+# Test 11: Sys-Audit Lifecycle -- Started/Terminal Correlation and Stale Recovery
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_sys_audit_started_and_terminal_events_share_operation_id():
+    """Verify log_started()'s operation_id correlates with the terminal log_executed() row."""
+    import services.tools.builtin.sys_audit as sys_audit_module
+    from uuid import uuid4
+
+    pool = _get_real_postgres_pool()
+    repo = PostgresSysAuditRepository(pool)
+    sys_audit_module.configure_sys_audit_repository(repo)
+    try:
+        marker = uuid4().hex[:8]
+        operation_id = sys_audit_module.log_started(f"mkdir-{marker}", ["-p", "/tmp/x"], target_path="/tmp/x")
+        sys_audit_module.log_executed(
+            f"mkdir-{marker}", ["-p", "/tmp/x"], exit_code=0, duration_ms=1.0,
+            stdout_bytes=0, stderr_bytes=0, operation_id=operation_id,
+        )
+        events = await repo.list_events(limit=500)
+        matching = [e for e in events if e.get("operation_id") == operation_id]
+        assert len(matching) == 2
+        assert {e["lifecycle_stage"] for e in matching} == {"started", "completed"}
+    finally:
+        sys_audit_module.configure_sys_audit_repository(None)
+
+
+@pytest.mark.asyncio
+async def test_sys_audit_stale_started_event_recovers_to_outcome_unknown():
+    """A crash between log_started() and the terminal log_executed() must never
+    be silently read back as success -- recover_stale_events flips it to
+    outcome_unknown, mirroring PostgresGovernanceRepository.recover_stale_operations."""
+    pool = _get_real_postgres_pool()
+    repo = PostgresSysAuditRepository(pool)
+    result = await repo.log_event(tool_name="mkdir", lifecycle_stage="started", command="mkdir")
+    event_id = result["event_id"]
+
+    recovered = await repo.recover_stale_events(stale_threshold_seconds=0.0)
+    assert any(r["event_id"] == event_id for r in recovered)
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT lifecycle_stage FROM sys_audit_events WHERE event_id = %s;", (event_id,))
+            assert cur.fetchone()[0] == "outcome_unknown"
+    finally:
+        pool.putconn(conn)
+
+
+@pytest.mark.asyncio
+async def test_wsl_executor_fail_closed_on_audit_persistence_failure():
+    """WslExecutorTool.execute() must not spawn a WSL subprocess when the
+    fail-closed pre-action audit write fails."""
+    import services.tools.builtin.sys_audit as sys_audit_module
+    from services.tools.builtin.wsl_executor import WslExecutorTool
+
+    class _FailingRepo:
+        def log_event_sync(self, *args, **kwargs):
+            raise AuditPersistenceError("simulated durable audit outage")
+
+    sys_audit_module.configure_sys_audit_repository(_FailingRepo())
+    try:
+        tool = WslExecutorTool()
+        result = await tool.execute(command="mkdir", args=["-p", "/home/liara/workspace/x"])
+        assert result["status"] == "failed"
+        assert "audit" in (result["error"] or "").lower()
+    finally:
+        sys_audit_module.configure_sys_audit_repository(None)
+
+
+@pytest.mark.asyncio
+async def test_admin_sys_audit_summary_reads_postgres_when_no_log_path():
+    """Without an explicit log_path override, /admin/sys-audit/summary must
+    read from the Postgres-backed repository, not the legacy JSONL file."""
+    from uuid import uuid4
+
+    pool = _get_real_postgres_pool()
+    repo = PostgresSysAuditRepository(pool)
+    marker = uuid4().hex[:8]
+    await repo.log_event(
+        tool_name=f"mkdir-{marker}", lifecycle_stage="completed", outcome="allow",
+        command=f"mkdir-{marker}", command_family="filesystem", risk_level="high",
+    )
+
+    adapter = _make_in_process_adapter()
+    orch = _FakeOrchestrator()
+    app = create_api_app(orchestrator=orch, memory_adapter=adapter)
+    app.state.audit_repository = repo
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/admin/sys-audit/summary", params={"risk_level": "high", "command_family": "filesystem"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total"] >= 1
+    assert body["filters"]["log_path"] is None

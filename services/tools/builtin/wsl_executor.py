@@ -20,7 +20,8 @@ import time
 from ..base import Tool
 from .policy_db import list_policy_commands
 from .sys_command_policy import check_command_policy, check_command_request, list_profiled_command_names
-from .sys_audit import log_blocked, log_executed
+from .sys_audit import log_blocked, log_executed, log_started
+from services.api.exceptions import AuditPersistenceError
 from services.simulation.wsl_session_runtime import WslSessionError, WslSessionManager
 
 
@@ -722,6 +723,24 @@ class WslExecutorTool(Tool):
             )
             return self.failure(policy_error)
 
+        # Fail-closed pre-action audit: a durable "started" record must exist
+        # before any external side effect (WSL subprocess spawn / health probe)
+        # so a crash between here and the terminal log_executed() call is
+        # visible as incomplete/outcome_unknown, never inferred as success.
+        # No-op (returns an id, doesn't raise) when no repository is
+        # configured -- see sys_audit.log_started's docstring.
+        try:
+            operation_id = log_started(
+                command, args,
+                target_path=target_path,
+                storage_scope=storage_scope,
+                write_mode=write_mode,
+                request_id=request_id, session_id=session_id, run_id=run_id, source=source, context=context_val,
+                proposal_id=proposal_id,
+            )
+        except AuditPersistenceError as exc:
+            return self.failure(f"Audit persistence unavailable, refusing to execute: {exc}")
+
         if command_name == "health":
             _t_start = time.monotonic()
             try:
@@ -813,6 +832,7 @@ class WslExecutorTool(Tool):
                     duration_ms=_duration_ms,
                     stdout_bytes=len(stdout_bytes),
                     stderr_bytes=0,
+                    operation_id=operation_id,
                     stdin_text=stdin_text,
                     target_path=target_path,
                     storage_scope=storage_scope,
@@ -855,6 +875,7 @@ class WslExecutorTool(Tool):
                     duration_ms=_duration_ms,
                     stdout_bytes=0,
                     stderr_bytes=len(stderr_bytes),
+                    operation_id=operation_id,
                     stdin_text=stdin_text,
                     target_path=target_path,
                     storage_scope=storage_scope,
@@ -1000,6 +1021,7 @@ class WslExecutorTool(Tool):
                 duration_ms=_duration_ms,
                 stdout_bytes=0,
                 stderr_bytes=0,
+                operation_id=operation_id,
                 stdin_text=stdin_text,
                 target_path=target_path,
                 storage_scope=storage_scope,
@@ -1028,6 +1050,30 @@ class WslExecutorTool(Tool):
                         write_mode=write_mode,
                         stdin_text=stdin_text,
                         timeout=max(1, min(timeout, 5)),
+                    )
+                    # Gap this closes: a timed-out-but-actually-succeeded
+                    # mutation previously had no terminal audit event at all --
+                    # only the exit_code=124 "started-then-timed-out" record
+                    # above, never anything reflecting the reconciled success.
+                    log_executed(
+                        command,
+                        args,
+                        exit_code=0,
+                        duration_ms=_duration_ms,
+                        stdout_bytes=0,
+                        stderr_bytes=0,
+                        operation_id=operation_id,
+                        stdin_text=stdin_text,
+                        target_path=target_path,
+                        storage_scope=storage_scope,
+                        retention_hint_seconds=retention_hint_seconds,
+                        write_mode=write_mode,
+                        request_id=request_id,
+                        session_id=session_id,
+                        run_id=run_id,
+                        source=source,
+                        context=context_val,
+                        proposal_id=proposal_id,
                     )
                     return self.success(
                         "",
@@ -1084,6 +1130,7 @@ class WslExecutorTool(Tool):
             duration_ms=_duration_ms,
             stdout_bytes=len(stdout_bytes),
             stderr_bytes=len(stderr_bytes),
+            operation_id=operation_id,
             stdin_text=stdin_text,
             target_path=target_path,
             storage_scope=storage_scope,

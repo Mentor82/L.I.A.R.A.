@@ -1047,8 +1047,33 @@ async def act_on_sys_governance_proposal(
     }
 
 
+async def _load_sys_audit_entries_for_admin(
+    request: Request,
+    *,
+    log_path: str | None,
+    limit: int,
+    risk_level: str | None = None,
+    command_family: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load sys-audit entries for the admin endpoints.
+
+    log_path is an explicit escape hatch for export/debug tooling and always
+    reads the legacy JSONL file when given. Otherwise reads from the
+    Postgres-backed repository (risk_level/command_family pushed down as SQL
+    predicates via the hybrid schema, migration 003) -- falling back to the
+    JSONL file only if no repository is wired up on app.state at all.
+    """
+    if log_path:
+        return load_sys_audit_entries(Path(log_path), limit=limit)
+    audit_repo = getattr(request.app.state, "audit_repository", None)
+    if audit_repo is not None:
+        return await audit_repo.query_events(risk_level=risk_level, command_family=command_family, limit=limit)
+    return load_sys_audit_entries(None, limit=limit)
+
+
 @router.get("/admin/sys-audit/summary")
 async def sys_audit_summary(
+    request: Request,
     response: Response,
     limit: int = Query(default=500, ge=1, le=5000),
     blocked_only: bool = Query(default=False),
@@ -1058,8 +1083,9 @@ async def sys_audit_summary(
     log_path: str | None = Query(default=None),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    audit_path = Path(log_path) if log_path else None
-    entries = load_sys_audit_entries(audit_path, limit=limit)
+    entries = await _load_sys_audit_entries_for_admin(
+        request, log_path=log_path, limit=limit, risk_level=risk_level, command_family=command_family,
+    )
     filtered = filter_sys_audit_entries(
         entries,
         blocked_only=blocked_only,
@@ -1068,7 +1094,7 @@ async def sys_audit_summary(
         command_family=command_family,
     )
     summary = summarize_sys_audit_entries(filtered)
-    summary["available_entries"] = count_sys_audit_entries(audit_path)
+    summary["available_entries"] = count_sys_audit_entries(Path(log_path)) if log_path else len(entries)
     summary["inspected_entries"] = len(entries)
     summary["filtered_entries"] = len(filtered)
     return {
@@ -1087,6 +1113,7 @@ async def sys_audit_summary(
 
 @router.get("/admin/sys-audit/suspicious")
 async def sys_audit_suspicious(
+    request: Request,
     response: Response,
     limit: int = Query(default=500, ge=1, le=5000),
     max_items: int = Query(default=30, ge=1, le=200),
@@ -1097,7 +1124,9 @@ async def sys_audit_suspicious(
     log_path: str | None = Query(default=None),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    entries = load_sys_audit_entries(Path(log_path) if log_path else None, limit=limit)
+    entries = await _load_sys_audit_entries_for_admin(
+        request, log_path=log_path, limit=limit, risk_level=risk_level, command_family=command_family,
+    )
     filtered = filter_sys_audit_entries(
         entries,
         blocked_only=blocked_only,
@@ -1125,6 +1154,7 @@ async def sys_audit_suspicious(
 @router.get("/admin/sys-audit/presets/{preset_name}")
 async def sys_audit_preset(
     preset_name: str,
+    request: Request,
     response: Response,
     log_path: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=5000),
@@ -1172,7 +1202,13 @@ async def sys_audit_preset(
     selected["limit"] = int(limit or selected["limit"])
     selected["max_items"] = int(max_items or selected["max_items"])
 
-    entries = load_sys_audit_entries(Path(log_path) if log_path else None, limit=selected["limit"])
+    entries = await _load_sys_audit_entries_for_admin(
+        request,
+        log_path=log_path,
+        limit=selected["limit"],
+        risk_level=selected["risk_level"],
+        command_family=selected["command_family"],
+    )
     filtered = filter_sys_audit_entries(
         entries,
         blocked_only=selected["blocked_only"],

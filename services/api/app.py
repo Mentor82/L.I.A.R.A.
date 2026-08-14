@@ -20,7 +20,7 @@ from services.memory.store import BackedMemoryServiceStore, EphemeralMemoryStore
 from services.memory.tier_store import MemoryLayer
 from services.memory_adapter import InProcessMemoryAdapter, MemoryServiceAdapter
 from services.orchestrator import Orchestrator
-from services.tools.builtin.sys_audit import log_judge_pre_action
+from services.tools.builtin.sys_audit import configure_sys_audit_repository, log_judge_pre_action
 from services.tools.coordinator import ToolCoordinator
 from services.tools.governance import (
     load_sys_governance_proposals,
@@ -172,6 +172,10 @@ def create_api_app(
     app.state.governance_service = gov_service
     app.state.governance_repository = gov_repo
     app.state.audit_repository = audit_repo
+    # Hard cutover: wsl_executor.py/tool_discovery.py/generation_pipeline.py/
+    # chat.py's log_blocked/log_executed/log_judge_pre_action/log_started calls
+    # write to Postgres from here on instead of sys_audit.jsonl.
+    configure_sys_audit_repository(audit_repo)
 
     # Mount subrouters
     app.include_router(system_router)
