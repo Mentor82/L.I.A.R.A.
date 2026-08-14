@@ -172,8 +172,17 @@ class GovernanceService:
         run_id: Optional[str] = None,
         source: str = "api",
         context: str = "api.tools.sys.governance.decision",
+        handoff_update: Optional[dict[str, Any]] = None,
+        invocation_update: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Atomically transition a proposal decision using multi-attribute CAS."""
+        """Atomically transition a proposal decision using multi-attribute CAS.
+
+        handoff_update/invocation_update, when given, are committed in the
+        SAME CAS statement as the decision -- the caller (router) computes
+        them before calling this, since they may depend on orchestrator/
+        workspace-agent state this FastAPI-free service intentionally has no
+        access to.
+        """
         if decision not in {"approved", "rejected"}:
             raise PolicyViolationError(f"Invalid decision value: {decision}. Must be 'approved' or 'rejected'.")
 
@@ -207,6 +216,8 @@ class GovernanceService:
                 "source": source,
                 "context": context,
             },
+            handoff_update=handoff_update,
+            invocation_update=invocation_update,
         )
 
         # Log audit event for decision
@@ -337,3 +348,19 @@ class GovernanceService:
     async def list_events(self, proposal_id: Optional[str] = None, limit: int = 100) -> List[dict[str, Any]]:
         """List immutable governance_events rows, optionally filtered to one proposal."""
         return await self.repo.list_events(proposal_id=proposal_id, limit=limit)
+
+    async def update_handoff(
+        self,
+        proposal_id: str,
+        expected_revision: int,
+        handoff: dict[str, Any],
+        invocation: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """CAS-guarded update of a proposal's handoff (and optionally invocation)
+        state, keyed on revision alone.
+
+        Used after an external workspace-agent resume call whose result must
+        be persisted using the revision execute_atomic_cas_decision's own
+        handoff_update already returned -- see decide_proposal's docstring.
+        """
+        return await self.repo.update_handoff(proposal_id, expected_revision, handoff, invocation=invocation)

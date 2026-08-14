@@ -302,7 +302,18 @@ class PostgresGovernanceRepository:
         decided_by: str,
         decision_reason: Optional[str],
         traceability: Optional[dict[str, Any]] = None,
+        handoff_update: Optional[dict[str, Any]] = None,
+        invocation_update: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        """Atomically transition a proposal's decision/state.
+
+        When handoff_update/invocation_update are given, those columns are
+        set in the SAME UPDATE statement and transaction as the decision
+        itself -- computing their values must happen before calling this (see
+        GovernanceService.decide_proposal), never as a second CAS call
+        afterward, since a second call would use a now-stale expected_revision
+        once this one has already committed.
+        """
         now = datetime.now(UTC).isoformat()
 
         if self._pool is None:
@@ -338,7 +349,11 @@ class PostgresGovernanceRepository:
             prop["decision_reason"] = decision_reason
             prop["decision_at"] = now
             prop["updated_at"] = now
-            
+            if handoff_update is not None:
+                prop["handoff"] = handoff_update
+            if invocation_update is not None:
+                prop["invocation"] = invocation_update
+
             # Persist back to disk if path is defined
             p_path = Path(self._app_state.sys_tool_proposals_path) if self._app_state and getattr(self._app_state, "sys_tool_proposals_path", None) else sys_governance_store_path()
             persist_sys_governance_proposals(dict_store, p_path)
@@ -357,32 +372,32 @@ class PostgresGovernanceRepository:
 
         def _sync_cas(conn):
             with conn.cursor() as cur:
-                # Execute CAS update checking (proposal_id, revision, state, decision)
+                set_clauses = [
+                    "revision = revision + 1",
+                    "decision = %s",
+                    "state = %s",
+                    "decided_by = %s",
+                    "decision_reason = %s",
+                    "decision_at = %s",
+                    "updated_at = %s",
+                ]
+                params: list[Any] = [new_decision, new_state, decided_by, decision_reason, now, now]
+                if handoff_update is not None:
+                    set_clauses.append("handoff = %s")
+                    params.append(json.dumps(redact_and_bound_payload(handoff_update)))
+                if invocation_update is not None:
+                    set_clauses.append("invocation = %s")
+                    params.append(json.dumps(redact_and_bound_payload(invocation_update)))
+                params.extend([proposal_id, expected_revision, expected_state, expected_decision])
+
                 cur.execute(
-                    """
+                    f"""
                     UPDATE governance_proposals
-                    SET revision = revision + 1,
-                        decision = %s,
-                        state = %s,
-                        decided_by = %s,
-                        decision_reason = %s,
-                        decision_at = %s,
-                        updated_at = %s
+                    SET {', '.join(set_clauses)}
                     WHERE proposal_id = %s AND revision = %s AND state = %s AND decision = %s
-                    RETURNING proposal_id, revision, decision, state, updated_at;
+                    RETURNING proposal_id, revision, decision, state, updated_at, handoff, invocation;
                     """,
-                    (
-                        new_decision,
-                        new_state,
-                        decided_by,
-                        decision_reason,
-                        now,
-                        now,
-                        proposal_id,
-                        expected_revision,
-                        expected_state,
-                        expected_decision,
-                    ),
+                    tuple(params),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -398,6 +413,8 @@ class PostgresGovernanceRepository:
                     )
 
                 new_revision = row[1]
+                new_handoff = row[5] if isinstance(row[5], dict) else json.loads(row[5] or "{}")
+                new_invocation = row[6] if isinstance(row[6], dict) else json.loads(row[6] or "{}")
                 # Insert immutable governance event in the SAME transaction
                 event_id = f"evt-{uuid4().hex[:12]}"
                 cur.execute(
@@ -428,9 +445,94 @@ class PostgresGovernanceRepository:
                     "decision_reason": decision_reason,
                     "decision_at": now,
                     "updated_at": now,
+                    "handoff": new_handoff,
+                    "invocation": new_invocation,
                 }
 
         return await asyncio.to_thread(self._run_in_connection, _sync_cas)
+
+    async def update_handoff(
+        self,
+        proposal_id: str,
+        expected_revision: int,
+        handoff: dict[str, Any],
+        invocation: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """CAS-guarded update of the handoff column (and optionally invocation),
+        keyed on revision alone.
+
+        For the case where a handoff transition depends on the result of an
+        external side effect (e.g. workspace_agent.resume_from_governance_proposal)
+        that genuinely cannot be part of the same DB transaction as the
+        decision CAS: callers must pass the *fresh* revision returned by that
+        decision CAS (execute_atomic_cas_decision's return value), not the
+        pre-decision revision, since the decision CAS already bumped it once.
+        """
+        now = datetime.now(UTC).isoformat()
+
+        if self._pool is None:
+            dict_store = self._get_proposals_dict()
+            prop = dict_store.get(proposal_id)
+            if not prop:
+                p_path = Path(self._app_state.sys_tool_proposals_path) if self._app_state and getattr(self._app_state, "sys_tool_proposals_path", None) else sys_governance_store_path()
+                disk_items = load_sys_governance_proposals(p_path)
+                if proposal_id in disk_items:
+                    prop = disk_items[proposal_id]
+                    dict_store[proposal_id] = prop
+            if not prop:
+                raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
+            if prop.get("revision") != expected_revision:
+                raise GovernanceConflictError(
+                    f"update_handoff CAS failed for proposal {proposal_id}: "
+                    f"expected revision={expected_revision}, actual revision={prop.get('revision')}"
+                )
+            prop["revision"] = expected_revision + 1
+            prop["handoff"] = handoff
+            if invocation is not None:
+                prop["invocation"] = invocation
+            prop["updated_at"] = now
+            p_path = Path(self._app_state.sys_tool_proposals_path) if self._app_state and getattr(self._app_state, "sys_tool_proposals_path", None) else sys_governance_store_path()
+            persist_sys_governance_proposals(dict_store, p_path)
+            return dict(prop)
+
+        def _sync_update_handoff(conn):
+            with conn.cursor() as cur:
+                set_clauses = ["revision = revision + 1", "handoff = %s", "updated_at = %s"]
+                params: list[Any] = [json.dumps(redact_and_bound_payload(handoff)), now]
+                if invocation is not None:
+                    set_clauses.append("invocation = %s")
+                    params.append(json.dumps(redact_and_bound_payload(invocation)))
+                params.extend([proposal_id, expected_revision])
+                cur.execute(
+                    f"""
+                    UPDATE governance_proposals
+                    SET {', '.join(set_clauses)}
+                    WHERE proposal_id = %s AND revision = %s
+                    RETURNING proposal_id, revision, decision, state, handoff, updated_at, invocation;
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("SELECT revision FROM governance_proposals WHERE proposal_id = %s;", (proposal_id,))
+                    existing = cur.fetchone()
+                    if not existing:
+                        raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
+                    raise GovernanceConflictError(
+                        f"update_handoff CAS failed for proposal {proposal_id}: "
+                        f"expected revision={expected_revision}, actual revision={existing[0]}"
+                    )
+                return {
+                    "proposal_id": row[0],
+                    "revision": row[1],
+                    "decision": row[2],
+                    "state": row[3],
+                    "handoff": row[4] if isinstance(row[4], dict) else json.loads(row[4] or "{}"),
+                    "updated_at": row[5].isoformat() if hasattr(row[5], "isoformat") else row[5],
+                    "invocation": row[6] if isinstance(row[6], dict) else json.loads(row[6] or "{}"),
+                }
+
+        return await asyncio.to_thread(self._run_in_connection, _sync_update_handoff)
 
     async def claim_operation(
         self,

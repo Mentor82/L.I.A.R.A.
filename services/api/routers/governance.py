@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -51,6 +52,8 @@ from services.tools.governance import (
 )
 from services.workspace import persist_governance_decision
 
+
+logger = logging.getLogger("liara.api.governance")
 
 router = APIRouter(tags=["governance"])
 
@@ -375,18 +378,85 @@ async def decide_sys_governance_proposal(
     service: Any = Depends(get_governance_service),
     principal: Principal = Depends(get_verified_principal),
 ) -> dict[str, Any]:
+    """Decide (approve/reject) a sys proposal, including any workspace checkpoint handoff.
+
+    handoff is a governance_proposals column (Postgres), not the legacy JSON
+    file: the router computes what handoff transition to request (it needs
+    app_state.orchestrator, which the FastAPI-free GovernanceService
+    intentionally has no access to), then either commits it in the SAME CAS
+    call as the decision (reject, or approve-with-no-resumable-agent -- no
+    external side effect needed) or, when an external
+    workspace_agent.resume_from_governance_proposal call is unavoidable,
+    commits an interim "resuming" handoff in that same CAS call and persists
+    the final result afterward via update_handoff, using the fresh revision
+    the decision CAS itself returned (never a second call with the
+    pre-decision revision -- see execute_atomic_cas_decision's docstring).
+    """
     response.headers["Cache-Control"] = "no-store"
+    app_state = request.app.state
+    now = datetime.now(UTC).isoformat()
+    request_id = request_body.request_id or request_body.proposal_id
+    run_id = request_body.run_id or request_id
+    session_id = request_body.session_id
+    source = request_body.source or "api"
+    context = request_body.context or "api.tools.sys.governance.decision"
+
+    try:
+        pre_proposal = await service.get_proposal(request_body.proposal_id)
+    except GovernanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    handoff = pre_proposal.get("handoff") if isinstance(pre_proposal.get("handoff"), dict) else {}
+    checkpoint = handoff.get("checkpoint") if isinstance(handoff.get("checkpoint"), dict) else {}
+    invocation = pre_proposal.get("invocation") if isinstance(pre_proposal.get("invocation"), dict) else {}
+    needs_resume = False
+    handoff_update: dict[str, Any] | None = None
+    invocation_update: dict[str, Any] | None = None
+    workspace_agent = None
+    if checkpoint:
+        if request_body.decision == "rejected":
+            handoff_update = {
+                **handoff,
+                "state": "rejected",
+                "resume": {"status": "rejected", "decided_at": now, "reason": request_body.decision_reason},
+            }
+        else:
+            orch = getattr(app_state, "orchestrator", None)
+            workspace_agent = getattr(orch, "workspace_agent", None)
+            if workspace_agent is None or not hasattr(workspace_agent, "resume_from_governance_proposal"):
+                handoff_update = {
+                    **handoff,
+                    "state": "resume_unavailable",
+                    "resume": {"status": "unavailable", "error": "orchestrator has no resumable workspace agent"},
+                }
+            else:
+                handoff_update = {**handoff, "state": "resuming"}
+                needs_resume = True
+                # Mirrors invoke_tool()'s own invocation bookkeeping (bumped
+                # here since the resume flow below calls ToolCoordinator
+                # directly rather than going through invoke_tool()).
+                invocation_update = {
+                    **invocation,
+                    "state": "invoking",
+                    "attempt_count": int(invocation.get("attempt_count") or 0) + 1,
+                    "last_attempt_at": now,
+                    "last_request_id": request_id,
+                    "last_run_id": run_id,
+                }
+
     try:
         proposal = await service.decide_proposal(
             proposal_id=request_body.proposal_id,
             decision=request_body.decision,
             principal=principal,
             decision_reason=request_body.decision_reason,
-            session_id=request_body.session_id,
+            session_id=session_id,
             request_id=request_body.request_id,
             run_id=request_body.run_id,
-            source=request_body.source or "api",
-            context=request_body.context or "api.tools.sys.governance.decision",
+            source=source,
+            context=context,
+            handoff_update=handoff_update,
+            invocation_update=invocation_update,
         )
     except GovernanceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -400,15 +470,6 @@ async def decide_sys_governance_proposal(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GovernanceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    app_state = request.app.state
-    now = datetime.now(UTC).isoformat()
-    proposals = _sync_sys_governance_store(app_state)
-    request_id = request_body.request_id or proposal["proposal_id"]
-    run_id = request_body.run_id or request_id
-    session_id = request_body.session_id
-    source = request_body.source or "api"
-    context = request_body.context or "api.tools.sys.governance.decision"
 
     _append_sys_governance_event(
         _sys_governance_events_path(app_state),
@@ -455,110 +516,139 @@ async def decide_sys_governance_proposal(
             "error": str(exc),
         }
 
-    handoff = proposal.get("handoff") if isinstance(proposal.get("handoff"), dict) else {}
-    checkpoint = handoff.get("checkpoint") if isinstance(handoff.get("checkpoint"), dict) else {}
     resume_payload: dict[str, Any] | None = None
-    if checkpoint:
-        if request_body.decision == "rejected":
-            handoff["state"] = "rejected"
-            handoff["resume"] = {
-                "status": "rejected",
-                "decided_at": now,
-                "reason": request_body.decision_reason,
-            }
-        else:
-            orch = getattr(app_state, "orchestrator", None)
-            workspace_agent = getattr(orch, "workspace_agent", None)
-            if workspace_agent is None or not hasattr(workspace_agent, "resume_from_governance_proposal"):
-                handoff["state"] = "resume_unavailable"
-                handoff["resume"] = {
-                    "status": "unavailable",
-                    "error": "orchestrator has no resumable workspace agent",
-                }
-            else:
-                handoff["state"] = "resuming"
-                proposal["handoff"] = handoff
-                proposal["updated_at"] = datetime.now(UTC).isoformat()
-                _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
-                try:
-                    from services.api.routers.tools import invoke_tool
-                    invoke_parameters = dict(proposal.get("parameters") or {})
-                    invoke_parameters["proposal_id"] = request_body.proposal_id
-                    approved_execution = await invoke_tool(
-                        "sys",
-                        ToolInvokeRequest(parameters=invoke_parameters),
-                        request,
-                        Response(),
-                    )
-                    refreshed = _sync_sys_governance_store(app_state).get(request_body.proposal_id)
-                    if refreshed is None:
-                        raise RuntimeError("approved workspace proposal disappeared during invocation")
-                    workspace_result = await workspace_agent.resume_from_governance_proposal(
-                        refreshed,
-                        approved_execution,
-                    )
-                    resume_payload = workspace_result.model_dump(mode="json")
-                    persistence: dict[str, Any]
-                    try:
-                        persistence = await workspace_agent.persist_run_artifact(
-                            workspace_result,
-                            session_id=str(session_id or ""),
-                            run_id=run_id,
-                        )
-                    except Exception as persist_error:
-                        persistence = {"status": "failed", "error": str(persist_error)}
-                    resume_payload["persistence"] = persistence
-                    proposals = _sync_sys_governance_store(app_state)
-                    proposal = proposals[request_body.proposal_id]
-                    handoff = dict(proposal.get("handoff") or {})
-                    handoff["state"] = (
-                        "resume_completed" if workspace_result.status == "completed" else workspace_result.status
-                    )
-                    handoff["resume"] = {
-                        "status": workspace_result.status,
-                        "completed_at": datetime.now(UTC).isoformat(),
-                        "step_count": len(workspace_result.steps),
-                        "validator": dict(workspace_result.validator or {}),
-                        "persistence": persistence,
-                    }
-                except Exception as exc:
-                    proposals = _sync_sys_governance_store(app_state)
-                    proposal = proposals[request_body.proposal_id]
-                    handoff = dict(proposal.get("handoff") or {})
-                    handoff["state"] = "resume_failed"
-                    handoff["resume"] = {
-                        "status": "failed",
-                        "failed_at": datetime.now(UTC).isoformat(),
-                        "error": str(exc),
-                    }
-                    resume_payload = dict(handoff["resume"])
-                proposal["handoff"] = handoff
-                proposal["updated_at"] = datetime.now(UTC).isoformat()
-                _append_sys_governance_event(
-                    _sys_governance_events_path(app_state),
-                    {
-                        "event_type": {
-                            "resume_completed": "workspace_resume_completed",
-                            "awaiting_decision": "workspace_resume_paused",
-                        }.get(str(handoff.get("state") or ""), "workspace_resume_failed"),
-                        "proposal_id": request_body.proposal_id,
-                        "tool_name": "sys",
-                        "resume_status": (handoff.get("resume") or {}).get("status"),
-                        "traceability": {
-                            "request_id": request_id,
-                            "run_id": run_id,
-                            "session_id": session_id,
-                            "source": source,
-                            "context": "api.tools.sys.governance.workspace_resume",
-                        },
-                    },
+    if needs_resume:
+        # proposal["revision"] here is the FRESH revision the decision CAS
+        # above returned -- required by update_handoff's own CAS predicate.
+        _append_sys_governance_event(
+            _sys_governance_events_path(app_state),
+            {
+                "event_type": "invocation_attempted",
+                "proposal_id": request_body.proposal_id,
+                "tool_name": "sys",
+                "invocation_digest": proposal.get("invocation_digest"),
+                "attempt_count": (invocation_update or {}).get("attempt_count"),
+                "traceability": {
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "source": source,
+                    "context": context,
+                },
+            },
+        )
+        try:
+            invoke_parameters = dict(proposal.get("parameters") or {})
+            invoke_parameters.setdefault("request_id", request_id)
+            invoke_parameters.setdefault("run_id", run_id)
+            invoke_parameters.setdefault("source", source)
+            invoke_parameters.setdefault("context", context)
+            # Direct ToolCoordinator call, not the HTTP invoke_tool() endpoint:
+            # this decision's CAS is already this call's governance
+            # authorization (same rationale as act_on_sys_governance_proposal
+            # in Phase 1), and invoke_tool()'s own governance re-validation is
+            # file-backed (Phase 4 territory) so it wouldn't find a
+            # Postgres-only proposal anyway.
+            tool_coordinator = ToolCoordinator()
+            approved_execution = await tool_coordinator.execute_tool(
+                ToolExecutionRequest(tool_name="sys", parameters=invoke_parameters)
+            )
+            workspace_result = await workspace_agent.resume_from_governance_proposal(
+                proposal,
+                approved_execution,
+            )
+            resume_payload = workspace_result.model_dump(mode="json")
+            persistence: dict[str, Any]
+            try:
+                persistence = await workspace_agent.persist_run_artifact(
+                    workspace_result,
+                    session_id=str(session_id or ""),
+                    run_id=run_id,
                 )
+            except Exception as persist_error:
+                persistence = {"status": "failed", "error": str(persist_error)}
+            resume_payload["persistence"] = persistence
+            resume_succeeded = workspace_result.status == "completed"
+            final_handoff = {
+                **handoff_update,
+                "state": "resume_completed" if resume_succeeded else workspace_result.status,
+                "resume": {
+                    "status": workspace_result.status,
+                    "completed_at": datetime.now(UTC).isoformat(),
+                    "step_count": len(workspace_result.steps),
+                    "validator": dict(workspace_result.validator or {}),
+                    "persistence": persistence,
+                },
+            }
+            final_invocation = {
+                **(invocation_update or {}),
+                "state": "completed" if resume_succeeded else "failed",
+                "success_count": int((invocation_update or {}).get("success_count") or 0) + int(resume_succeeded),
+                "last_completed_at": datetime.now(UTC).isoformat(),
+                "last_status": workspace_result.status,
+            }
+        except Exception as exc:
+            final_handoff = {
+                **handoff_update,
+                "state": "resume_failed",
+                "resume": {"status": "failed", "failed_at": datetime.now(UTC).isoformat(), "error": str(exc)},
+            }
+            resume_payload = dict(final_handoff["resume"])
+            final_invocation = {
+                **(invocation_update or {}),
+                "state": "failed",
+                "last_completed_at": datetime.now(UTC).isoformat(),
+                "last_error": str(exc),
+            }
 
-        proposal["handoff"] = handoff
-        proposal["updated_at"] = datetime.now(UTC).isoformat()
+        _append_sys_governance_event(
+            _sys_governance_events_path(app_state),
+            {
+                "event_type": "invocation_completed" if final_invocation.get("state") == "completed" else "invocation_failed",
+                "proposal_id": request_body.proposal_id,
+                "tool_name": "sys",
+                "status": final_invocation.get("last_status"),
+                "error": final_invocation.get("last_error"),
+                "success_count": final_invocation.get("success_count"),
+                "traceability": {
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "source": source,
+                    "context": context,
+                },
+            },
+        )
 
-    proposals[request_body.proposal_id] = proposal
-    _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+        try:
+            proposal = await service.update_handoff(
+                request_body.proposal_id, proposal["revision"], final_handoff, invocation=final_invocation
+            )
+        except (GovernanceConflictError, GovernanceNotFoundError) as exc:
+            # The decision itself already committed successfully; a failure
+            # persisting the final handoff result must not turn this into a
+            # 409/404 for the whole (already-decided) request.
+            logger.warning(f"Failed to persist final handoff state for {request_body.proposal_id}: {exc}")
+
+        _append_sys_governance_event(
+            _sys_governance_events_path(app_state),
+            {
+                "event_type": {
+                    "resume_completed": "workspace_resume_completed",
+                    "awaiting_decision": "workspace_resume_paused",
+                }.get(str(final_handoff.get("state") or ""), "workspace_resume_failed"),
+                "proposal_id": request_body.proposal_id,
+                "tool_name": "sys",
+                "resume_status": (final_handoff.get("resume") or {}).get("status"),
+                "traceability": {
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "source": source,
+                    "context": "api.tools.sys.governance.workspace_resume",
+                },
+            },
+        )
 
     return {
         "status": "success",
