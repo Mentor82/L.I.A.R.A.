@@ -49,6 +49,8 @@ class SysToolProposalDecisionRequest(BaseModel):
     proposal_id: str
     decision: Literal["approved", "rejected"]
     decided_by: str
+    """Client-supplied hint only; actual attribution is derived from the
+    verified Principal via Depends(get_verified_principal). Not authoritative."""
     decision_reason: str
     request_id: str | None = None
     run_id: str | None = None
@@ -63,6 +65,8 @@ class SysToolProposalActionRequest(BaseModel):
     proposal_id: str
     action: Literal["apply", "rollback"]
     acted_by: str
+    """Client-supplied hint only; actual attribution is derived from the
+    verified Principal via Depends(get_verified_principal). Not authoritative."""
     action_reason: str
     request_id: str | None = None
     run_id: str | None = None

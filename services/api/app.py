@@ -10,9 +10,19 @@ import typing
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from services.api.exceptions import (
+    AuditPersistenceError,
+    ForbiddenPrincipalError,
+    GovernanceConflictError,
+    GovernanceError,
+    GovernanceNotFoundError,
+    PolicyViolationError,
+    UnauthorizedPrincipalError,
+)
 from services.config import Settings
 from services.inference.gateway import InferenceGateway
 from services.inference.tts_adapter import TtsServiceAdapter
@@ -83,6 +93,38 @@ def create_default_orchestrator(memory_adapter: MemoryServiceAdapter) -> Orchest
     )
 
 
+_GOVERNANCE_EXCEPTION_STATUS_CODES: list[tuple[type[GovernanceError], int]] = [
+    (UnauthorizedPrincipalError, 401),
+    (ForbiddenPrincipalError, 403),
+    (GovernanceNotFoundError, 404),
+    (GovernanceConflictError, 409),
+    (PolicyViolationError, 409),
+    (AuditPersistenceError, 503),
+]
+
+
+async def _governance_domain_exception_handler(request: Request, exc: GovernanceError) -> JSONResponse:
+    """App-level safety net mapping GovernanceError (and subclasses) to stable
+    HTTP status codes.
+
+    Router endpoints already catch these explicitly within their own try/except
+    blocks for exceptions raised inside the endpoint body -- but exceptions
+    raised from a FastAPI dependency (e.g. Depends(get_verified_principal)
+    raising UnauthorizedPrincipalError) occur *before* the endpoint body ever
+    runs, so no in-body try/except can catch them. Without this handler, such
+    a dependency-level failure surfaces as an unhandled 500 instead of the
+    intended 401/403/etc. Starlette dispatches by walking the exception's MRO,
+    so registering this once for the base GovernanceError class also covers
+    every subclass, even ones not explicitly listed in the status-code table.
+    """
+    status_code = 400
+    for exc_type, mapped_status in _GOVERNANCE_EXCEPTION_STATUS_CODES:
+        if isinstance(exc, exc_type):
+            status_code = mapped_status
+            break
+    return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+
+
 async def _maybe_close(value: typing.Any) -> None:
     close_fn = getattr(value, "close", None)
     if not callable(close_fn):
@@ -134,6 +176,7 @@ def create_api_app(
         await _maybe_close(adapter)
 
     app = FastAPI(title="liara-api", lifespan=_lifespan)
+    app.add_exception_handler(GovernanceError, _governance_domain_exception_handler)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_allowed_origins(),

@@ -732,3 +732,90 @@ async def test_admin_sys_audit_summary_reads_postgres_when_no_log_path():
     body = response.json()
     assert body["summary"]["total"] >= 1
     assert body["filters"]["log_path"] is None
+
+
+# -----------------------------------------------------------------------------
+# Test 12: Principal Enforcement End-to-End (401/403 Through Real HTTP, Not
+# Just the Dependency Function) and Non-Impersonation
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_http_401_missing_auth_and_403_non_admin_on_real_endpoints(monkeypatch):
+    """Unlike calling get_verified_principal/require_admin_principal directly
+    (tests 8/9), this hits real HTTP endpoints end-to-end -- proving both the
+    Depends(...) wiring AND the app-level GovernanceError exception handler
+    (dependencies raise before the endpoint body's own try/except can run)
+    actually produce 401/403, not an unhandled 500."""
+    monkeypatch.setenv("LIARA_FAIL_CLOSED_AUTH", "true")
+    monkeypatch.setenv("LIARA_USER_TOKEN", "real-endpoint-user-token")
+
+    adapter = _make_in_process_adapter()
+    orch = _FakeOrchestrator()
+    app = create_api_app(orchestrator=orch, memory_adapter=adapter)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # No Authorization header at all -> get_verified_principal fails closed.
+        no_auth = await client.get("/tools/sys/governance/proposals")
+        assert no_auth.status_code == 401
+
+        # Authenticated as a regular (non-admin) user -> require_admin_principal
+        # rejects the admin-only sys-audit endpoint.
+        non_admin = await client.get(
+            "/admin/sys-audit/summary",
+            headers={"Authorization": "Bearer real-endpoint-user-token"},
+        )
+        assert non_admin.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_forged_acted_by_does_not_impersonate(monkeypatch):
+    """A client-supplied acted_by naming a different actor must never reach
+    persisted attribution -- only the verified principal's actor_id does."""
+    pool = _get_real_postgres_pool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
+    from uuid import uuid4
+    proposal_id = f"sys-prop-impersonate-{uuid4().hex[:8]}"
+    await repo.save_proposal({
+        "proposal_id": proposal_id, "command": "health", "revision": 1,
+        "state": "created", "decision": "pending", "requested_by": "test.runner",
+    })
+    await repo.execute_atomic_cas_decision(
+        proposal_id, 1, "created", "pending", "approved", "decided",
+        "real.decider", "approved for test",
+    )
+
+    adapter = _make_in_process_adapter()
+    orch = _FakeOrchestrator()
+    app = create_api_app(orchestrator=orch, memory_adapter=adapter)
+    app.state.governance_repository = repo
+    from services.api.services.governance_service import GovernanceService
+    from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
+    app.state.governance_service = GovernanceService(repo, PostgresSysAuditRepository(pool))
+
+    monkeypatch.setenv("LIARA_FAIL_CLOSED_AUTH", "true")
+    monkeypatch.setenv("LIARA_ADMIN_TOKEN", "real-admin-token")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/tools/sys/governance/actions",
+            json={
+                "proposal_id": proposal_id,
+                "action": "apply",
+                "acted_by": "forged.impersonated.actor",
+                "action_reason": "attempt impersonation",
+            },
+            headers={
+                "Authorization": "Bearer real-admin-token",
+                "X-LIARA-Actor-ID": "genuine.verified.actor",
+            },
+        )
+    # health has no reversible target, so apply either succeeds (200) or
+    # fails for unrelated ToolCoordinator reasons (409) -- either way the
+    # claimed operation's actor_id must reflect the verified principal.
+    assert response.status_code in (200, 409)
+
+    latest_op = await repo.get_latest_operation(proposal_id, "apply")
+    assert latest_op is not None
+    assert latest_op["actor_id"] == "genuine.verified.actor"
+    assert latest_op["actor_id"] != "forged.impersonated.actor"

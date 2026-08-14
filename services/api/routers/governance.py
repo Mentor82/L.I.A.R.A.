@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from services.api.deps import get_orchestrator, get_governance_service, get_verified_principal
-from services.api.security import Principal
+from services.api.security import Principal, require_admin_principal
 from services.api.exceptions import (
     AuditPersistenceError,
     ForbiddenPrincipalError,
@@ -289,6 +289,7 @@ async def list_sys_governance_proposals(
     response: Response,
     decision: str = Query(default="all"),
     limit: int = Query(default=50, ge=1, le=500),
+    principal: Principal = Depends(get_verified_principal),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     app_state = request.app.state
@@ -340,6 +341,7 @@ async def list_sys_governance_events(
     response: Response,
     proposal_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    principal: Principal = Depends(get_verified_principal),
 ) -> dict[str, Any]:
     """List governance events from the legacy JSONL file.
 
@@ -1088,6 +1090,7 @@ async def sys_audit_summary(
     risk_level: str | None = Query(default=None),
     command_family: str | None = Query(default=None),
     log_path: str | None = Query(default=None),
+    principal: Principal = Depends(require_admin_principal),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     entries = await _load_sys_audit_entries_for_admin(
@@ -1129,6 +1132,7 @@ async def sys_audit_suspicious(
     risk_level: str | None = Query(default=None),
     command_family: str | None = Query(default=None),
     log_path: str | None = Query(default=None),
+    principal: Principal = Depends(require_admin_principal),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     entries = await _load_sys_audit_entries_for_admin(
@@ -1166,6 +1170,7 @@ async def sys_audit_preset(
     log_path: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=5000),
     max_items: int | None = Query(default=None, ge=1, le=200),
+    principal: Principal = Depends(require_admin_principal),
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     presets: dict[str, dict[str, Any]] = {
