@@ -11,8 +11,6 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
-from uuid import uuid4
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from services.api.deps import get_orchestrator, get_governance_service, get_verified_principal
@@ -352,7 +350,14 @@ async def list_sys_governance_events(
     response.headers["Cache-Control"] = "no-store"
     app_state = request.app.state
     events = _load_sys_governance_events(_sys_governance_events_path(app_state), proposal_id=proposal_id)
-    events.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    # Reverse the already-chronological append order rather than sorting by
+    # the string timestamp field: two events appended in quick succession
+    # (e.g. an "attempted" event immediately followed by a "completed" one)
+    # can end up with an identical timestamp string at low clock resolution,
+    # and a stable sort(reverse=True) preserves original order *within* a tie
+    # -- which silently un-reverses that pair relative to the rest of the
+    # (correctly newest-first) list. File append order has no such ambiguity.
+    events.reverse()
     return {
         "status": "success",
         "count": min(len(events), limit),
@@ -607,7 +612,11 @@ async def act_on_sys_governance_proposal(
     }
 
     if request_body.action == "apply":
-        idempotency_key = request_body.request_id or f"apply-{uuid4().hex[:12]}"
+        # Deterministic default (not a random uuid): a genuine client retry of
+        # this exact apply call without an explicit request_id must still hit
+        # the idempotent "reused" path in claim_operation, not silently mint a
+        # new, undeduplicated idempotency key on every attempt.
+        idempotency_key = request_body.request_id or f"apply-{request_body.proposal_id}"
         try:
             claimed_proposal, operation = await service.claim_apply(
                 request_body.proposal_id,
@@ -619,6 +628,14 @@ async def act_on_sys_governance_proposal(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except GovernanceConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if operation.get("reused"):
+            # A retry of an identical (proposal_id, idempotency_key) claim --
+            # single-use semantics mean this is a conflict, not a cue to
+            # silently re-run (or re-mutate) the already-claimed action.
+            raise HTTPException(
+                status_code=409,
+                detail=f"Proposal action already claimed: {request_body.proposal_id}",
+            )
         operation_id = operation["operation_id"]
         _append_sys_governance_event(
             _sys_governance_events_path(app_state),
@@ -771,7 +788,8 @@ async def act_on_sys_governance_proposal(
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=409, detail=f"Rollback snapshot is invalid: {exc}") from exc
 
-    idempotency_key = request_body.request_id or f"rollback-{uuid4().hex[:12]}"
+    # Deterministic default, same rationale as the apply branch above.
+    idempotency_key = request_body.request_id or f"rollback-{request_body.proposal_id}"
     try:
         _claimed_proposal, rollback_operation = await service.claim_rollback(
             request_body.proposal_id,
@@ -783,6 +801,11 @@ async def act_on_sys_governance_proposal(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except GovernanceConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if rollback_operation.get("reused"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Proposal rollback already claimed: {request_body.proposal_id}",
+        )
     rollback_operation_id = rollback_operation["operation_id"]
     _append_sys_governance_event(
         _sys_governance_events_path(app_state),

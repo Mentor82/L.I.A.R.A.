@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,17 +40,39 @@ def _deterministic_legacy_id(prefix: str, line: str) -> str:
     return f"{prefix}-legacy-{digest}"
 
 
+# Same sensitive-keyword intent as redact_and_bound_payload's dict-key
+# redaction, applied as a regex over raw text instead: a malformed line isn't
+# valid JSON, so it can't be redacted key-by-key.
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r'(?i)("?\b(?:token|secret|password|passwd|api[_-]?key|auth|bearer)\b"?\s*[:=]\s*)("[^"]*"|\'[^\']*\'|\S+)'
+)
+_QUARANTINE_PREVIEW_MAX_CHARS = 500
+
+
+def _sanitize_quarantine_preview(line: str) -> str:
+    """Best-effort redaction of a raw, unparseable line before it's persisted."""
+    redacted = _SENSITIVE_TEXT_PATTERN.sub(r"\1[REDACTED]", line)
+    if len(redacted) > _QUARANTINE_PREVIEW_MAX_CHARS:
+        redacted = redacted[:_QUARANTINE_PREVIEW_MAX_CHARS] + "...[TRUNCATED]"
+    return redacted
+
+
 def _quarantine_line(source_file: Path, line: str, reason: str) -> None:
-    """Append a malformed line + reason to a quarantine file next to the source.
+    """Append a malformed line's sanitized preview + reason to a quarantine file.
 
     Keeps a malformed line from silently vanishing (or aborting every
     subsequent line in the same file) while still letting the migration
-    report an observable quarantined count.
+    report an observable quarantined count. Never stores the raw line
+    verbatim -- sys_audit.jsonl entries in particular may carry sensitive
+    command/stdin content, so a corrupted line gets a sha256 (for
+    correlation/dedup) plus a redacted, length-bounded preview instead.
     """
     quarantine_file = source_file.with_name(source_file.name + ".quarantine.jsonl")
     record = {
         "reason": reason,
-        "raw_line": line,
+        "raw_line_sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(),
+        "raw_line_length": len(line),
+        "sanitized_preview": _sanitize_quarantine_preview(line),
         "quarantined_at": datetime.now(UTC).isoformat(),
     }
     with quarantine_file.open("a", encoding="utf-8") as fh:

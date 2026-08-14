@@ -399,7 +399,9 @@ async def test_legacy_import_real_files_quarantine_and_idempotent_rerun(tmp_path
     assert events_quarantine.exists()
     assert audit_quarantine.exists()
     quarantined_event_record = json.loads(events_quarantine.read_text(encoding="utf-8").splitlines()[0])
-    assert "this is not valid json" in quarantined_event_record["raw_line"]
+    assert "this is not valid json" in quarantined_event_record["sanitized_preview"]
+    assert "raw_line" not in quarantined_event_record
+    assert len(quarantined_event_record["raw_line_sha256"]) == 64
 
     # Second run: the valid line is already present, must not be re-imported.
     counts_run2 = run_legacy_audit_migration("postgresql://liara:liara2026@127.0.0.1:5433/liara_memory")

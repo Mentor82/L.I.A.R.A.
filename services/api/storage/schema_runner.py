@@ -10,6 +10,14 @@ logger = logging.getLogger("liara.db.schema")
 
 MIGRATIONS_DIR = Path(__file__).parent.parent.parent / "db" / "migrations"
 
+# Arbitrary fixed key for a Postgres session-level advisory lock, unique to
+# schema-migration application. Serializes concurrent callers (e.g. multiple
+# API workers starting up at once) so only one process applies migrations at
+# a time -- without it, two processes can both see a migration as "not yet
+# applied", both execute it, and the loser's schema_migrations INSERT then
+# fails on the filename primary key, aborting that process's startup.
+_MIGRATION_ADVISORY_LOCK_KEY = 872234571983221
+
 
 def apply_governance_schema_sync(connection: Any) -> None:
     """Apply every NNN_description.sql migration under MIGRATIONS_DIR, in order.
@@ -20,50 +28,63 @@ def apply_governance_schema_sync(connection: Any) -> None:
     every call and relying on each migration being idempotent forever. Each
     migration's SQL and its `schema_migrations` bookkeeping row commit
     together, so a failed migration is never marked applied.
+
+    The whole check-then-apply sequence runs under a session-level Postgres
+    advisory lock so concurrent callers serialize instead of racing on which
+    migrations are "missing".
     """
     if not MIGRATIONS_DIR.is_dir():
         logger.error(f"Migrations directory not found: {MIGRATIONS_DIR}")
         raise FileNotFoundError(f"Migrations directory missing: {MIGRATIONS_DIR}")
 
     with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                filename TEXT PRIMARY KEY,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """
-        )
-        cursor.execute("SELECT filename FROM schema_migrations;")
-        already_applied = {row[0] for row in cursor.fetchall()}
+        cursor.execute("SELECT pg_advisory_lock(%s);", (_MIGRATION_ADVISORY_LOCK_KEY,))
     connection.commit()
 
-    migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-    if not migration_files:
-        logger.error(f"No migration files found in: {MIGRATIONS_DIR}")
-        raise FileNotFoundError(f"No migration files in: {MIGRATIONS_DIR}")
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    filename TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            cursor.execute("SELECT filename FROM schema_migrations;")
+            already_applied = {row[0] for row in cursor.fetchall()}
+        connection.commit()
 
-    applied_count = 0
-    for migration_file in migration_files:
-        if migration_file.name in already_applied:
-            continue
-        sql = migration_file.read_text(encoding="utf-8")
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql)
-                cursor.execute(
-                    "INSERT INTO schema_migrations (filename) VALUES (%s);",
-                    (migration_file.name,),
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            logger.exception(f"Migration failed, rolled back: {migration_file.name}")
-            raise
-        applied_count += 1
-        logger.info(f"Applied migration: {migration_file.name}")
+        migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+        if not migration_files:
+            logger.error(f"No migration files found in: {MIGRATIONS_DIR}")
+            raise FileNotFoundError(f"No migration files in: {MIGRATIONS_DIR}")
 
-    if applied_count:
-        logger.info(f"Applied {applied_count} new migration(s) out of {len(migration_files)} total.")
-    else:
-        logger.info(f"Schema up to date, no new migrations ({len(migration_files)} total already applied).")
+        applied_count = 0
+        for migration_file in migration_files:
+            if migration_file.name in already_applied:
+                continue
+            sql = migration_file.read_text(encoding="utf-8")
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(sql)
+                    cursor.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES (%s);",
+                        (migration_file.name,),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                logger.exception(f"Migration failed, rolled back: {migration_file.name}")
+                raise
+            applied_count += 1
+            logger.info(f"Applied migration: {migration_file.name}")
+
+        if applied_count:
+            logger.info(f"Applied {applied_count} new migration(s) out of {len(migration_files)} total.")
+        else:
+            logger.info(f"Schema up to date, no new migrations ({len(migration_files)} total already applied).")
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(%s);", (_MIGRATION_ADVISORY_LOCK_KEY,))
+        connection.commit()

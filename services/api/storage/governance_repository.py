@@ -459,14 +459,13 @@ class PostgresGovernanceRepository:
             prop = dict_store.get(proposal_id)
             if not prop:
                 raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
-            if prop.get("decision") != "approved":
-                raise GovernanceConflictError(f"Proposal {proposal_id} is not approved (decision={prop.get('decision')})")
-            if expected_proposal_state is not None and prop.get("state") != expected_proposal_state:
-                raise GovernanceConflictError(
-                    f"Proposal {proposal_id} is not in expected state '{expected_proposal_state}' "
-                    f"(actual state={prop.get('state')})"
-                )
 
+            # Idempotent retry: if this exact (proposal_id, operation_type,
+            # idempotency_key) was already claimed, return it as-is *before*
+            # checking decision/expected_proposal_state -- the first successful
+            # claim already advanced the proposal past expected_proposal_state,
+            # so a retry of the same request must not be rejected as a conflict
+            # just because the state moved on.
             existing_op = next(
                 (
                     op for op in self._in_memory_operations.values()
@@ -480,6 +479,14 @@ class PostgresGovernanceRepository:
                 return (
                     dict(prop),
                     {"operation_id": existing_op["operation_id"], "state": existing_op["state"], "idempotency_key": idempotency_key, "reused": True},
+                )
+
+            if prop.get("decision") != "approved":
+                raise GovernanceConflictError(f"Proposal {proposal_id} is not approved (decision={prop.get('decision')})")
+            if expected_proposal_state is not None and prop.get("state") != expected_proposal_state:
+                raise GovernanceConflictError(
+                    f"Proposal {proposal_id} is not in expected state '{expected_proposal_state}' "
+                    f"(actual state={prop.get('state')})"
                 )
 
             prop["revision"] = prop.get("revision", 1) + 1
@@ -515,7 +522,37 @@ class PostgresGovernanceRepository:
 
         def _sync_claim(conn):
             with conn.cursor() as cur:
-                # 1. Fetch current proposal
+                # 0. Idempotent retry check, ahead of the state guard below: if
+                # this exact (proposal_id, operation_type, idempotency_key) was
+                # already claimed, return it regardless of the proposal's
+                # current state -- a retry of an already-succeeded claim must
+                # not be rejected just because the first claim already moved
+                # the proposal past expected_proposal_state. A residual race
+                # between this check and the INSERT below is still handled by
+                # the UNIQUE-constraint catch further down.
+                cur.execute(
+                    """
+                    SELECT operation_id, state, created_at FROM governance_operations
+                    WHERE proposal_id = %s AND operation_type = %s AND idempotency_key = %s;
+                    """,
+                    (proposal_id, operation_type, idempotency_key),
+                )
+                pre_existing_op = cur.fetchone()
+                if pre_existing_op:
+                    cur.execute(
+                        "SELECT revision, decision, state FROM governance_proposals WHERE proposal_id = %s;",
+                        (proposal_id,),
+                    )
+                    prop_row = cur.fetchone()
+                    if not prop_row:
+                        raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
+                    rev0, dec0, state0 = prop_row
+                    return (
+                        {"proposal_id": proposal_id, "revision": rev0, "decision": dec0, "state": state0},
+                        {"operation_id": pre_existing_op[0], "state": pre_existing_op[1], "idempotency_key": idempotency_key, "reused": True},
+                    )
+
+                # 1. Fetch current proposal (fresh claim path)
                 cur.execute(
                     "SELECT revision, decision, state FROM governance_proposals WHERE proposal_id = %s FOR UPDATE;",
                     (proposal_id,),
@@ -641,15 +678,16 @@ class PostgresGovernanceRepository:
                 raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
 
             existing_op = self._in_memory_operations.get(operation_id)
-            if existing_op is not None:
-                if existing_op["proposal_id"] != proposal_id or existing_op["state"] in {"completed", "failed", "outcome_unknown"}:
-                    raise GovernanceConflictError(
-                        f"Operation {operation_id} cannot be completed: expected proposal_id={proposal_id} "
-                        f"and a non-terminal state, actual proposal_id={existing_op['proposal_id']}, state={existing_op['state']}"
-                    )
-                existing_op["state"] = final_op_state
-                existing_op["details"] = details or existing_op.get("details") or {}
-                existing_op["updated_at"] = now
+            if existing_op is None:
+                raise GovernanceNotFoundError(f"Unknown operation ID: {operation_id}")
+            if existing_op["proposal_id"] != proposal_id or existing_op["state"] in {"completed", "failed", "outcome_unknown"}:
+                raise GovernanceConflictError(
+                    f"Operation {operation_id} cannot be completed: expected proposal_id={proposal_id} "
+                    f"and a non-terminal state, actual proposal_id={existing_op['proposal_id']}, state={existing_op['state']}"
+                )
+            existing_op["state"] = final_op_state
+            existing_op["details"] = details or existing_op.get("details") or {}
+            existing_op["updated_at"] = now
 
             prop["revision"] = prop.get("revision", 1) + 1
             prop["state"] = final_proposal_state
