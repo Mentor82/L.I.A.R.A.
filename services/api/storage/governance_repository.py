@@ -552,7 +552,10 @@ class PostgresGovernanceRepository:
                         {"operation_id": pre_existing_op[0], "state": pre_existing_op[1], "idempotency_key": idempotency_key, "reused": True},
                     )
 
-                # 1. Fetch current proposal (fresh claim path)
+                # 1. Fetch current proposal (fresh claim path). FOR UPDATE
+                # serializes concurrent claims on this proposal_id: a second
+                # request racing in with the exact same idempotency_key blocks
+                # here until the first commits.
                 cur.execute(
                     "SELECT revision, decision, state FROM governance_proposals WHERE proposal_id = %s FOR UPDATE;",
                     (proposal_id,),
@@ -562,6 +565,30 @@ class PostgresGovernanceRepository:
                     raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
 
                 rev, dec, curr_state = prop_row
+
+                # 1b. Re-check idempotency now that the row lock is held: the
+                # step-0 check above ran *before* blocking on FOR UPDATE, so a
+                # concurrent transaction using the exact same idempotency_key
+                # may have inserted its operation and committed (advancing
+                # curr_state past expected_proposal_state) while this
+                # transaction was waiting for the lock. Without this re-check,
+                # such a genuinely concurrent duplicate request would
+                # incorrectly hit the expected_proposal_state guard below
+                # instead of being recognized as a retry.
+                cur.execute(
+                    """
+                    SELECT operation_id, state, created_at FROM governance_operations
+                    WHERE proposal_id = %s AND operation_type = %s AND idempotency_key = %s;
+                    """,
+                    (proposal_id, operation_type, idempotency_key),
+                )
+                locked_existing_op = cur.fetchone()
+                if locked_existing_op:
+                    return (
+                        {"proposal_id": proposal_id, "revision": rev, "decision": dec, "state": curr_state},
+                        {"operation_id": locked_existing_op[0], "state": locked_existing_op[1], "idempotency_key": idempotency_key, "reused": True},
+                    )
+
                 if dec != "approved":
                     raise GovernanceConflictError(f"Proposal {proposal_id} is not approved (decision={dec})")
                 if expected_proposal_state is not None and curr_state != expected_proposal_state:

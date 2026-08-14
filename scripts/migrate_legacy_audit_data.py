@@ -41,17 +41,31 @@ def _deterministic_legacy_id(prefix: str, line: str) -> str:
 
 
 # Same sensitive-keyword intent as redact_and_bound_payload's dict-key
-# redaction, applied as a regex over raw text instead: a malformed line isn't
-# valid JSON, so it can't be redacted key-by-key.
+# redaction (services/api/storage/governance_repository.py's
+# _SENSITIVE_KEY_PATTERN uses the same word list, unanchored), applied as a
+# regex over raw text instead: a malformed line isn't valid JSON, so it can't
+# be redacted key-by-key. No \b word boundaries around the keyword -- an
+# anchored \btoken\b would miss "auth_token"/"apiKey"-style identifiers,
+# under-redacting exactly the case that matters.
 _SENSITIVE_TEXT_PATTERN = re.compile(
-    r'(?i)("?\b(?:token|secret|password|passwd|api[_-]?key|auth|bearer)\b"?\s*[:=]\s*)("[^"]*"|\'[^\']*\'|\S+)'
+    r'(?i)("?\S*(?:token|secret|password|passwd|key|auth|bearer)\S*"?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\S+)'
 )
+# "Authorization: Bearer <token>"-style values have no key[:=]value separator
+# for the token itself -- handled separately.
+_BEARER_SCHEME_PATTERN = re.compile(r"(?i)\b(bearer)\s+\S+")
 _QUARANTINE_PREVIEW_MAX_CHARS = 500
 
 
 def _sanitize_quarantine_preview(line: str) -> str:
-    """Best-effort redaction of a raw, unparseable line before it's persisted."""
-    redacted = _SENSITIVE_TEXT_PATTERN.sub(r"\1[REDACTED]", line)
+    """Best-effort redaction of a raw, unparseable line before it's persisted.
+
+    Bearer-scheme redaction runs *first*: "Authorization: Bearer <token>"
+    otherwise matches _SENSITIVE_TEXT_PATTERN's key[:=]value shape too (its
+    "value" being the literal word "Bearer"), consuming just that word and
+    leaving the actual token after it untouched.
+    """
+    redacted = _BEARER_SCHEME_PATTERN.sub(r"\1 [REDACTED]", line)
+    redacted = _SENSITIVE_TEXT_PATTERN.sub(r"\1[REDACTED]", redacted)
     if len(redacted) > _QUARANTINE_PREVIEW_MAX_CHARS:
         redacted = redacted[:_QUARANTINE_PREVIEW_MAX_CHARS] + "...[TRUNCATED]"
     return redacted
