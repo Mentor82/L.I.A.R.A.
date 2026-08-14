@@ -5,22 +5,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
-from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 from uuid import uuid4
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from services.api.deps import get_app_symbol
+from services.api.deps import get_governance_service, get_verified_principal
+from services.api.exceptions import GovernanceConflictError, GovernanceNotFoundError
 from services.api.models import ToolInvokeRequest
+from services.api.security import Principal
 from services.contracts import ToolExecutionRequest, ToolExecutionResult
 from services.shared.types import MemoryTier
 from services.tools.coordinator import ToolCoordinator
 from services.tools.governance import (
     append_sys_governance_event,
-    load_sys_governance_proposals,
-    persist_sys_governance_proposals,
+    sys_governance_events_path,
     sys_governance_invocation_digest,
     sys_governance_mode,
 )
@@ -101,7 +100,23 @@ async def tool_metadata(tool_name: str, request: Request) -> Response:
 
 
 @router.post("/{tool_name}/invoke", response_model=ToolExecutionResult)
-async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: Request, response: Response) -> ToolExecutionResult:
+async def invoke_tool(
+    tool_name: str,
+    request_body: ToolInvokeRequest,
+    request: Request,
+    response: Response,
+    service: Any = Depends(get_governance_service),
+    principal: Principal = Depends(get_verified_principal),
+) -> ToolExecutionResult:
+    """Invoke a tool, with governance-bound authorization and invocation-count
+    bookkeeping for the "sys" tool when a proposal_id is supplied.
+
+    The proposal lookup and invocation claim/complete are Postgres-backed
+    (GovernanceService.get_proposal/claim_invocation/complete_invocation)
+    rather than the legacy file store -- a proposal that only exists in
+    Postgres (the normal case once a real pool is configured) previously
+    404'd here unconditionally, since the file-based lookup never saw it.
+    """
     response.headers["Cache-Control"] = "no-store"
     tool_registry = get_tool_registry()
     if not _is_public_tool_name(tool_name) or tool_name not in tool_registry.list_tools():
@@ -119,11 +134,10 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                 detail="SYS governance mode 'all' requires proposal_id",
             )
         if proposal_id:
-            sync_fn = get_app_symbol("_sync_sys_governance_store", None)
-            proposals = sync_fn(request.app.state) if sync_fn else getattr(request.app.state, "sys_tool_proposals", {})
-            proposal = proposals.get(proposal_id)
-            if proposal is None:
-                raise HTTPException(status_code=404, detail=f"Unknown sys proposal: {proposal_id}")
+            try:
+                proposal = await service.get_proposal(proposal_id)
+            except GovernanceNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
             if str(proposal.get("decision") or "") != "approved":
                 raise HTTPException(
                     status_code=409,
@@ -165,8 +179,7 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
                 if sandbox_root:
                     parameters["workdir"] = sandbox_root
 
-    uuid4_fn = get_app_symbol("uuid4", uuid4)
-    generated_trace_id = f"api-tool-{uuid4_fn().hex[:12]}"
+    generated_trace_id = f"api-tool-{uuid4().hex[:12]}"
     if not str(parameters.get("request_id") or "").strip():
         parameters["request_id"] = generated_trace_id
     if not str(parameters.get("run_id") or "").strip():
@@ -176,52 +189,40 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
     if not str(parameters.get("context") or "").strip():
         parameters["context"] = f"api.tools.{tool_name}.invoke"
 
+    def _invocation_traceability() -> dict[str, Any]:
+        return {
+            "request_id": parameters.get("request_id"),
+            "run_id": parameters.get("run_id"),
+            "session_id": parameters.get("session_id"),
+            "source": parameters.get("source"),
+            "context": parameters.get("context"),
+        }
+
+    claimed_revision: int | None = None
     if governance_proposal is not None:
         proposal_id = str(governance_proposal["proposal_id"])
-        async with request.app.state.sys_tool_governance_lock:
-            current = request.app.state.sys_tool_proposals.get(proposal_id)
-            invocation = dict((current or {}).get("invocation") or {})
-            if invocation.get("state") == "invoking":
-                raise HTTPException(status_code=409, detail=f"Sys proposal invocation already in progress: {proposal_id}")
-            attempt_count = int(invocation.get("attempt_count") or 0)
-            success_count = int(invocation.get("success_count") or 0)
-            max_invocations = int((current or {}).get("max_invocations") or 1)
-            if attempt_count >= max_invocations:
-                raise HTTPException(status_code=409, detail=f"Sys proposal invocation limit reached: {proposal_id}")
-            invocation.update(
-                {
-                    "state": "invoking",
-                    "attempt_count": attempt_count + 1,
-                    "success_count": success_count,
-                    "last_attempt_at": datetime.now(UTC).isoformat(),
-                    "last_request_id": parameters.get("request_id"),
-                    "last_run_id": parameters.get("run_id"),
-                }
+        try:
+            claimed = await service.claim_invocation(
+                proposal_id, principal, parameters.get("request_id"), parameters.get("run_id"),
             )
-            current["invocation"] = invocation
-            current["updated_at"] = invocation["last_attempt_at"]
-            persist_fn = get_app_symbol("_persist_sys_governance_proposals", None)
-            if persist_fn:
-                persist_fn(request.app.state.sys_tool_proposals_path, request.app.state.sys_tool_proposals)
-            append_event_fn = get_app_symbol("_append_sys_governance_event", None)
-            if append_event_fn:
-                append_event_fn(
-                    request.app.state.sys_tool_events_path,
-                    {
-                        "event_type": "invocation_attempted",
-                        "proposal_id": proposal_id,
-                        "tool_name": "sys",
-                        "invocation_digest": current.get("invocation_digest"),
-                        "attempt_count": invocation["attempt_count"],
-                        "traceability": {
-                            "request_id": parameters.get("request_id"),
-                            "run_id": parameters.get("run_id"),
-                            "session_id": parameters.get("session_id"),
-                            "source": parameters.get("source"),
-                            "context": parameters.get("context"),
-                        },
-                    },
-                )
+        except GovernanceConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        claimed_revision = claimed["revision"]
+        # Dual-write into the legacy JSONL feed: GET /tools/sys/governance/events
+        # still reads from there (Phase 4/6 territory to migrate that read
+        # endpoint), so consumers of that feed must keep seeing invocation
+        # activity even though Postgres is now the authoritative store.
+        append_sys_governance_event(
+            {
+                "event_type": "invocation_attempted",
+                "proposal_id": proposal_id,
+                "tool_name": "sys",
+                "invocation_digest": governance_proposal.get("invocation_digest"),
+                "attempt_count": (claimed.get("invocation") or {}).get("attempt_count"),
+                "traceability": _invocation_traceability(),
+            },
+            sys_governance_events_path(),
+        )
 
     coordinator = ToolCoordinator()
     exec_request = ToolExecutionRequest(
@@ -234,127 +235,48 @@ async def invoke_tool(tool_name: str, request_body: ToolInvokeRequest, request: 
     try:
         result = await coordinator.execute_tool(exec_request)
     except Exception as exc:
-        if governance_proposal is not None:
-            proposal_id = str(governance_proposal["proposal_id"])
-            async with request.app.state.sys_tool_governance_lock:
-                current = request.app.state.sys_tool_proposals.get(proposal_id)
-                if current:
-                    invocation = dict(current.get("invocation") or {})
-                    invocation.update({
-                        "state": "failed",
-                        "last_completed_at": datetime.now(UTC).isoformat(),
-                        "last_error": str(exc),
-                    })
-                    current["invocation"] = invocation
-                    current["updated_at"] = invocation["last_completed_at"]
-                    persist_fn = get_app_symbol("_persist_sys_governance_proposals", None)
-                    if persist_fn:
-                        persist_fn(request.app.state.sys_tool_proposals_path, request.app.state.sys_tool_proposals)
-                    else:
-                        persist_sys_governance_proposals(request.app.state.sys_tool_proposals, request.app.state.sys_tool_proposals_path)
-                    append_event_fn = get_app_symbol("_append_sys_governance_event", None)
-                    if append_event_fn:
-                        append_event_fn(
-                            request.app.state.sys_tool_events_path,
-                            {
-                                "event_type": "invocation_failed",
-                                "proposal_id": proposal_id,
-                                "tool_name": "sys",
-                                "error": str(exc),
-                                "traceability": {
-                                    "request_id": parameters.get("request_id"),
-                                    "run_id": parameters.get("run_id"),
-                                    "session_id": parameters.get("session_id"),
-                                    "source": parameters.get("source"),
-                                    "context": parameters.get("context"),
-                                },
-                            },
-                        )
-                    else:
-                        append_sys_governance_event(
-                            {
-                                "event_type": "invocation_failed",
-                                "proposal_id": proposal_id,
-                                "tool_name": "sys",
-                                "error": str(exc),
-                                "traceability": {
-                                    "request_id": parameters.get("request_id"),
-                                    "run_id": parameters.get("run_id"),
-                                    "session_id": parameters.get("session_id"),
-                                    "source": parameters.get("source"),
-                                    "context": parameters.get("context"),
-                                },
-                            },
-                            request.app.state.sys_tool_events_path,
-                        )
+        if governance_proposal is not None and claimed_revision is not None:
+            try:
+                await service.complete_invocation(
+                    str(governance_proposal["proposal_id"]), claimed_revision,
+                    success=False, error=str(exc),
+                )
+                append_sys_governance_event(
+                    {
+                        "event_type": "invocation_failed",
+                        "proposal_id": str(governance_proposal["proposal_id"]),
+                        "tool_name": "sys",
+                        "error": str(exc),
+                        "traceability": _invocation_traceability(),
+                    },
+                    sys_governance_events_path(),
+                )
+            except GovernanceConflictError:
+                pass
         raise
 
-    if governance_proposal is not None:
-        proposal_id = str(governance_proposal["proposal_id"])
-        async with request.app.state.sys_tool_governance_lock:
-            current = request.app.state.sys_tool_proposals.get(proposal_id)
-            if current:
-                invocation = dict(current.get("invocation") or {})
-                succeeded = result.status == "success"
-                success_count = int(invocation.get("success_count") or 0) + int(succeeded)
-                invocation.update(
-                    {
-                        "state": "completed" if succeeded else "failed",
-                        "success_count": success_count,
-                        "last_completed_at": datetime.now(UTC).isoformat(),
-                        "last_status": result.status,
-                        "last_error": result.error,
-                        "last_execution_ms": result.execution_ms,
-                    }
-                )
-                current["invocation"] = invocation
-                current["updated_at"] = invocation["last_completed_at"]
-                persist_fn = get_app_symbol("_persist_sys_governance_proposals", None)
-                if persist_fn:
-                    persist_fn(request.app.state.sys_tool_proposals_path, request.app.state.sys_tool_proposals)
-                else:
-                    persist_sys_governance_proposals(request.app.state.sys_tool_proposals, request.app.state.sys_tool_proposals_path)
-                append_event_fn = get_app_symbol("_append_sys_governance_event", None)
-                if append_event_fn:
-                    append_event_fn(
-                        request.app.state.sys_tool_events_path,
-                        {
-                            "event_type": "invocation_completed" if succeeded else "invocation_failed",
-                            "proposal_id": proposal_id,
-                            "tool_name": "sys",
-                            "status": result.status,
-                            "error": result.error,
-                            "execution_ms": result.execution_ms,
-                            "success_count": success_count,
-                            "traceability": {
-                                "request_id": parameters.get("request_id"),
-                                "run_id": parameters.get("run_id"),
-                                "session_id": parameters.get("session_id"),
-                                "source": parameters.get("source"),
-                                "context": parameters.get("context"),
-                            },
-                        },
-                    )
-                else:
-                    append_sys_governance_event(
-                        {
-                            "event_type": "invocation_completed" if succeeded else "invocation_failed",
-                            "proposal_id": proposal_id,
-                            "tool_name": "sys",
-                            "status": result.status,
-                            "error": result.error,
-                            "execution_ms": result.execution_ms,
-                            "success_count": success_count,
-                            "traceability": {
-                                "request_id": parameters.get("request_id"),
-                                "run_id": parameters.get("run_id"),
-                                "session_id": parameters.get("session_id"),
-                                "source": parameters.get("source"),
-                                "context": parameters.get("context"),
-                            },
-                        },
-                        request.app.state.sys_tool_events_path,
-                    )
+    if governance_proposal is not None and claimed_revision is not None:
+        try:
+            succeeded = result.status == "success"
+            await service.complete_invocation(
+                str(governance_proposal["proposal_id"]), claimed_revision,
+                success=succeeded, status=result.status,
+                error=result.error, execution_ms=result.execution_ms,
+            )
+            append_sys_governance_event(
+                {
+                    "event_type": "invocation_completed" if succeeded else "invocation_failed",
+                    "proposal_id": str(governance_proposal["proposal_id"]),
+                    "tool_name": "sys",
+                    "status": result.status,
+                    "error": result.error,
+                    "execution_ms": result.execution_ms,
+                    "traceability": _invocation_traceability(),
+                },
+                sys_governance_events_path(),
+            )
+        except GovernanceConflictError:
+            pass
 
     if governance_proposal and result.metadata:
         result.metadata["governance_proposal_id"] = str(governance_proposal.get("proposal_id"))

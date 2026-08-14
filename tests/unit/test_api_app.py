@@ -528,7 +528,7 @@ async def test_chat_blocks_harmful_request_before_orchestration(monkeypatch):
         audit_calls.append(kwargs)
         return None
 
-    monkeypatch.setattr("services.api.app.log_judge_pre_action", _capture_audit)
+    monkeypatch.setattr("services.api.routers.chat.log_judge_pre_action", _capture_audit)
     app = create_api_app(orchestrator=orchestrator, memory_adapter=adapter)
 
     transport = httpx.ASGITransport(app=app)
@@ -588,7 +588,7 @@ async def test_chat_overrides_unsafe_generated_response_with_refusal(monkeypatch
         audit_calls.append(kwargs)
         return None
 
-    monkeypatch.setattr("services.api.app.log_judge_pre_action", _capture_audit)
+    monkeypatch.setattr("services.api.routers.chat.log_judge_pre_action", _capture_audit)
     app = create_api_app(orchestrator=UnsafeOutputFakeOrchestrator(), memory_adapter=adapter)
 
     transport = httpx.ASGITransport(app=app)
@@ -1617,7 +1617,7 @@ async def test_tools_invoke_adds_default_traceability_metadata(monkeypatch):
         )
 
     monkeypatch.setattr("services.tools.coordinator.ToolCoordinator.execute_tool", _fake_execute_tool)
-    monkeypatch.setattr("services.api.app.uuid4", lambda: type("_FakeUuid", (), {"hex": "1234567890abcdef"})())
+    monkeypatch.setattr("services.api.routers.tools.uuid4", lambda: type("_FakeUuid", (), {"hex": "1234567890abcdef"})())
     app = create_api_app(orchestrator=FakeOrchestrator(), memory_adapter=adapter)
 
     transport = httpx.ASGITransport(app=app)
@@ -2524,7 +2524,7 @@ def test_operations_workspace_returns_read_only_evidence(monkeypatch):
         )
     )
     monkeypatch.setattr(
-        "services.api.app.get_workspace_status",
+        "services.api.routers.operations.get_workspace_status",
         lambda: {
             "workspace_root": "/home/liara/workspace",
             "artifacts_dir": "/home/liara/workspace/.liara_artifacts",
@@ -2533,7 +2533,7 @@ def test_operations_workspace_returns_read_only_evidence(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        "services.api.app.list_workspace_artifacts",
+        "services.api.routers.operations.list_workspace_artifacts",
         lambda artifact_type=None, limit=10: [
             {
                 "path": "/home/liara/workspace/.liara_artifacts/validation-reports/report.json",
@@ -2675,7 +2675,7 @@ def test_operations_dreaming_returns_read_only_status_and_proposals(monkeypatch)
         async def close(self):
             return None
 
-    monkeypatch.setattr("services.api.app.BackedMemoryServiceStore", FakeDreamingStore)
+    monkeypatch.setattr("services.api.routers.operations.BackedMemoryServiceStore", FakeDreamingStore)
     app = create_api_app(orchestrator=FakeOrchestrator(), memory_adapter=adapter)
 
     with TestClient(app) as client:

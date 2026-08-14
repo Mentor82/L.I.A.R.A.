@@ -36,15 +36,7 @@ from services.workspace import get_workspace_status, list_workspace_artifacts
 from services.api.routers.artifacts import router as artifacts_router, _get_session_snapshot_best_effort, _resolve_effective_sandbox_root
 from services.api.routers.chat import router as chat_router
 from services.api.routers.compute import router as compute_router
-from services.api.routers.governance import (
-    router as governance_router,
-    _sys_governance_store_path,
-    _sys_governance_events_path,
-    _sync_sys_governance_store,
-    _persist_sys_governance_proposals,
-    _append_sys_governance_event,
-    _load_sys_governance_events,
-)
+from services.api.routers.governance import router as governance_router
 from services.api.routers.operations import router as operations_router
 from services.api.routers.speech import router as speech_router
 from services.api.routers.system import router as system_router

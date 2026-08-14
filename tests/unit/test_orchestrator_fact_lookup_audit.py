@@ -124,7 +124,7 @@ async def test_validate_response_logs_logic_error_for_fact_lookup_without_refere
         calls.append(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr("services.orchestrator.orchestrator.log_judge_pre_action", _capture_log)
+    monkeypatch.setattr("services.orchestrator.generation_pipeline.log_judge_pre_action", _capture_log)
 
     validation = await orchestrator._validate_response(
         run_id="run-logic-1",
@@ -166,7 +166,7 @@ async def test_validate_response_uses_session_fallback_when_run_id_missing(monke
         calls.append(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr("services.orchestrator.orchestrator.log_judge_pre_action", _capture_log)
+    monkeypatch.setattr("services.orchestrator.generation_pipeline.log_judge_pre_action", _capture_log)
 
     validation = await orchestrator._validate_response(
         run_id="",
@@ -203,7 +203,7 @@ async def test_validate_response_passes_fact_lookup_reference_when_present(monke
         calls.append(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr("services.orchestrator.orchestrator.log_judge_pre_action", _capture_log)
+    monkeypatch.setattr("services.orchestrator.generation_pipeline.log_judge_pre_action", _capture_log)
 
     validation = await orchestrator._validate_response(
         run_id="run-logic-2",

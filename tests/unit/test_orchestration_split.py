@@ -893,7 +893,7 @@ async def test_orchestrator_judges_the_concrete_sys_payload(monkeypatch):
     orchestrator._simulation_mode = False
 
     monkeypatch.setattr(
-        "services.orchestrator.orchestrator.log_judge_pre_action",
+        "services.orchestrator.tool_discovery.log_judge_pre_action",
         lambda **entry: audit_entries.append(entry),
     )
 

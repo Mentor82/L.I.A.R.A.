@@ -101,7 +101,7 @@ def _adapter():
 
 def test_operations_subgraph_is_read_only_bounded_and_typed(monkeypatch):
     fake_store = _FakeGraphOperationsStore()
-    monkeypatch.setattr("services.api.app.BackedMemoryServiceStore", lambda: fake_store)
+    monkeypatch.setattr("services.api.routers.operations.BackedMemoryServiceStore", lambda: fake_store)
     app = create_api_app(orchestrator=_FakeOrchestrator(), memory_adapter=_adapter())
 
     with TestClient(app) as client:

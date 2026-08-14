@@ -43,7 +43,6 @@ from services.contracts import (
     VisionImageInput,
     VisionRequest,
 )
-from services.tools.builtin.sys_audit import log_judge_pre_action
 from services.contracts.service_boundaries import ExternalToolCall
 from services.config import Settings
 from services.inference.invocation import ensure_inference_invoker

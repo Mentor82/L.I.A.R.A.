@@ -16,6 +16,7 @@ from services.contracts import ExecutorRequest, InputSituationProfile
 from services.contracts.service_boundaries import ExternalToolCall
 from services.shared.types import ToolStatus
 from services.tools.registry import get_tool_registry
+from services.tools.builtin.sys_audit import log_judge_pre_action
 from services.reward_model.scorer import RewardModelScorer
 from .defs.external_tools import (
     normalize_external_tool,
@@ -220,16 +221,11 @@ async def execute_tools(
                 input=input_payload,
             )
             decision = orchestrator.judge_engine.evaluate_pre_action(ctx)
-            import sys
-            orch_mod = sys.modules.get("services.orchestrator.orchestrator")
-            log_fn = getattr(orch_mod, "log_judge_pre_action", None)
-            if not log_fn:
-                from services.tools.builtin.sys_audit import log_judge_pre_action as log_fn
-            
+
             dec_str = decision.decision.value if hasattr(decision, "decision") and hasattr(decision.decision, "value") else str(getattr(decision, "decision", decision.get("decision", "allow") if isinstance(decision, dict) else "allow"))
             is_approved = getattr(decision, "approved", True) if not isinstance(decision, dict) else decision.get("approved", True)
 
-            log_fn(
+            log_judge_pre_action(
                 tool_name=",".join(selected_tools),
                 decision=dec_str,
                 request_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",

@@ -11,16 +11,6 @@ from services.memory_adapter import MemoryServiceAdapter
 from services.orchestrator import Orchestrator
 
 
-def get_app_symbol(name: str, fallback: Any) -> Any:
-    """Helper to look up symbol on services.api.app if monkeypatched in tests, else fallback."""
-    import sys
-    app_mod = sys.modules.get("services.api.app")
-    if not app_mod:
-        return fallback
-    sym = getattr(app_mod, name, fallback)
-    return sym if sym is not None else fallback
-
-
 def get_memory_adapter(request: Request) -> MemoryServiceAdapter:
     """Dependency for MemoryServiceAdapter stored in app state."""
     return request.app.state.memory_adapter

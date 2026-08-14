@@ -16,7 +16,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from services.api.deps import get_memory_adapter, get_orchestrator, get_app_symbol
+from services.api.deps import get_memory_adapter, get_orchestrator
 from services.api.models import SessionResponse, SessionUpdateRequest
 from services.contracts import (
     ChatArtifact,
@@ -376,7 +376,6 @@ async def _run_chat(
     *,
     progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[str, ChatResponse]:
-    log_judge_fn = get_app_symbol("log_judge_pre_action", log_judge_pre_action)
     run_started = time.perf_counter()
     run_id = str(uuid4())
     now = datetime.now(UTC).isoformat()
@@ -504,7 +503,7 @@ async def _run_chat(
 
     if is_harmful_query:
         refusal_text = _safety_refusal_text(request.message)
-        log_judge_fn(
+        log_judge_pre_action(
             tool_name="chat_safety_pre",
             decision="block",
             issues=["Unsafe user request blocked before generation."],
@@ -674,7 +673,7 @@ async def _run_chat(
         risk_flags = set(validation_result.get("risk_flags") or [])
         risk_flags.add("policy_safety_violation")
         validation_result["risk_flags"] = sorted(risk_flags)
-        log_judge_fn(
+        log_judge_pre_action(
             tool_name="chat_safety_post",
             decision="block",
             issues=issues,

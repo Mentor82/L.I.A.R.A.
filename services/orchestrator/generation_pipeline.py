@@ -18,6 +18,7 @@ from services.config import Settings
 from services.contracts import InferenceRequest, InferenceResult, InputSituationProfile
 from services.judge import JudgeContext, JudgeStage
 from services.shared.types import RunState
+from services.tools.builtin.sys_audit import log_judge_pre_action
 from .defs.npu_helper import classify_npu_helper_task, should_use_npu_helper_offload
 from .defs.judge import (
     create_judge_context_for_pre_action,
@@ -343,12 +344,7 @@ def validate_response(
 
                         try:
                             judge_trace = orchestrator._judge_traceability(run_id=actual_run_id)
-                            import sys
-                            orch_mod = sys.modules.get("services.orchestrator.orchestrator")
-                            log_fn = getattr(orch_mod, "log_judge_pre_action", None)
-                            if not log_fn:
-                                from services.tools.builtin.sys_audit import log_judge_pre_action as log_fn
-                            log_fn(
+                            log_judge_pre_action(
                                 tool_name="fact_lookup_reference",
                                 decision="block",
                                 issues=[logic_issue],

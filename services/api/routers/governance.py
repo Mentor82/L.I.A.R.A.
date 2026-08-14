@@ -967,11 +967,18 @@ async def act_on_sys_governance_proposal(
         from services.api.routers.tools import invoke_tool
         rollback_invoke_parameters = dict(rollback_parameters)
         rollback_invoke_parameters["proposal_id"] = rollback_proposal["proposal_id"]
+        # invoke_tool's service/principal parameters are FastAPI Depends(...)
+        # defaults, only resolved when called through routing -- called
+        # directly like this, they must be passed through explicitly using
+        # the values this function's own (already-resolved) dependencies
+        # provide, rather than left as unresolved Depends sentinels.
         execution = await invoke_tool(
             "sys",
             ToolInvokeRequest(parameters=rollback_invoke_parameters, timeout_seconds=120),
             request,
             Response(),
+            service=service,
+            principal=principal,
         )
         evidence = dict(execution.metadata.get("mutation_evidence") or {})
         if execution.status != "success" or not bool(execution.metadata.get("mutation_verified")):

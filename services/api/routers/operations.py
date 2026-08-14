@@ -7,7 +7,6 @@ import sys
 from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
-from services.api.deps import get_app_symbol
 import httpx
 
 from services.contracts import (
@@ -25,7 +24,9 @@ from services.contracts import (
     SystemStateEnvelope,
     StateCurve,
 )
+from services.memory.store import BackedMemoryServiceStore
 from services.memory_adapter import RemoteMemoryAdapter
+from services.workspace import get_workspace_status, list_workspace_artifacts
 
 
 router = APIRouter(tags=["operations"])
@@ -172,9 +173,7 @@ async def memory_relations_cleanup_expired(request_body: RelationCleanupExpiredR
                 ),
             )
 
-    from services.memory.store import BackedMemoryServiceStore
-    store_cls = get_app_symbol("BackedMemoryServiceStore", BackedMemoryServiceStore)
-    store = store_cls()
+    store = BackedMemoryServiceStore()
     try:
         return await store.relation_cleanup_expired(request_body)
     finally:
@@ -198,9 +197,7 @@ async def operations_dreaming(
             status_payload = await adapter._get_json("/dreaming/status")
             proposals_payload = await adapter._post_json("/dreaming/proposals", dreaming_request.model_dump())
         else:
-            from services.memory.store import BackedMemoryServiceStore
-            store_cls = get_app_symbol("BackedMemoryServiceStore", BackedMemoryServiceStore)
-            store = store_cls()
+            store = BackedMemoryServiceStore()
             try:
                 status = await store.dreaming_status()
                 proposals = await store.dreaming_proposals(dreaming_request)
@@ -299,15 +296,11 @@ async def operations_workspace(
             },
         )
 
-    from services.workspace import get_workspace_status, list_workspace_artifacts
-    get_ws_status_fn = get_app_symbol("get_workspace_status", get_workspace_status)
-    list_ws_artifacts_fn = get_app_symbol("list_workspace_artifacts", list_workspace_artifacts)
-
     response.headers["Cache-Control"] = "no-store"
     return {
         "status": "success",
-        "workspace": get_ws_status_fn(),
-        "artifacts": list_ws_artifacts_fn(
+        "workspace": get_workspace_status(),
+        "artifacts": list_workspace_artifacts(
             artifact_type=normalized_type,
             limit=limit,
         ),
@@ -348,9 +341,7 @@ async def operations_graph_subgraph(
                 ),
             )
 
-    from services.memory.store import BackedMemoryServiceStore
-    store_cls = get_app_symbol("BackedMemoryServiceStore", BackedMemoryServiceStore)
-    store = store_cls()
+    store = BackedMemoryServiceStore()
     try:
         return await store.architecture_subgraph(subgraph_request)
     finally:

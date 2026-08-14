@@ -364,3 +364,82 @@ class GovernanceService:
         handoff_update already returned -- see decide_proposal's docstring.
         """
         return await self.repo.update_handoff(proposal_id, expected_revision, handoff, invocation=invocation)
+
+    async def claim_invocation(
+        self,
+        proposal_id: str,
+        principal: Principal,
+        request_id: Optional[str],
+        run_id: Optional[str],
+    ) -> dict[str, Any]:
+        """Claim one invocation attempt against an approved sys proposal.
+
+        Unlike apply/rollback (single-use, claim_operation-based), a proposal
+        may legally be invoked multiple times up to max_invocations, so this
+        is not an exclusivity claim -- it's an optimistic-concurrency CAS
+        (reusing update_handoff, revision-keyed) that enforces the
+        max_invocations cap and the "not already mid-invocation" guard. A
+        concurrent second claim racing on the same revision fails with
+        GovernanceConflictError rather than corrupting the counter.
+
+        Returns the updated proposal; its "invocation" field carries the
+        freshly-claimed state, and its "revision" is the one
+        complete_invocation must be called with.
+        """
+        proposal = await self.get_proposal(proposal_id)
+        if proposal.get("decision") != "approved":
+            raise GovernanceConflictError(f"Sys proposal is not approved: {proposal_id}")
+
+        invocation = dict(proposal.get("invocation") or {})
+        if invocation.get("state") == "invoking":
+            raise GovernanceConflictError(f"Sys proposal invocation already in progress: {proposal_id}")
+        attempt_count = int(invocation.get("attempt_count") or 0)
+        max_invocations = int(proposal.get("max_invocations") or 1)
+        if attempt_count >= max_invocations:
+            raise GovernanceConflictError(f"Sys proposal invocation limit reached: {proposal_id}")
+
+        now = datetime.now(UTC).isoformat()
+        new_invocation = {
+            **invocation,
+            "state": "invoking",
+            "attempt_count": attempt_count + 1,
+            "success_count": int(invocation.get("success_count") or 0),
+            "last_attempt_at": now,
+            "last_request_id": request_id,
+            "last_run_id": run_id,
+            "last_actor_id": principal.actor_id,
+        }
+        return await self.repo.update_handoff(
+            proposal_id, proposal["revision"], dict(proposal.get("handoff") or {}), invocation=new_invocation,
+        )
+
+    async def complete_invocation(
+        self,
+        proposal_id: str,
+        expected_revision: int,
+        success: bool,
+        status: Optional[str] = None,
+        error: Optional[str] = None,
+        execution_ms: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Finalize a claimed invocation attempt as completed or failed.
+
+        expected_revision must be the fresh revision claim_invocation's
+        result returned, not the pre-claim one.
+        """
+        proposal = await self.get_proposal(proposal_id)
+        invocation = dict(proposal.get("invocation") or {})
+        success_count = int(invocation.get("success_count") or 0) + int(success)
+        now = datetime.now(UTC).isoformat()
+        new_invocation = {
+            **invocation,
+            "state": "completed" if success else "failed",
+            "success_count": success_count,
+            "last_completed_at": now,
+            "last_status": status,
+            "last_error": error,
+            "last_execution_ms": execution_ms,
+        }
+        return await self.repo.update_handoff(
+            proposal_id, expected_revision, dict(proposal.get("handoff") or {}), invocation=new_invocation,
+        )
