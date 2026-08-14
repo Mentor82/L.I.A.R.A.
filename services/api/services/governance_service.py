@@ -232,3 +232,108 @@ class GovernanceService:
     async def recover_stale_operations(self, stale_threshold_seconds: float = 300.0) -> List[dict[str, Any]]:
         """Trigger recovery for operations stuck in 'started' state past threshold."""
         return await self.repo.recover_stale_operations(stale_threshold_seconds)
+
+    async def claim_apply(
+        self,
+        proposal_id: str,
+        principal: Principal,
+        idempotency_key: str,
+        action_reason: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Exclusively claim an "apply" operation for an approved, not-yet-applied proposal.
+
+        The proposal must be in state "decided" (i.e. approved and not already
+        applying/applied/rolling_back/etc). The DB row lock inside
+        claim_operation, combined with the expected_proposal_state check,
+        serializes concurrent claims across worker processes -- replacing the
+        single-process app_state.sys_tool_governance_lock the router used to
+        rely on.
+        """
+        proposal = await self.get_proposal(proposal_id)
+        if proposal.get("decision") != "approved":
+            raise GovernanceConflictError(f"Sys proposal is not approved: {proposal_id}")
+        handoff = proposal.get("handoff") if isinstance(proposal.get("handoff"), dict) else {}
+        if isinstance(handoff.get("checkpoint"), dict):
+            raise GovernanceConflictError("Workspace checkpoint proposals are applied automatically by their decision")
+
+        claim_details = dict(details or {})
+        claim_details["acted_by"] = principal.actor_id
+        claim_details["reason"] = action_reason
+        return await self.repo.claim_operation(
+            proposal_id=proposal_id,
+            operation_type="apply",
+            idempotency_key=idempotency_key,
+            actor_id=principal.actor_id,
+            target_state="applying",
+            details=claim_details,
+            expected_proposal_state="decided",
+        )
+
+    async def complete_apply(
+        self,
+        operation_id: str,
+        proposal_id: str,
+        principal: Principal,
+        success: bool,
+        details: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Finalize a claimed "apply" operation as applied or apply_failed."""
+        proposal, _operation = await self.repo.complete_operation(
+            operation_id=operation_id,
+            proposal_id=proposal_id,
+            final_op_state="completed" if success else "failed",
+            final_proposal_state="applied" if success else "apply_failed",
+            actor_id=principal.actor_id,
+            details=details,
+        )
+        return proposal
+
+    async def claim_rollback(
+        self,
+        proposal_id: str,
+        principal: Principal,
+        idempotency_key: str,
+        action_reason: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Exclusively claim a "rollback" operation for an already-applied proposal."""
+        claim_details = dict(details or {})
+        claim_details["acted_by"] = principal.actor_id
+        claim_details["reason"] = action_reason
+        return await self.repo.claim_operation(
+            proposal_id=proposal_id,
+            operation_type="rollback",
+            idempotency_key=idempotency_key,
+            actor_id=principal.actor_id,
+            target_state="rolling_back",
+            details=claim_details,
+            expected_proposal_state="applied",
+        )
+
+    async def complete_rollback(
+        self,
+        operation_id: str,
+        proposal_id: str,
+        principal: Principal,
+        success: bool,
+        details: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Finalize a claimed "rollback" operation as rolled_back or rollback_failed."""
+        proposal, _operation = await self.repo.complete_operation(
+            operation_id=operation_id,
+            proposal_id=proposal_id,
+            final_op_state="completed" if success else "failed",
+            final_proposal_state="rolled_back" if success else "rollback_failed",
+            actor_id=principal.actor_id,
+            details=details,
+        )
+        return proposal
+
+    async def get_latest_operation(self, proposal_id: str, operation_type: str) -> Optional[dict[str, Any]]:
+        """Fetch the most recent claimed operation of a given type for a proposal."""
+        return await self.repo.get_latest_operation(proposal_id, operation_type)
+
+    async def list_events(self, proposal_id: Optional[str] = None, limit: int = 100) -> List[dict[str, Any]]:
+        """List immutable governance_events rows, optionally filtered to one proposal."""
+        return await self.repo.list_events(proposal_id=proposal_id, limit=limit)

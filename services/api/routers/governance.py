@@ -18,7 +18,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from services.api.deps import get_orchestrator, get_governance_service, get_verified_principal
 from services.api.security import Principal
 from services.api.exceptions import (
+    AuditPersistenceError,
+    ForbiddenPrincipalError,
     GovernanceConflictError,
+    GovernanceError,
     GovernanceNotFoundError,
     PolicyViolationError,
     UnauthorizedPrincipalError,
@@ -267,6 +270,14 @@ async def create_sys_governance_proposal(
         }
     except UnauthorizedPrincipalError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ForbiddenPrincipalError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (GovernanceConflictError, PolicyViolationError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GovernanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AuditPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GovernanceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -329,6 +340,15 @@ async def list_sys_governance_events(
     proposal_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict[str, Any]:
+    """List governance events from the legacy JSONL file.
+
+    Stays file-backed for now: invoke_tool()'s own invocation lifecycle events
+    (Phase 4 territory) and the compensating rollback proposal (see
+    act_on_sys_governance_proposal's docstring) are still JSONL-only, so
+    switching this read endpoint to the Postgres-backed governance_events table
+    before those producers migrate would silently hide their events. Apply/
+    rollback below dual-write into both stores for this reason.
+    """
     response.headers["Cache-Control"] = "no-store"
     app_state = request.app.state
     events = _load_sys_governance_events(_sys_governance_events_path(app_state), proposal_id=proposal_id)
@@ -369,6 +389,12 @@ async def decide_sys_governance_proposal(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except UnauthorizedPrincipalError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ForbiddenPrincipalError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except AuditPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     app_state = request.app.state
     now = datetime.now(UTC).isoformat()
@@ -541,13 +567,30 @@ async def act_on_sys_governance_proposal(
     request_body: SysToolProposalActionRequest,
     request: Request,
     response: Response,
+    service: Any = Depends(get_governance_service),
+    principal: Principal = Depends(get_verified_principal),
 ) -> dict[str, Any]:
+    """Apply or roll back an approved sys proposal.
+
+    Claim/complete against PostgresGovernanceRepository (claim_apply/complete_apply,
+    claim_rollback/complete_rollback) provide the single-use, cross-process-safe
+    guarantee that app_state.sys_tool_governance_lock (a single-process
+    asyncio.Lock) previously only approximated. acted_by/action_reason in the
+    request body are wire-compatible hints only; principal.actor_id is the sole
+    authoritative actor recorded against the claimed operation.
+
+    The compensating rollback proposal (a new, separate, auto-approved proposal
+    that performs the actual restore) intentionally still uses the legacy
+    file-backed governance store -- that mechanism, and invoke_tool()'s own
+    governance-authorization bookkeeping for it, are unchanged here; only the
+    ORIGINAL proposal's apply/rollback transaction bookkeeping moves to Postgres.
+    """
     response.headers["Cache-Control"] = "no-store"
     app_state = request.app.state
-    proposals = _sync_sys_governance_store(app_state)
-    proposal = proposals.get(request_body.proposal_id)
-    if proposal is None:
-        raise HTTPException(status_code=404, detail=f"Unknown sys proposal: {request_body.proposal_id}")
+    try:
+        proposal = await service.get_proposal(request_body.proposal_id)
+    except GovernanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     traceability = dict(proposal.get("traceability") or {})
     request_id = request_body.request_id or str(traceability.get("request_id") or request_body.proposal_id)
@@ -564,45 +607,30 @@ async def act_on_sys_governance_proposal(
     }
 
     if request_body.action == "apply":
-        if str(proposal.get("decision") or "") != "approved":
-            raise HTTPException(status_code=409, detail=f"Sys proposal is not approved: {request_body.proposal_id}")
-        handoff = proposal.get("handoff") if isinstance(proposal.get("handoff"), dict) else {}
-        if isinstance(handoff.get("checkpoint"), dict):
-            raise HTTPException(
-                status_code=409,
-                detail="Workspace checkpoint proposals are applied automatically by their decision",
+        idempotency_key = request_body.request_id or f"apply-{uuid4().hex[:12]}"
+        try:
+            claimed_proposal, operation = await service.claim_apply(
+                request_body.proposal_id,
+                principal,
+                idempotency_key,
+                action_reason=request_body.action_reason,
             )
-        transaction = dict(proposal.get("transaction") or {})
-        if str(transaction.get("state") or "") in {"applying", "applied", "rolling_back", "rolled_back"}:
-            raise HTTPException(status_code=409, detail=f"Proposal action already started: {request_body.proposal_id}")
-        invocation = dict(proposal.get("invocation") or {})
-        if int(invocation.get("attempt_count") or 0) > 0:
-            raise HTTPException(status_code=409, detail=f"Proposal invocation already consumed: {request_body.proposal_id}")
-
-        async with app_state.sys_tool_governance_lock:
-            proposals = _sync_sys_governance_store(app_state)
-            proposal = proposals[request_body.proposal_id]
-            transaction = dict(proposal.get("transaction") or {})
-            invocation = dict(proposal.get("invocation") or {})
-            if str(transaction.get("state") or "") in {
-                "preparing",
-                "applying",
-                "applied",
-                "rolling_back",
-                "rolled_back",
-            } or int(invocation.get("attempt_count") or 0) > 0:
-                raise HTTPException(status_code=409, detail=f"Proposal action already started: {request_body.proposal_id}")
-            proposal["transaction"] = {
-                "state": "preparing",
-                "apply": {
-                    "acted_by": request_body.acted_by,
-                    "reason": request_body.action_reason,
-                    "started_at": datetime.now(UTC).isoformat(),
-                },
-            }
-            proposal["updated_at"] = datetime.now(UTC).isoformat()
-            proposals[request_body.proposal_id] = proposal
-            _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+        except GovernanceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except GovernanceConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        operation_id = operation["operation_id"]
+        _append_sys_governance_event(
+            _sys_governance_events_path(app_state),
+            {
+                "event_type": "governance_apply_attempted",
+                "proposal_id": request_body.proposal_id,
+                "tool_name": "sys",
+                "acted_by": principal.actor_id,
+                "action_reason": request_body.action_reason,
+                "traceability": trace,
+            },
+        )
 
         parameters = dict(proposal.get("parameters") or {})
         parameters.setdefault("command", str(proposal.get("command") or ""))
@@ -612,6 +640,7 @@ async def act_on_sys_governance_proposal(
             "state": "unavailable",
             "reason": unsupported_reason,
         }
+        tool_coordinator = ToolCoordinator()
         if target_path:
             preflight_parameters = {
                 "command": "cat",
@@ -621,7 +650,6 @@ async def act_on_sys_governance_proposal(
                 "source": "governance_apply_preflight",
                 "context": "api.tools.sys.governance.rollback_capture",
             }
-            tool_coordinator = ToolCoordinator()
             try:
                 preflight = await tool_coordinator.execute_tool(
                     ToolExecutionRequest(tool_name="sys", parameters=preflight_parameters)
@@ -651,60 +679,25 @@ async def act_on_sys_governance_proposal(
             else:
                 rollback["reason"] = "target did not exist as a readable regular file before apply"
 
-        now = datetime.now(UTC).isoformat()
-        transaction = {
-            "state": "applying",
-            "apply": {
-                "acted_by": request_body.acted_by,
-                "reason": request_body.action_reason,
-                "started_at": now,
-            },
-            "rollback": rollback,
-        }
-        proposal["transaction"] = transaction
-        proposal["updated_at"] = now
-        proposals[request_body.proposal_id] = proposal
-        _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
-        _append_sys_governance_event(
-            _sys_governance_events_path(app_state),
-            {
-                "event_type": "governance_apply_attempted",
-                "proposal_id": request_body.proposal_id,
-                "tool_name": "sys",
-                "rollback_supported": bool(rollback.get("supported")),
-                "acted_by": request_body.acted_by,
-                "action_reason": request_body.action_reason,
-                "traceability": trace,
-            },
-        )
-
-        execution: ToolExecutionResult | None = None
+        # Perform the mutation directly via ToolCoordinator rather than the HTTP
+        # invoke_tool() endpoint: claim_apply above is already this call's
+        # governance authorization, so invoke_tool()'s own (file-backed,
+        # unrelated) proposal re-validation is neither needed nor reachable for
+        # a Postgres-only proposal.
         try:
-            from services.api.routers.tools import invoke_tool
-            invoke_parameters = dict(parameters)
-            invoke_parameters["proposal_id"] = request_body.proposal_id
-            execution = await invoke_tool(
-                "sys",
-                ToolInvokeRequest(parameters=invoke_parameters, timeout_seconds=120),
-                request,
-                Response(),
+            execution = await tool_coordinator.execute_tool(
+                ToolExecutionRequest(tool_name="sys", parameters=parameters, timeout_seconds=120)
             )
             if execution.status != "success":
                 raise RuntimeError(execution.error or "approved SYS action failed")
         except Exception as exc:
-            proposals = _sync_sys_governance_store(app_state)
-            proposal = proposals[request_body.proposal_id]
-            transaction = dict(proposal.get("transaction") or {})
-            transaction["state"] = "apply_failed"
-            transaction["apply"] = {
-                **dict(transaction.get("apply") or {}),
-                "failed_at": datetime.now(UTC).isoformat(),
-                "error": str(exc),
-            }
-            proposal["transaction"] = transaction
-            proposal["updated_at"] = datetime.now(UTC).isoformat()
-            proposals[request_body.proposal_id] = proposal
-            _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+            await service.complete_apply(
+                operation_id,
+                request_body.proposal_id,
+                principal,
+                success=False,
+                details={"acted_by": principal.actor_id, "reason": request_body.action_reason, "error": str(exc)},
+            )
             _append_sys_governance_event(
                 _sys_governance_events_path(app_state),
                 {
@@ -717,69 +710,89 @@ async def act_on_sys_governance_proposal(
             )
             raise HTTPException(status_code=409, detail=f"Governance apply failed: {exc}") from exc
 
-        proposals = _sync_sys_governance_store(app_state)
-        proposal = proposals[request_body.proposal_id]
-        transaction = dict(proposal.get("transaction") or {})
-        transaction["state"] = "applied"
-        transaction["apply"] = {
-            **dict(transaction.get("apply") or {}),
-            "completed_at": datetime.now(UTC).isoformat(),
-            "status": execution.status,
-        }
-        proposal["transaction"] = transaction
-        proposal["updated_at"] = datetime.now(UTC).isoformat()
-        proposals[request_body.proposal_id] = proposal
-        _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+        now = datetime.now(UTC).isoformat()
+        updated_proposal = await service.complete_apply(
+            operation_id,
+            request_body.proposal_id,
+            principal,
+            success=True,
+            details={
+                "acted_by": principal.actor_id,
+                "reason": request_body.action_reason,
+                "completed_at": now,
+                "status": execution.status,
+                "rollback": rollback,
+            },
+        )
+        if execution.metadata is not None:
+            execution.metadata["governance_proposal_id"] = request_body.proposal_id
         _append_sys_governance_event(
             _sys_governance_events_path(app_state),
             {
                 "event_type": "governance_apply_completed",
                 "proposal_id": request_body.proposal_id,
                 "tool_name": "sys",
-                "rollback_supported": bool((transaction.get("rollback") or {}).get("supported")),
+                "rollback_supported": bool(rollback.get("supported")),
                 "traceability": trace,
             },
         )
+        item = dict(updated_proposal)
+        item["transaction"] = {
+            "state": "applied",
+            "apply": {
+                "acted_by": principal.actor_id,
+                "reason": request_body.action_reason,
+                "completed_at": now,
+                "status": execution.status,
+            },
+            "rollback": rollback,
+        }
         return {
             "status": "success",
             "action": "apply",
-            "item": proposal,
+            "item": item,
             "execution": execution.model_dump(mode="json"),
         }
 
-    transaction = dict(proposal.get("transaction") or {})
-    if str(transaction.get("state") or "") != "applied":
+    # action == "rollback"
+    if str(proposal.get("state") or "") != "applied":
         raise HTTPException(status_code=409, detail=f"Proposal is not in applied state: {request_body.proposal_id}")
-    rollback = dict(transaction.get("rollback") or {})
-    if not bool(rollback.get("supported")) or str(rollback.get("state") or "") != "captured":
-        reason = str(rollback.get("reason") or "rollback is unavailable")
+    apply_operation = await service.get_latest_operation(request_body.proposal_id, "apply")
+    apply_rollback_info = dict((apply_operation or {}).get("details", {}).get("rollback") or {})
+    if not bool(apply_rollback_info.get("supported")) or str(apply_rollback_info.get("state") or "") != "captured":
+        reason = str(apply_rollback_info.get("reason") or "rollback is unavailable")
         raise HTTPException(status_code=409, detail=reason)
     try:
         snapshot = _load_sys_governance_rollback_snapshot(
             _sys_governance_store_path(app_state),
             request_body.proposal_id,
-            dict(rollback.get("snapshot") or {}),
+            dict(apply_rollback_info.get("snapshot") or {}),
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=409, detail=f"Rollback snapshot is invalid: {exc}") from exc
 
-    async with app_state.sys_tool_governance_lock:
-        proposals = _sync_sys_governance_store(app_state)
-        proposal = proposals[request_body.proposal_id]
-        transaction = dict(proposal.get("transaction") or {})
-        rollback = dict(transaction.get("rollback") or {})
-        if str(transaction.get("state") or "") != "applied" or str(rollback.get("state") or "") != "captured":
-            raise HTTPException(status_code=409, detail=f"Proposal rollback already started: {request_body.proposal_id}")
-        transaction["state"] = "rollback_preparing"
-        rollback["state"] = "preparing"
-        rollback["acted_by"] = request_body.acted_by
-        rollback["reason"] = request_body.action_reason
-        rollback["started_at"] = datetime.now(UTC).isoformat()
-        transaction["rollback"] = rollback
-        proposal["transaction"] = transaction
-        proposal["updated_at"] = datetime.now(UTC).isoformat()
-        proposals[request_body.proposal_id] = proposal
-        _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+    idempotency_key = request_body.request_id or f"rollback-{uuid4().hex[:12]}"
+    try:
+        _claimed_proposal, rollback_operation = await service.claim_rollback(
+            request_body.proposal_id,
+            principal,
+            idempotency_key,
+            action_reason=request_body.action_reason,
+        )
+    except GovernanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GovernanceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    rollback_operation_id = rollback_operation["operation_id"]
+    _append_sys_governance_event(
+        _sys_governance_events_path(app_state),
+        {
+            "event_type": "governance_rollback_attempted",
+            "proposal_id": request_body.proposal_id,
+            "tool_name": "sys",
+            "traceability": trace,
+        },
+    )
 
     rollback_parameters = {
         "command": "tee",
@@ -793,6 +806,8 @@ async def act_on_sys_governance_proposal(
         "source": "governance_rollback",
         "context": "api.tools.sys.governance.rollback_compensation",
     }
+    # Compensating proposal creation/auto-approval intentionally stays on the
+    # legacy file-backed store (see docstring) -- unchanged from before Phase 1.
     from services.tools.governance import create_pending_sys_governance_proposal
     rollback_proposal = await asyncio.to_thread(
         create_pending_sys_governance_proposal,
@@ -800,7 +815,7 @@ async def act_on_sys_governance_proposal(
         parameters=rollback_parameters,
         capability="governance_rollback",
         rationale=f"Compensate applied proposal {request_body.proposal_id}",
-        requested_by=request_body.acted_by,
+        requested_by=principal.actor_id,
         traceability=trace,
         handoff={
             "state": "rollback_pending",
@@ -809,32 +824,17 @@ async def act_on_sys_governance_proposal(
         },
         origin="governance_rollback",
     )
-    proposals = _sync_sys_governance_store(app_state)
-    rollback_proposal = proposals[str(rollback_proposal["proposal_id"])]
+    file_proposals = _sync_sys_governance_store(app_state)
+    rollback_proposal = file_proposals[str(rollback_proposal["proposal_id"])]
     now = datetime.now(UTC).isoformat()
     rollback_proposal["decision"] = "approved"
-    rollback_proposal["decided_by"] = request_body.acted_by
+    rollback_proposal["decided_by"] = principal.actor_id
     rollback_proposal["decision_reason"] = request_body.action_reason
     rollback_proposal["decision_at"] = now
     rollback_proposal["rollback_of"] = request_body.proposal_id
     rollback_proposal["updated_at"] = now
-    proposal = proposals[request_body.proposal_id]
-    transaction = dict(proposal.get("transaction") or {})
-    transaction["state"] = "rolling_back"
-    rollback = dict(transaction.get("rollback") or {})
-    rollback.update({
-        "state": "rolling_back",
-        "proposal_id": rollback_proposal["proposal_id"],
-        "acted_by": request_body.acted_by,
-        "reason": request_body.action_reason,
-        "started_at": now,
-    })
-    transaction["rollback"] = rollback
-    proposal["transaction"] = transaction
-    proposal["updated_at"] = now
-    proposals[request_body.proposal_id] = proposal
-    proposals[str(rollback_proposal["proposal_id"])] = rollback_proposal
-    _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+    file_proposals[str(rollback_proposal["proposal_id"])] = rollback_proposal
+    _persist_sys_governance_proposals(_sys_governance_store_path(app_state), file_proposals)
     _append_sys_governance_event(
         _sys_governance_events_path(app_state),
         {
@@ -842,20 +842,10 @@ async def act_on_sys_governance_proposal(
             "proposal_id": rollback_proposal["proposal_id"],
             "tool_name": "sys",
             "decision": "approved",
-            "decided_by": request_body.acted_by,
+            "decided_by": principal.actor_id,
             "decision_reason": request_body.action_reason,
             "command": "tee",
             "rollback_of": request_body.proposal_id,
-            "traceability": trace,
-        },
-    )
-    _append_sys_governance_event(
-        _sys_governance_events_path(app_state),
-        {
-            "event_type": "governance_rollback_attempted",
-            "proposal_id": request_body.proposal_id,
-            "rollback_proposal_id": rollback_proposal["proposal_id"],
-            "tool_name": "sys",
             "traceability": trace,
         },
     )
@@ -876,17 +866,13 @@ async def act_on_sys_governance_proposal(
         if str(evidence.get("sha256") or "") != str(snapshot.get("sha256") or ""):
             raise RuntimeError("rollback content digest was not restored")
     except Exception as exc:
-        proposals = _sync_sys_governance_store(app_state)
-        proposal = proposals[request_body.proposal_id]
-        transaction = dict(proposal.get("transaction") or {})
-        transaction["state"] = "rollback_failed"
-        rollback = dict(transaction.get("rollback") or {})
-        rollback.update({"state": "failed", "failed_at": datetime.now(UTC).isoformat(), "error": str(exc)})
-        transaction["rollback"] = rollback
-        proposal["transaction"] = transaction
-        proposal["updated_at"] = datetime.now(UTC).isoformat()
-        proposals[request_body.proposal_id] = proposal
-        _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+        await service.complete_rollback(
+            rollback_operation_id,
+            request_body.proposal_id,
+            principal,
+            success=False,
+            details={"acted_by": principal.actor_id, "reason": request_body.action_reason, "error": str(exc)},
+        )
         _append_sys_governance_event(
             _sys_governance_events_path(app_state),
             {
@@ -900,21 +886,29 @@ async def act_on_sys_governance_proposal(
         )
         raise HTTPException(status_code=409, detail=f"Governance rollback failed: {exc}") from exc
 
-    proposals = _sync_sys_governance_store(app_state)
-    proposal = proposals[request_body.proposal_id]
-    transaction = dict(proposal.get("transaction") or {})
-    transaction["state"] = "rolled_back"
-    rollback = dict(transaction.get("rollback") or {})
-    rollback.update({
-        "state": "completed",
-        "completed_at": datetime.now(UTC).isoformat(),
-        "restored_sha256": snapshot["sha256"],
-    })
-    transaction["rollback"] = rollback
-    proposal["transaction"] = transaction
-    proposal["updated_at"] = datetime.now(UTC).isoformat()
-    proposals[request_body.proposal_id] = proposal
-    _persist_sys_governance_proposals(_sys_governance_store_path(app_state), proposals)
+    now = datetime.now(UTC).isoformat()
+    updated_proposal = await service.complete_rollback(
+        rollback_operation_id,
+        request_body.proposal_id,
+        principal,
+        success=True,
+        details={
+            "acted_by": principal.actor_id,
+            "reason": request_body.action_reason,
+            "completed_at": now,
+            "restored_sha256": snapshot["sha256"],
+            "rollback_proposal_id": rollback_proposal["proposal_id"],
+        },
+    )
+    item = dict(updated_proposal)
+    item["transaction"] = {
+        "state": "rolled_back",
+        "rollback": {
+            "state": "completed",
+            "completed_at": now,
+            "restored_sha256": snapshot["sha256"],
+        },
+    }
     _append_sys_governance_event(
         _sys_governance_events_path(app_state),
         {
@@ -926,11 +920,16 @@ async def act_on_sys_governance_proposal(
             "traceability": trace,
         },
     )
+    # Re-sync from the file store: invoke_tool() above applied its own
+    # invocation-bookkeeping to the compensating rollback_proposal record and
+    # persisted it -- our earlier in-memory `file_proposals` reference predates
+    # that update.
+    file_proposals = _sync_sys_governance_store(app_state)
     return {
         "status": "success",
         "action": "rollback",
-        "item": proposal,
-        "rollback_proposal": proposals.get(str(rollback_proposal["proposal_id"]), rollback_proposal),
+        "item": item,
+        "rollback_proposal": file_proposals.get(str(rollback_proposal["proposal_id"]), rollback_proposal),
         "execution": execution.model_dump(mode="json"),
     }
 

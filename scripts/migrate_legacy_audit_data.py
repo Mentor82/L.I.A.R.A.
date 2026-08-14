@@ -6,6 +6,7 @@ into PostgreSQL canonical tables. Writes `legacy_import_completed = true` to sys
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("liara.migration")
 
 
+def _deterministic_legacy_id(prefix: str, line: str) -> str:
+    """Content-addressed fallback ID for a legacy record without its own event_id.
+
+    Deterministic across process restarts, unlike Python's salted hash() —
+    a legacy record lacking event_id would otherwise get a different
+    fallback id on every run, defeating ON CONFLICT DO NOTHING dedup and
+    creating duplicate rows on every rerun.
+    """
+    digest = hashlib.sha256(line.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}-legacy-{digest}"
+
+
+def _quarantine_line(source_file: Path, line: str, reason: str) -> None:
+    """Append a malformed line + reason to a quarantine file next to the source.
+
+    Keeps a malformed line from silently vanishing (or aborting every
+    subsequent line in the same file) while still letting the migration
+    report an observable quarantined count.
+    """
+    quarantine_file = source_file.with_name(source_file.name + ".quarantine.jsonl")
+    record = {
+        "reason": reason,
+        "raw_line": line,
+        "quarantined_at": datetime.now(UTC).isoformat(),
+    }
+    with quarantine_file.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def run_legacy_audit_migration(postgres_url: str | None = None) -> dict[str, int]:
     """Run idempotent migration of legacy JSON/JSONL files into PostgreSQL."""
     url = postgres_url or Settings.POSTGRES_URL
@@ -42,8 +72,10 @@ def run_legacy_audit_migration(postgres_url: str | None = None) -> dict[str, int
         "proposals_skipped": 0,
         "gov_events_imported": 0,
         "gov_events_skipped": 0,
+        "gov_events_quarantined": 0,
         "sys_audit_imported": 0,
         "sys_audit_skipped": 0,
+        "sys_audit_quarantined": 0,
     }
 
     try:
@@ -51,12 +83,14 @@ def run_legacy_audit_migration(postgres_url: str | None = None) -> dict[str, int
         apply_governance_schema_sync(conn)
 
         with conn.cursor() as cur:
-            # Check if migration already completed
-            cur.execute("SELECT value FROM system_metadata WHERE key = 'legacy_import_completed';")
-            row = cur.fetchone()
-            if row and row[0] and row[0].get("completed") is True:
-                logger.info("Legacy import already completed previously. Skipping file import.")
-                return counts
+            # Note: no early-return on a prior "legacy_import_completed" flag.
+            # Once Postgres is the canonical store, no new writes should land in
+            # the legacy JSONL files, but if a straggler ever does, skipping all
+            # file scanning forever would silently drop it. Every run rescans;
+            # the per-row ON CONFLICT DO NOTHING / SELECT-then-INSERT checks
+            # below make reruns cheap, and the system_metadata marker at the end
+            # is updated with the latest counts/timestamp on every run instead
+            # of being a one-shot flag.
 
             # 2. Migrate Proposals (sys_governance_proposals.json)
             workspace_dir = Path(os.getenv("LIARA_SYS_GOVERNANCE_PATH", str(PROJECT_ROOT / "data"))).parent
@@ -109,91 +143,101 @@ def run_legacy_audit_migration(postgres_url: str | None = None) -> dict[str, int
             # 3. Migrate Governance Events (sys_governance_events.jsonl)
             events_file = workspace_dir / "sys_governance_events.jsonl"
             if events_file.exists():
-                try:
-                    for line in events_file.read_text(encoding="utf-8").splitlines():
-                        if not line.strip():
-                            continue
+                for line in events_file.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
                         event = json.loads(line)
                         if not isinstance(event, dict):
-                            continue
-                        evt_id = str(event.get("event_id") or f"evt-{hash(line)}")
+                            raise ValueError("governance event line is not a JSON object")
                         prop_id = str(event.get("proposal_id") or "")
                         if not prop_id:
-                            continue
+                            raise ValueError("governance event line is missing proposal_id")
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        _quarantine_line(events_file, line, str(exc))
+                        counts["gov_events_quarantined"] += 1
+                        continue
 
-                        cur.execute("SELECT 1 FROM governance_events WHERE event_id = %s;", (evt_id,))
-                        if cur.fetchone():
-                            counts["gov_events_skipped"] += 1
-                            continue
+                    evt_id = str(event.get("event_id") or _deterministic_legacy_id("evt", line))
 
-                        cur.execute(
-                            """
-                            INSERT INTO governance_events (
-                                event_id, proposal_id, proposal_revision, event_type, decision, state, actor_id, traceability, created_at
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT DO NOTHING;
-                            """,
-                            (
-                                evt_id,
-                                prop_id,
-                                int(event.get("proposal_revision") or 1),
-                                str(event.get("event_type") or "proposal_event"),
-                                event.get("decision"),
-                                event.get("state"),
-                                event.get("actor_id") or event.get("decided_by"),
-                                json.dumps(redact_and_bound_payload(event.get("traceability"))),
-                                event.get("timestamp") or datetime.now(UTC).isoformat(),
-                            ),
-                        )
-                        counts["gov_events_imported"] += 1
-                except Exception as exc:
-                    logger.warning(f"Error parsing governance events file: {exc}")
+                    cur.execute("SELECT 1 FROM governance_events WHERE event_id = %s;", (evt_id,))
+                    if cur.fetchone():
+                        counts["gov_events_skipped"] += 1
+                        continue
+
+                    cur.execute(
+                        """
+                        INSERT INTO governance_events (
+                            event_id, proposal_id, proposal_revision, event_type, decision, state, actor_id, traceability, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (
+                            evt_id,
+                            prop_id,
+                            int(event.get("proposal_revision") or 1),
+                            str(event.get("event_type") or "proposal_event"),
+                            event.get("decision"),
+                            event.get("state"),
+                            event.get("actor_id") or event.get("decided_by"),
+                            json.dumps(redact_and_bound_payload(event.get("traceability"))),
+                            event.get("timestamp") or datetime.now(UTC).isoformat(),
+                        ),
+                    )
+                    counts["gov_events_imported"] += 1
 
             # 4. Migrate Sys Audit Events (sys_audit.jsonl)
             audit_file = workspace_dir / "sys_audit.jsonl"
             if audit_file.exists():
-                try:
-                    for line in audit_file.read_text(encoding="utf-8").splitlines():
-                        if not line.strip():
-                            continue
+                for line in audit_file.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
                         item = json.loads(line)
                         if not isinstance(item, dict):
-                            continue
-                        evt_id = str(item.get("event_id") or f"aud-{hash(line)}")
-                        tool = str(item.get("tool_name") or "unknown")
+                            raise ValueError("sys_audit line is not a JSON object")
+                    except json.JSONDecodeError as exc:
+                        _quarantine_line(audit_file, line, str(exc))
+                        counts["sys_audit_quarantined"] += 1
+                        continue
+                    except ValueError as exc:
+                        _quarantine_line(audit_file, line, str(exc))
+                        counts["sys_audit_quarantined"] += 1
+                        continue
 
-                        cur.execute("SELECT 1 FROM sys_audit_events WHERE event_id = %s;", (evt_id,))
-                        if cur.fetchone():
-                            counts["sys_audit_skipped"] += 1
-                            continue
+                    evt_id = str(item.get("event_id") or _deterministic_legacy_id("aud", line))
+                    tool = str(item.get("tool_name") or "unknown")
 
-                        cur.execute(
-                            """
-                            INSERT INTO sys_audit_events (
-                                event_id, operation_id, proposal_id, request_id, session_id, run_id,
-                                tool_name, lifecycle_stage, outcome, actor_id, context, metadata, timestamp
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT DO NOTHING;
-                            """,
-                            (
-                                evt_id,
-                                item.get("operation_id"),
-                                item.get("proposal_id"),
-                                item.get("request_id"),
-                                item.get("session_id"),
-                                item.get("run_id"),
-                                tool,
-                                str(item.get("lifecycle_stage") or "completed"),
-                                item.get("outcome") or item.get("decision"),
-                                item.get("actor_id"),
-                                item.get("context"),
-                                json.dumps(redact_and_bound_payload(item.get("metadata") or item)),
-                                item.get("timestamp") or datetime.now(UTC).isoformat(),
-                            ),
-                        )
-                        counts["sys_audit_imported"] += 1
-                except Exception as exc:
-                    logger.warning(f"Error parsing sys_audit file: {exc}")
+                    cur.execute("SELECT 1 FROM sys_audit_events WHERE event_id = %s;", (evt_id,))
+                    if cur.fetchone():
+                        counts["sys_audit_skipped"] += 1
+                        continue
+
+                    cur.execute(
+                        """
+                        INSERT INTO sys_audit_events (
+                            event_id, operation_id, proposal_id, request_id, session_id, run_id,
+                            tool_name, lifecycle_stage, outcome, actor_id, context, metadata, timestamp
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (
+                            evt_id,
+                            item.get("operation_id"),
+                            item.get("proposal_id"),
+                            item.get("request_id"),
+                            item.get("session_id"),
+                            item.get("run_id"),
+                            tool,
+                            str(item.get("lifecycle_stage") or "completed"),
+                            item.get("outcome") or item.get("decision"),
+                            item.get("actor_id"),
+                            item.get("context"),
+                            json.dumps(redact_and_bound_payload(item.get("metadata") or item)),
+                            item.get("timestamp") or datetime.now(UTC).isoformat(),
+                        ),
+                    )
+                    counts["sys_audit_imported"] += 1
 
             # 5. Set persistent cutover marker
             now_iso = datetime.now(UTC).isoformat()

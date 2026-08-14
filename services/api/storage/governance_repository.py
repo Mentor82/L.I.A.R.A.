@@ -63,6 +63,38 @@ def redact_and_bound_payload(data: Any, max_bytes: int = MAX_JSONB_BYTES) -> dic
     return cleaned_dict
 
 
+def _row_to_proposal_dict(row: tuple) -> dict[str, Any]:
+    """Map a governance_proposals SELECT row (22-column shape used by get_proposal/
+    list_proposals) into the proposal dict shape the rest of the codebase expects."""
+    def _json_field(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else json.loads(value or "{}")
+
+    return {
+        "proposal_id": row[0],
+        "revision": row[1],
+        "decision": row[2],
+        "state": row[3],
+        "tool_name": row[4],
+        "command": row[5],
+        "parameters": _json_field(row[6]),
+        "policy_check": _json_field(row[7]),
+        "capability": row[8],
+        "rationale": row[9],
+        "requested_by": row[10],
+        "decided_by": row[11],
+        "decision_reason": row[12],
+        "decision_at": row[13].isoformat() if hasattr(row[13], "isoformat") else row[13],
+        "traceability": _json_field(row[14]),
+        "created_at": row[15].isoformat() if hasattr(row[15], "isoformat") else row[15],
+        "updated_at": row[16].isoformat() if hasattr(row[16], "isoformat") else row[16],
+        "handoff": _json_field(row[17]),
+        "transaction": _json_field(row[18]),
+        "invocation": _json_field(row[19]),
+        "invocation_digest": row[20],
+        "max_invocations": row[21],
+    }
+
+
 class PostgresGovernanceRepository:
     """Repository handling governance persistence and transactional state transitions."""
 
@@ -75,6 +107,7 @@ class PostgresGovernanceRepository:
             )
         self._in_memory_proposals: dict[str, dict[str, Any]] = in_memory_store if in_memory_store is not None else {}
         self._in_memory_events: list[dict[str, Any]] = []
+        self._in_memory_operations: dict[str, dict[str, Any]] = {}
         self._app_state = app_state
 
     def _get_proposals_dict(self) -> dict[str, dict[str, Any]]:
@@ -131,8 +164,9 @@ class PostgresGovernanceRepository:
                     INSERT INTO governance_proposals (
                         proposal_id, revision, decision, state, tool_name, command,
                         parameters, policy_check, capability, rationale, requested_by,
-                        decided_by, decision_reason, decision_at, traceability, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                        handoff, transaction, invocation, invocation_digest, max_invocations
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING proposal_id, revision, decision, state, created_at, updated_at;
                     """,
                     (
@@ -153,6 +187,11 @@ class PostgresGovernanceRepository:
                         json.dumps(redact_and_bound_payload(proposal.get("traceability"))),
                         proposal.get("created_at", datetime.now(UTC).isoformat()),
                         proposal.get("updated_at", datetime.now(UTC).isoformat()),
+                        json.dumps(redact_and_bound_payload(proposal.get("handoff"))),
+                        json.dumps(redact_and_bound_payload(proposal.get("transaction"))),
+                        json.dumps(redact_and_bound_payload(proposal.get("invocation"))),
+                        proposal.get("invocation_digest"),
+                        proposal.get("max_invocations", 1),
                     ),
                 )
                 
@@ -200,7 +239,8 @@ class PostgresGovernanceRepository:
                     """
                     SELECT proposal_id, revision, decision, state, tool_name, command,
                            parameters, policy_check, capability, rationale, requested_by,
-                           decided_by, decision_reason, decision_at, traceability, created_at, updated_at
+                           decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                           handoff, transaction, invocation, invocation_digest, max_invocations
                     FROM governance_proposals WHERE proposal_id = %s;
                     """,
                     (proposal_id,),
@@ -208,25 +248,7 @@ class PostgresGovernanceRepository:
                 row = cur.fetchone()
                 if not row:
                     return None
-                return {
-                    "proposal_id": row[0],
-                    "revision": row[1],
-                    "decision": row[2],
-                    "state": row[3],
-                    "tool_name": row[4],
-                    "command": row[5],
-                    "parameters": row[6] if isinstance(row[6], dict) else json.loads(row[6] or "{}"),
-                    "policy_check": row[7] if isinstance(row[7], dict) else json.loads(row[7] or "{}"),
-                    "capability": row[8],
-                    "rationale": row[9],
-                    "requested_by": row[10],
-                    "decided_by": row[11],
-                    "decision_reason": row[12],
-                    "decision_at": row[13].isoformat() if hasattr(row[13], "isoformat") else row[13],
-                    "traceability": row[14] if isinstance(row[14], dict) else json.loads(row[14] or "{}"),
-                    "created_at": row[15].isoformat() if hasattr(row[15], "isoformat") else row[15],
-                    "updated_at": row[16].isoformat() if hasattr(row[16], "isoformat") else row[16],
-                }
+                return _row_to_proposal_dict(row)
 
         return await asyncio.to_thread(self._run_in_connection, _sync_get)
 
@@ -246,7 +268,8 @@ class PostgresGovernanceRepository:
                         """
                         SELECT proposal_id, revision, decision, state, tool_name, command,
                                parameters, policy_check, capability, rationale, requested_by,
-                               decided_by, decision_reason, decision_at, traceability, created_at, updated_at
+                               decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                               handoff, transaction, invocation, invocation_digest, max_invocations
                         FROM governance_proposals WHERE decision = %s
                         ORDER BY created_at DESC LIMIT %s;
                         """,
@@ -257,34 +280,14 @@ class PostgresGovernanceRepository:
                         """
                         SELECT proposal_id, revision, decision, state, tool_name, command,
                                parameters, policy_check, capability, rationale, requested_by,
-                               decided_by, decision_reason, decision_at, traceability, created_at, updated_at
+                               decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                               handoff, transaction, invocation, invocation_digest, max_invocations
                         FROM governance_proposals ORDER BY created_at DESC LIMIT %s;
                         """,
                         (limit,),
                     )
                 rows = cur.fetchall()
-                results = []
-                for row in rows:
-                    results.append({
-                        "proposal_id": row[0],
-                        "revision": row[1],
-                        "decision": row[2],
-                        "state": row[3],
-                        "tool_name": row[4],
-                        "command": row[5],
-                        "parameters": row[6] if isinstance(row[6], dict) else json.loads(row[6] or "{}"),
-                        "policy_check": row[7] if isinstance(row[7], dict) else json.loads(row[7] or "{}"),
-                        "capability": row[8],
-                        "rationale": row[9],
-                        "requested_by": row[10],
-                        "decided_by": row[11],
-                        "decision_reason": row[12],
-                        "decision_at": row[13].isoformat() if hasattr(row[13], "isoformat") else row[13],
-                        "traceability": row[14] if isinstance(row[14], dict) else json.loads(row[14] or "{}"),
-                        "created_at": row[15].isoformat() if hasattr(row[15], "isoformat") else row[15],
-                        "updated_at": row[16].isoformat() if hasattr(row[16], "isoformat") else row[16],
-                    })
-                return results
+                return [_row_to_proposal_dict(row) for row in rows]
 
         return await asyncio.to_thread(self._run_in_connection, _sync_list)
 
@@ -437,8 +440,17 @@ class PostgresGovernanceRepository:
         actor_id: str,
         target_state: str,    # e.g., 'invoking', 'applying', 'rolling_back'
         details: Optional[dict[str, Any]] = None,
+        expected_proposal_state: Optional[str] = None,
     ) -> Tuple[dict[str, Any], dict[str, Any]]:
-        """Atomically claim an external side-effect operation with DB-level idempotency constraint."""
+        """Atomically claim an external side-effect operation with DB-level idempotency constraint.
+
+        When expected_proposal_state is given, the claim additionally requires the
+        proposal's current state to match it (checked under the same row lock /
+        in-memory check as the decision check below), so e.g. a second concurrent
+        "apply" claim on a proposal that has already moved past "decided" is
+        rejected with GovernanceConflictError instead of racing a second
+        governance_operations row into existence via a different idempotency key.
+        """
         now = datetime.now(UTC).isoformat()
         operation_id = f"op-{uuid4().hex[:12]}"
 
@@ -449,11 +461,42 @@ class PostgresGovernanceRepository:
                 raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
             if prop.get("decision") != "approved":
                 raise GovernanceConflictError(f"Proposal {proposal_id} is not approved (decision={prop.get('decision')})")
+            if expected_proposal_state is not None and prop.get("state") != expected_proposal_state:
+                raise GovernanceConflictError(
+                    f"Proposal {proposal_id} is not in expected state '{expected_proposal_state}' "
+                    f"(actual state={prop.get('state')})"
+                )
+
+            existing_op = next(
+                (
+                    op for op in self._in_memory_operations.values()
+                    if op["proposal_id"] == proposal_id
+                    and op["operation_type"] == operation_type
+                    and op["idempotency_key"] == idempotency_key
+                ),
+                None,
+            )
+            if existing_op is not None:
+                return (
+                    dict(prop),
+                    {"operation_id": existing_op["operation_id"], "state": existing_op["state"], "idempotency_key": idempotency_key, "reused": True},
+                )
 
             prop["revision"] = prop.get("revision", 1) + 1
             prop["state"] = target_state
             prop["updated_at"] = now
 
+            self._in_memory_operations[operation_id] = {
+                "operation_id": operation_id,
+                "proposal_id": proposal_id,
+                "operation_type": operation_type,
+                "state": "started",
+                "idempotency_key": idempotency_key,
+                "actor_id": actor_id,
+                "details": details or {},
+                "created_at": now,
+                "updated_at": now,
+            }
             self._in_memory_events.append({
                 "event_id": f"evt-{uuid4().hex[:12]}",
                 "proposal_id": proposal_id,
@@ -484,6 +527,11 @@ class PostgresGovernanceRepository:
                 rev, dec, curr_state = prop_row
                 if dec != "approved":
                     raise GovernanceConflictError(f"Proposal {proposal_id} is not approved (decision={dec})")
+                if expected_proposal_state is not None and curr_state != expected_proposal_state:
+                    raise GovernanceConflictError(
+                        f"Proposal {proposal_id} is not in expected state '{expected_proposal_state}' "
+                        f"(actual state={curr_state})"
+                    )
 
                 # 2. Insert claimed operation with UNIQUE constraint on (proposal_id, operation_type, idempotency_key)
                 try:
@@ -576,7 +624,14 @@ class PostgresGovernanceRepository:
         actor_id: str,
         details: Optional[dict[str, Any]] = None,
     ) -> Tuple[dict[str, Any], dict[str, Any]]:
-        """Complete or fail a claimed operation and transition coupled proposal state."""
+        """Complete or fail a claimed operation and transition coupled proposal state.
+
+        The operation update is CAS-guarded: it only applies when the operation
+        both belongs to the given proposal_id and is still in a non-terminal
+        state, so a mismatched or already-terminal operation_id is rejected
+        with GovernanceConflictError instead of silently mutating proposal
+        state a second time.
+        """
         now = datetime.now(UTC).isoformat()
 
         if self._pool is None:
@@ -584,6 +639,18 @@ class PostgresGovernanceRepository:
             prop = dict_store.get(proposal_id)
             if not prop:
                 raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
+
+            existing_op = self._in_memory_operations.get(operation_id)
+            if existing_op is not None:
+                if existing_op["proposal_id"] != proposal_id or existing_op["state"] in {"completed", "failed", "outcome_unknown"}:
+                    raise GovernanceConflictError(
+                        f"Operation {operation_id} cannot be completed: expected proposal_id={proposal_id} "
+                        f"and a non-terminal state, actual proposal_id={existing_op['proposal_id']}, state={existing_op['state']}"
+                    )
+                existing_op["state"] = final_op_state
+                existing_op["details"] = details or existing_op.get("details") or {}
+                existing_op["updated_at"] = now
+
             prop["revision"] = prop.get("revision", 1) + 1
             prop["state"] = final_proposal_state
             prop["updated_at"] = now
@@ -600,16 +667,35 @@ class PostgresGovernanceRepository:
                 "created_at": now,
             })
             return (dict(prop), {"operation_id": operation_id, "state": final_op_state})
+
+        def _sync_complete(conn):
             with conn.cursor() as cur:
-                # Update operation record
+                # CAS-guard the operation update: must match proposal_id and
+                # still be non-terminal, otherwise reject rather than silently
+                # completing a foreign or already-finished operation.
                 cur.execute(
                     """
                     UPDATE governance_operations
                     SET state = %s, updated_at = %s, details = %s
-                    WHERE operation_id = %s;
+                    WHERE operation_id = %s AND proposal_id = %s
+                      AND state NOT IN ('completed', 'failed', 'outcome_unknown')
+                    RETURNING operation_id, proposal_id, operation_type;
                     """,
-                    (final_op_state, now, json.dumps(redact_and_bound_payload(details or {})), operation_id),
+                    (final_op_state, now, json.dumps(redact_and_bound_payload(details or {})), operation_id, proposal_id),
                 )
+                op_row = cur.fetchone()
+                if not op_row:
+                    cur.execute(
+                        "SELECT operation_id, proposal_id, state FROM governance_operations WHERE operation_id = %s;",
+                        (operation_id,),
+                    )
+                    existing = cur.fetchone()
+                    if not existing:
+                        raise GovernanceNotFoundError(f"Unknown operation ID: {operation_id}")
+                    raise GovernanceConflictError(
+                        f"Operation {operation_id} cannot be completed: expected proposal_id={proposal_id} "
+                        f"and a non-terminal state, actual proposal_id={existing[1]}, state={existing[2]}"
+                    )
 
                 # Update proposal record
                 cur.execute(
@@ -657,6 +743,100 @@ class PostgresGovernanceRepository:
                 )
 
         return await asyncio.to_thread(self._run_in_connection, _sync_complete)
+
+    async def get_latest_operation(self, proposal_id: str, operation_type: str) -> Optional[dict[str, Any]]:
+        """Fetch the most recent governance_operations row for (proposal_id, operation_type).
+
+        Used to retrieve operation-scoped bookkeeping (e.g. a captured rollback
+        snapshot reference stored in an "apply" operation's details) without a
+        proposal-level JSONB column for it.
+        """
+        if self._pool is None:
+            candidates = [
+                op for op in self._in_memory_operations.values()
+                if op["proposal_id"] == proposal_id and op["operation_type"] == operation_type
+            ]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda op: str(op.get("created_at") or ""), reverse=True)
+            return dict(candidates[0])
+
+        def _sync_get_latest(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT operation_id, proposal_id, operation_type, state, idempotency_key, actor_id, details, created_at, updated_at
+                    FROM governance_operations
+                    WHERE proposal_id = %s AND operation_type = %s
+                    ORDER BY created_at DESC LIMIT 1;
+                    """,
+                    (proposal_id, operation_type),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return {
+                    "operation_id": row[0],
+                    "proposal_id": row[1],
+                    "operation_type": row[2],
+                    "state": row[3],
+                    "idempotency_key": row[4],
+                    "actor_id": row[5],
+                    "details": row[6] if isinstance(row[6], dict) else json.loads(row[6] or "{}"),
+                    "created_at": row[7].isoformat() if hasattr(row[7], "isoformat") else row[7],
+                    "updated_at": row[8].isoformat() if hasattr(row[8], "isoformat") else row[8],
+                }
+
+        return await asyncio.to_thread(self._run_in_connection, _sync_get_latest)
+
+    async def list_events(self, proposal_id: Optional[str] = None, limit: int = 100) -> List[dict[str, Any]]:
+        """List immutable governance_events rows, optionally filtered to one proposal."""
+        if self._pool is None:
+            events = list(self._in_memory_events)
+            if proposal_id:
+                events = [e for e in events if e.get("proposal_id") == proposal_id]
+            events.sort(key=lambda e: str(e.get("created_at") or ""), reverse=True)
+            return [dict(e) for e in events[:limit]]
+
+        def _sync_list_events(conn):
+            with conn.cursor() as cur:
+                if proposal_id:
+                    cur.execute(
+                        """
+                        SELECT event_id, proposal_id, operation_id, proposal_revision, event_type,
+                               decision, state, actor_id, traceability, created_at
+                        FROM governance_events WHERE proposal_id = %s
+                        ORDER BY created_at DESC LIMIT %s;
+                        """,
+                        (proposal_id, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT event_id, proposal_id, operation_id, proposal_revision, event_type,
+                               decision, state, actor_id, traceability, created_at
+                        FROM governance_events ORDER BY created_at DESC LIMIT %s;
+                        """,
+                        (limit,),
+                    )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "event_id": row[0],
+                        "proposal_id": row[1],
+                        "operation_id": row[2],
+                        "proposal_revision": row[3],
+                        "event_type": row[4],
+                        "decision": row[5],
+                        "state": row[6],
+                        "actor_id": row[7],
+                        "traceability": row[8] if isinstance(row[8], dict) else json.loads(row[8] or "{}"),
+                        "timestamp": row[9].isoformat() if hasattr(row[9], "isoformat") else row[9],
+                    }
+                    for row in rows
+                ]
+
+        return await asyncio.to_thread(self._run_in_connection, _sync_list_events)
 
     async def recover_stale_operations(self, stale_threshold_seconds: float = 300.0) -> List[dict[str, Any]]:
         """Identify claimed operations stuck in 'started' state past threshold and mark them as outcome_unknown."""

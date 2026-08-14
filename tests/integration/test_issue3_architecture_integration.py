@@ -335,6 +335,93 @@ async def test_legacy_import_double_execution_idempotent(tmp_path, monkeypatch):
 
 
 # -----------------------------------------------------------------------------
+# Test 4b: Legacy Import Real File Parsing — Quarantine + Idempotent Rerun
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_legacy_import_real_files_quarantine_and_idempotent_rerun(tmp_path, monkeypatch):
+    """Exercise real (non-mocked) file parsing against real PostgreSQL: one valid line
+    plus one malformed line per JSONL source must import the valid line, quarantine the
+    malformed one (not abort the rest of the file), and a second run must import 0 new
+    rows for the already-imported line."""
+    import json
+    from uuid import uuid4
+
+    pool = _get_real_postgres_pool()
+    marker = uuid4().hex[:8]
+    proposal_id = f"sys-prop-real-{marker}"
+
+    # governance_events.proposal_id has a foreign-key constraint onto
+    # governance_proposals, so the referenced proposal must be imported
+    # (or already exist) first.
+    proposals_file = tmp_path / "sys_governance_proposals.json"
+    proposals_file.write_text(
+        json.dumps({proposal_id: {"command": "health", "decision": "pending", "requested_by": "legacy.import"}}),
+        encoding="utf-8",
+    )
+
+    events_file = tmp_path / "sys_governance_events.jsonl"
+    valid_event = {
+        "event_id": f"evt-real-{marker}",
+        "proposal_id": proposal_id,
+        "event_type": "proposal_created",
+        "decision": "pending",
+        "state": "created",
+    }
+    events_file.write_text(json.dumps(valid_event) + "\n{this is not valid json\n", encoding="utf-8")
+
+    audit_file = tmp_path / "sys_audit.jsonl"
+    valid_audit = {
+        "event_id": f"aud-real-{marker}",
+        "tool_name": "health",
+        "lifecycle_stage": "completed",
+    }
+    audit_file.write_text(json.dumps(valid_audit) + "\nnot even json at all\n", encoding="utf-8")
+
+    class _RealPoolFactStore:
+        def __init__(self, postgres_url=None, auto_initialize=False):
+            self._pool = pool
+
+        def _initialize_sync(self):
+            pass
+
+    monkeypatch.setattr("scripts.migrate_legacy_audit_data.FactStore", _RealPoolFactStore)
+    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_PATH", str(tmp_path / "data"))
+
+    counts_run1 = run_legacy_audit_migration("postgresql://liara:liara2026@127.0.0.1:5433/liara_memory")
+    assert counts_run1["proposals_imported"] == 1
+    assert counts_run1["gov_events_imported"] == 1
+    assert counts_run1["gov_events_quarantined"] == 1
+    assert counts_run1["sys_audit_imported"] == 1
+    assert counts_run1["sys_audit_quarantined"] == 1
+
+    events_quarantine = events_file.with_name(events_file.name + ".quarantine.jsonl")
+    audit_quarantine = audit_file.with_name(audit_file.name + ".quarantine.jsonl")
+    assert events_quarantine.exists()
+    assert audit_quarantine.exists()
+    quarantined_event_record = json.loads(events_quarantine.read_text(encoding="utf-8").splitlines()[0])
+    assert "this is not valid json" in quarantined_event_record["raw_line"]
+
+    # Second run: the valid line is already present, must not be re-imported.
+    counts_run2 = run_legacy_audit_migration("postgresql://liara:liara2026@127.0.0.1:5433/liara_memory")
+    assert counts_run2["proposals_imported"] == 0
+    assert counts_run2["proposals_skipped"] == 1
+    assert counts_run2["gov_events_imported"] == 0
+    assert counts_run2["gov_events_skipped"] == 1
+    assert counts_run2["sys_audit_imported"] == 0
+    assert counts_run2["sys_audit_skipped"] == 1
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM governance_events WHERE event_id = %s;", (f"evt-real-{marker}",))
+            assert cur.fetchone()[0] == 1
+            cur.execute("SELECT count(*) FROM sys_audit_events WHERE event_id = %s;", (f"aud-real-{marker}",))
+            assert cur.fetchone()[0] == 1
+    finally:
+        pool.putconn(conn)
+
+
+# -----------------------------------------------------------------------------
 # Test 5: SSE Lifecycle Distinction (aclose vs outer-task cancel vs socket disconnect)
 # -----------------------------------------------------------------------------
 @pytest.mark.asyncio
