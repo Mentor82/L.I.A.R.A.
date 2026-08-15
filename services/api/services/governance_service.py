@@ -154,12 +154,14 @@ class GovernanceService:
 
         Idempotent on handoff.handoff_key: a second call with the same key
         while a matching proposal is still pending returns that existing
-        proposal instead of creating a duplicate. This mirrors (but doesn't
-        improve on) the pre-migration file-based
-        create_pending_sys_governance_proposal's dedup guard -- like that
-        guard, the check-then-create is not atomic against a truly
-        concurrent duplicate call; unlike claim_operation's row-locked CAS,
-        proposal creation has no natural row to lock before it exists.
+        proposal instead of creating a duplicate. A partial UNIQUE index on
+        governance_proposals(handoff_key) WHERE decision='pending' (migration
+        004) enforces this atomically even under genuine concurrency --
+        mirrors claim_operation's UNIQUE(proposal_id, operation_type,
+        idempotency_key) idempotency pattern. The pre-check below is purely
+        an optimization to skip proposal construction on the common
+        non-conflicting path; save_proposal() raising GovernanceConflictError
+        on the actual insert is the real correctness guarantee.
         """
         classification = classify_sys_governance(parameters)
         invocation_digest = sys_governance_invocation_digest(command, parameters)
@@ -173,11 +175,9 @@ class GovernanceService:
             ))
         normalized_handoff["handoff_key"] = handoff_key
 
-        pending = await self.repo.list_proposals(decision="pending", limit=None)
-        for candidate in pending:
-            candidate_handoff = candidate.get("handoff") if isinstance(candidate.get("handoff"), dict) else {}
-            if str(candidate_handoff.get("handoff_key") or "") == handoff_key:
-                return candidate
+        existing = await self._find_pending_proposal_by_handoff_key(handoff_key)
+        if existing is not None:
+            return existing
 
         proposal_id = f"sys-prop-{uuid4().hex[:12]}"
         now = datetime.now(UTC).isoformat()
@@ -209,7 +209,17 @@ class GovernanceService:
             "handoff": normalized_handoff,
         }
 
-        saved_proposal = await self.repo.save_proposal(proposal)
+        try:
+            saved_proposal = await self.repo.save_proposal(proposal)
+        except GovernanceConflictError:
+            # Lost the race: a concurrent call already won the partial
+            # UNIQUE index for this handoff_key between our pre-check above
+            # and this insert. Return the winner instead of propagating a
+            # conflict for what the caller intends as an idempotent create.
+            existing = await self._find_pending_proposal_by_handoff_key(handoff_key)
+            if existing is not None:
+                return existing
+            raise
 
         await self.audit_repo.log_event(
             tool_name="sys_governance_proposal",
@@ -225,6 +235,9 @@ class GovernanceService:
         )
 
         return saved_proposal
+
+    async def _find_pending_proposal_by_handoff_key(self, handoff_key: str) -> Optional[dict[str, Any]]:
+        return await self.repo.find_pending_proposal_by_handoff_key(handoff_key)
 
     async def get_proposal(self, proposal_id: str) -> dict[str, Any]:
         """Get proposal or raise GovernanceNotFoundError."""

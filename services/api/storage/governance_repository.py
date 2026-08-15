@@ -63,6 +63,25 @@ def redact_and_bound_payload(data: Any, max_bytes: int = MAX_JSONB_BYTES) -> dic
     return cleaned_dict
 
 
+def _redact_handoff_for_storage(handoff: Any) -> dict[str, Any]:
+    """Like redact_and_bound_payload, but preserves handoff_key verbatim.
+
+    handoff_key is an opaque idempotency identifier (a hash of run_id/
+    step_id/invocation_digest), not a secret -- but _SENSITIVE_KEY_PATTERN's
+    broad substring match on "key" would otherwise redact it to a constant
+    "[REDACTED]" string, silently defeating handoff-key-based dedup (every
+    checkpoint proposal would collide on the placeholder instead of their
+    real key). Mirrors why invocation_digest is stored as its own unredacted
+    column rather than only inside a redacted JSONB blob.
+    """
+    source = handoff if isinstance(handoff, dict) else {}
+    handoff_key = source.get("handoff_key") or None
+    cleaned = redact_and_bound_payload(source)
+    if handoff_key:
+        cleaned["handoff_key"] = handoff_key
+    return cleaned
+
+
 def _row_to_proposal_dict(row: tuple) -> dict[str, Any]:
     """Map a governance_proposals SELECT row (22-column shape used by get_proposal/
     list_proposals) into the proposal dict shape the rest of the codebase expects."""
@@ -139,8 +158,31 @@ class PostgresGovernanceRepository:
                 self._pool.putconn(conn)
 
     async def save_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
-        """Insert a newly created proposal and log initial event."""
+        """Insert a newly created proposal and log initial event.
+
+        Raises GovernanceConflictError if proposal["handoff"]["handoff_key"]
+        collides with an already-pending proposal's handoff_key -- enforced
+        by a real partial UNIQUE index in Postgres (decision='pending',
+        handoff_key IS NOT NULL), an equivalent linear scan in the
+        in-memory/no-pool branch. This closes the check-then-insert race a
+        caller doing idempotent checkpoint creation
+        (GovernanceService.create_checkpoint_proposal) would otherwise have
+        under genuine concurrency: catch this and return the existing
+        proposal instead of treating it as a hard failure.
+        """
+        handoff = proposal.get("handoff") if isinstance(proposal.get("handoff"), dict) else {}
+        handoff_key = handoff.get("handoff_key") or None
+
         if self._pool is None:
+            dict_store = self._get_proposals_dict()
+            if handoff_key:
+                for existing in dict_store.values():
+                    existing_handoff = existing.get("handoff") if isinstance(existing.get("handoff"), dict) else {}
+                    if (
+                        str(existing.get("decision") or "") == "pending"
+                        and str(existing_handoff.get("handoff_key") or "") == handoff_key
+                    ):
+                        raise GovernanceConflictError(f"Duplicate pending handoff_key: {handoff_key}")
             pid = str(proposal["proposal_id"])
             p_copy = dict(proposal)
             p_copy.setdefault("revision", 1)
@@ -163,42 +205,49 @@ class PostgresGovernanceRepository:
 
         def _sync_save(conn):
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO governance_proposals (
-                        proposal_id, revision, decision, state, tool_name, command,
-                        parameters, policy_check, capability, rationale, requested_by,
-                        decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
-                        handoff, transaction, invocation, invocation_digest, max_invocations
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING proposal_id, revision, decision, state, created_at, updated_at;
-                    """,
-                    (
-                        proposal["proposal_id"],
-                        proposal.get("revision", 1),
-                        proposal.get("decision", "pending"),
-                        proposal.get("state", "created"),
-                        proposal.get("tool_name", "sys"),
-                        proposal.get("command", ""),
-                        json.dumps(redact_and_bound_payload(proposal.get("parameters"))),
-                        json.dumps(redact_and_bound_payload(proposal.get("policy_check"))),
-                        proposal.get("capability"),
-                        proposal.get("rationale"),
-                        proposal.get("requested_by"),
-                        proposal.get("decided_by"),
-                        proposal.get("decision_reason"),
-                        proposal.get("decision_at"),
-                        json.dumps(redact_and_bound_payload(proposal.get("traceability"))),
-                        proposal.get("created_at", datetime.now(UTC).isoformat()),
-                        proposal.get("updated_at", datetime.now(UTC).isoformat()),
-                        json.dumps(redact_and_bound_payload(proposal.get("handoff"))),
-                        json.dumps(redact_and_bound_payload(proposal.get("transaction"))),
-                        json.dumps(redact_and_bound_payload(proposal.get("invocation"))),
-                        proposal.get("invocation_digest"),
-                        proposal.get("max_invocations", 1),
-                    ),
-                )
-                
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO governance_proposals (
+                            proposal_id, revision, decision, state, tool_name, command,
+                            parameters, policy_check, capability, rationale, requested_by,
+                            decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                            handoff, transaction, invocation, invocation_digest, max_invocations, handoff_key
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING proposal_id, revision, decision, state, created_at, updated_at;
+                        """,
+                        (
+                            proposal["proposal_id"],
+                            proposal.get("revision", 1),
+                            proposal.get("decision", "pending"),
+                            proposal.get("state", "created"),
+                            proposal.get("tool_name", "sys"),
+                            proposal.get("command", ""),
+                            json.dumps(redact_and_bound_payload(proposal.get("parameters"))),
+                            json.dumps(redact_and_bound_payload(proposal.get("policy_check"))),
+                            proposal.get("capability"),
+                            proposal.get("rationale"),
+                            proposal.get("requested_by"),
+                            proposal.get("decided_by"),
+                            proposal.get("decision_reason"),
+                            proposal.get("decision_at"),
+                            json.dumps(redact_and_bound_payload(proposal.get("traceability"))),
+                            proposal.get("created_at", datetime.now(UTC).isoformat()),
+                            proposal.get("updated_at", datetime.now(UTC).isoformat()),
+                            json.dumps(_redact_handoff_for_storage(proposal.get("handoff"))),
+                            json.dumps(redact_and_bound_payload(proposal.get("transaction"))),
+                            json.dumps(redact_and_bound_payload(proposal.get("invocation"))),
+                            proposal.get("invocation_digest"),
+                            proposal.get("max_invocations", 1),
+                            handoff_key,
+                        ),
+                    )
+                except Exception as exc:
+                    if "uq_governance_proposals_pending_handoff_key" in str(exc) or "unique" in str(exc).lower():
+                        conn.rollback()
+                        raise GovernanceConflictError(f"Duplicate pending handoff_key: {handoff_key}") from exc
+                    raise
+
                 # Insert initial creation event
                 event_id = f"evt-{uuid4().hex[:12]}"
                 cur.execute(
@@ -222,6 +271,38 @@ class PostgresGovernanceRepository:
             return proposal
 
         return await asyncio.to_thread(self._run_in_connection, _sync_save)
+
+    async def find_pending_proposal_by_handoff_key(self, handoff_key: str) -> Optional[dict[str, Any]]:
+        """Look up a pending proposal by its handoff_key via the dedicated
+        (unredacted, indexed) column -- not by scanning the JSONB handoff
+        blob, whose handoff_key copy may be redacted (see
+        _redact_handoff_for_storage)."""
+        if self._pool is None:
+            for existing in self._get_proposals_dict().values():
+                existing_handoff = existing.get("handoff") if isinstance(existing.get("handoff"), dict) else {}
+                if (
+                    str(existing.get("decision") or "") == "pending"
+                    and str(existing_handoff.get("handoff_key") or "") == handoff_key
+                ):
+                    return dict(existing)
+            return None
+
+        def _sync_find(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT proposal_id, revision, decision, state, tool_name, command,
+                           parameters, policy_check, capability, rationale, requested_by,
+                           decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                           handoff, transaction, invocation, invocation_digest, max_invocations
+                    FROM governance_proposals WHERE decision = 'pending' AND handoff_key = %s LIMIT 1;
+                    """,
+                    (handoff_key,),
+                )
+                row = cur.fetchone()
+                return _row_to_proposal_dict(row) if row else None
+
+        return await asyncio.to_thread(self._run_in_connection, _sync_find)
 
     async def get_proposal(self, proposal_id: str) -> Optional[dict[str, Any]]:
         """Fetch a single proposal by ID."""
@@ -518,7 +599,7 @@ class PostgresGovernanceRepository:
         def _sync_update_handoff(conn):
             with conn.cursor() as cur:
                 set_clauses = ["revision = revision + 1", "handoff = %s", "updated_at = %s"]
-                params: list[Any] = [json.dumps(redact_and_bound_payload(handoff)), now]
+                params: list[Any] = [json.dumps(_redact_handoff_for_storage(handoff)), now]
                 if invocation is not None:
                     set_clauses.append("invocation = %s")
                     params.append(json.dumps(redact_and_bound_payload(invocation)))
@@ -1002,10 +1083,17 @@ class PostgresGovernanceRepository:
         """List immutable governance_events rows, optionally filtered to one proposal.
         limit=None means no SQL LIMIT (full scan)."""
         if self._pool is None:
-            events = list(self._in_memory_events)
+            # Reverse append order rather than sorting by the string
+            # created_at field: events from separate claim/complete calls
+            # can end up with an identical (especially on Windows' coarser
+            # wall-clock resolution) timestamp string, and a stable
+            # sort(reverse=True) on ties doesn't reliably reproduce the
+            # semantically-correct newest-first order across calls the way
+            # trusting insertion order does. Mirrors the same fix already
+            # applied to the legacy JSONL event reader.
+            events = list(reversed(self._in_memory_events))
             if proposal_id:
                 events = [e for e in events if e.get("proposal_id") == proposal_id]
-            events.sort(key=lambda e: str(e.get("created_at") or ""), reverse=True)
             return [dict(e) for e in events[:limit]]
 
         def _sync_list_events(conn):

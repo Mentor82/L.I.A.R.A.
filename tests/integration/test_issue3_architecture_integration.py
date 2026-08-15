@@ -911,3 +911,61 @@ async def test_workspace_checkpoint_proposal_decided_purely_from_postgres(tmp_pa
         assert decided.json()["item"]["decision"] == "approved"
 
     assert not legacy_store_path.exists()
+
+
+# -----------------------------------------------------------------------------
+# Test 14: Nephy Follow-up #2 -- Checkpoint-Proposal handoff_key Dedup Is
+# Atomic Under Real Concurrency, Not Just Sequential Retries
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_create_checkpoint_proposal_10_concurrent_same_handoff_key():
+    """10 concurrent create_checkpoint_proposal() calls with the identical
+    handoff_key must produce exactly 1 governance_proposals row -- enforced
+    by migration 004's partial UNIQUE index (decision='pending',
+    handoff_key), not merely a check-then-insert race window. Every caller
+    must get back the same winning proposal_id."""
+    from uuid import uuid4
+
+    from services.api.security import Principal
+    from services.api.services.governance_service import GovernanceService
+    from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
+
+    pool = _get_real_postgres_pool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
+    gov_service = GovernanceService(repo, PostgresSysAuditRepository(pool))
+
+    marker = uuid4().hex[:8]
+    handoff_key = f"handoff-race-{marker}"
+
+    async def _attempt_create(task_index: int) -> dict:
+        return await gov_service.create_checkpoint_proposal(
+            command="mkdir",
+            parameters={"command": "mkdir", "args": ["-p", f"race-{marker}"], "target_path": f"race-{marker}"},
+            principal=Principal(actor_id="workspace_agent", roles=["service"]),
+            capability="workspace_mkdir",
+            rationale=f"concurrent checkpoint attempt {task_index}",
+            traceability={"request_id": f"req-race-{marker}-{task_index}", "run_id": f"run-race-{marker}"},
+            handoff={"state": "awaiting_decision", "step_id": "mkdir", "handoff_key": handoff_key},
+        )
+
+    results = await asyncio.gather(*(_attempt_create(i) for i in range(10)))
+
+    proposal_ids = {result["proposal_id"] for result in results}
+    assert len(proposal_ids) == 1, f"expected exactly 1 distinct proposal_id, got {proposal_ids}"
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM governance_proposals WHERE handoff_key = %s;",
+                (handoff_key,),
+            )
+            assert cur.fetchone()[0] == 1
+    finally:
+        pool.putconn(conn)
+
+    # The stored handoff_key must be the real value, not redacted -- proves
+    # _redact_handoff_for_storage() correctly exempts it from the generic
+    # "key"-substring redaction pattern.
+    winning_proposal = await repo.get_proposal(proposal_ids.pop())
+    assert winning_proposal["handoff"]["handoff_key"] == handoff_key
