@@ -33,8 +33,9 @@ from services.contracts import (
     ValidatorStatusRequest,
     ValidatorSubmitRequest,
 )
+from services.api.security import Principal
 from services.config import Settings
-from services.tools.governance import create_pending_sys_governance_proposal, sys_governance_invocation_digest
+from services.tools.governance import sys_governance_invocation_digest
 
 
 _DEFAULT_ROOT = "/home/liara/workspace"
@@ -359,10 +360,15 @@ class WorkspaceRunResult(BaseModel):
 class WorkspaceAgent:
     """Generate and execute one bounded workspace plan, sequentially."""
 
-    def __init__(self, *, inference_invoker: Any, tool_coordinator: Any, memory_service: Any):
+    def __init__(self, *, inference_invoker: Any, tool_coordinator: Any, memory_service: Any, governance_service: Any = None):
         self.inference_invoker = inference_invoker
         self.tool_coordinator = tool_coordinator
         self.memory_service = memory_service
+        # Late-bound by create_api_app() once GovernanceService exists (same
+        # pattern as sys_audit.configure_sys_audit_repository()), since the
+        # orchestrator/WorkspaceAgent is constructed before the API app's
+        # Postgres-backed governance wiring is available.
+        self.governance_service = governance_service
         self.workspace_root = os.getenv("LIARA_AGENT_WORKSPACE_ROOT", _DEFAULT_ROOT).rstrip("/")
         self.validator_timeout = float(os.getenv("LIARA_AGENT_VALIDATOR_TIMEOUT_SECONDS", "180"))
         self.sys_max_attempts = max(1, min(3, int(os.getenv("LIARA_AGENT_SYS_MAX_ATTEMPTS", "2"))))
@@ -382,14 +388,18 @@ class WorkspaceAgent:
         classification: dict[str, Any],
         checkpoint: dict[str, Any] | None = None,
     ) -> WorkspaceStepResult:
+        if self.governance_service is None:
+            raise RuntimeError(
+                "WorkspaceAgent.governance_service is not configured -- checkpoint proposals "
+                "require the Postgres-backed GovernanceService (wired by create_api_app())."
+            )
         command = str(params.get("command") or "")
-        proposal = await asyncio.to_thread(
-            create_pending_sys_governance_proposal,
+        proposal = await self.governance_service.create_checkpoint_proposal(
             command=command,
             parameters=params,
+            principal=Principal(actor_id="workspace_agent", roles=["service"]),
             capability=f"workspace_{step.kind.value}",
             rationale=step.reason or f"Workspace step '{step.id}' requires governance approval",
-            requested_by="workspace_agent",
             traceability={
                 "request_id": trace.get("request_id"),
                 "run_id": trace.get("run_id"),

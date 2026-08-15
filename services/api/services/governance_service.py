@@ -21,6 +21,7 @@ from services.api.security import Principal
 from services.api.storage.governance_repository import PostgresGovernanceRepository
 from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
 from services.tools.governance import (
+    classify_sys_governance,
     sys_governance_invocation_digest,
     sys_governance_mode,
 )
@@ -134,6 +135,97 @@ class GovernanceService:
 
         return saved_proposal
 
+    async def create_checkpoint_proposal(
+        self,
+        *,
+        command: str,
+        parameters: dict[str, Any],
+        principal: Principal,
+        capability: str,
+        rationale: str,
+        traceability: dict[str, Any],
+        handoff: Optional[dict[str, Any]] = None,
+        max_invocations: int = 1,
+    ) -> dict[str, Any]:
+        """Create a proposal that starts directly in an "awaiting_decision"
+        handoff state, e.g. a workspace-agent step checkpoint -- as opposed
+        to create_proposal's plain HTTP-submitted flow, which never sets
+        handoff at creation time.
+
+        Idempotent on handoff.handoff_key: a second call with the same key
+        while a matching proposal is still pending returns that existing
+        proposal instead of creating a duplicate. This mirrors (but doesn't
+        improve on) the pre-migration file-based
+        create_pending_sys_governance_proposal's dedup guard -- like that
+        guard, the check-then-create is not atomic against a truly
+        concurrent duplicate call; unlike claim_operation's row-locked CAS,
+        proposal creation has no natural row to lock before it exists.
+        """
+        classification = classify_sys_governance(parameters)
+        invocation_digest = sys_governance_invocation_digest(command, parameters)
+        normalized_handoff = dict(handoff or {})
+        handoff_key = str(normalized_handoff.get("handoff_key") or "").strip()
+        if not handoff_key:
+            handoff_key = ":".join((
+                str(traceability.get("run_id") or traceability.get("request_id") or "unknown"),
+                str(normalized_handoff.get("step_id") or "unknown"),
+                invocation_digest,
+            ))
+        normalized_handoff["handoff_key"] = handoff_key
+
+        pending = await self.repo.list_proposals(decision="pending", limit=None)
+        for candidate in pending:
+            candidate_handoff = candidate.get("handoff") if isinstance(candidate.get("handoff"), dict) else {}
+            if str(candidate_handoff.get("handoff_key") or "") == handoff_key:
+                return candidate
+
+        proposal_id = f"sys-prop-{uuid4().hex[:12]}"
+        now = datetime.now(UTC).isoformat()
+        policy_check = {
+            "allowed": True,
+            "risk_level": classification["risk_level"],
+            "reasons": list(classification["reasons"]),
+        }
+        proposal = {
+            "proposal_id": proposal_id,
+            "revision": 1,
+            "decision": "pending",
+            "state": "created",
+            "tool_name": "sys",
+            "command": str(command),
+            "parameters": {k: v for k, v in dict(parameters).items() if k != "_governance_authorized"},
+            "invocation_digest": invocation_digest,
+            "max_invocations": max(1, min(int(max_invocations), 10)),
+            "invocation": {"state": "not_invoked", "attempt_count": 0, "success_count": 0},
+            "capability": capability,
+            "rationale": rationale,
+            "requested_by": principal.actor_id,
+            "policy_check": policy_check,
+            "decision_reason": None,
+            "decided_by": None,
+            "created_at": now,
+            "updated_at": now,
+            "traceability": dict(traceability),
+            "handoff": normalized_handoff,
+        }
+
+        saved_proposal = await self.repo.save_proposal(proposal)
+
+        await self.audit_repo.log_event(
+            tool_name="sys_governance_proposal",
+            lifecycle_stage="started",
+            outcome="allow",
+            proposal_id=proposal_id,
+            request_id=traceability.get("request_id"),
+            session_id=traceability.get("session_id"),
+            run_id=traceability.get("run_id"),
+            actor_id=principal.actor_id,
+            context=str(traceability.get("context") or "workspace_agent.governance_handoff"),
+            metadata={"command": command, "policy_check": policy_check},
+        )
+
+        return saved_proposal
+
     async def get_proposal(self, proposal_id: str) -> dict[str, Any]:
         """Get proposal or raise GovernanceNotFoundError."""
         proposal = await self.repo.get_proposal(proposal_id)
@@ -141,7 +233,7 @@ class GovernanceService:
             raise GovernanceNotFoundError(f"Unknown proposal ID: {proposal_id}")
         return proposal
 
-    async def list_proposals(self, decision: str = "all", limit: int = 50) -> dict[str, Any]:
+    async def list_proposals(self, decision: str = "all", limit: Optional[int] = 50) -> dict[str, Any]:
         """List proposals with summary metrics."""
         items = await self.repo.list_proposals(decision=decision, limit=limit)
         decision_counts = {"pending": 0, "approved": 0, "rejected": 0}
@@ -345,7 +437,7 @@ class GovernanceService:
         """Fetch the most recent claimed operation of a given type for a proposal."""
         return await self.repo.get_latest_operation(proposal_id, operation_type)
 
-    async def list_events(self, proposal_id: Optional[str] = None, limit: int = 100) -> List[dict[str, Any]]:
+    async def list_events(self, proposal_id: Optional[str] = None, limit: Optional[int] = 100) -> List[dict[str, Any]]:
         """List immutable governance_events rows, optionally filtered to one proposal."""
         return await self.repo.list_events(proposal_id=proposal_id, limit=limit)
 
@@ -410,7 +502,13 @@ class GovernanceService:
             "last_actor_id": principal.actor_id,
         }
         return await self.repo.update_handoff(
-            proposal_id, proposal["revision"], dict(proposal.get("handoff") or {}), invocation=new_invocation,
+            proposal_id,
+            proposal["revision"],
+            dict(proposal.get("handoff") or {}),
+            invocation=new_invocation,
+            event_type="invocation_attempted",
+            actor_id=principal.actor_id,
+            event_details={"request_id": request_id, "run_id": run_id},
         )
 
     async def complete_invocation(
@@ -421,6 +519,7 @@ class GovernanceService:
         status: Optional[str] = None,
         error: Optional[str] = None,
         execution_ms: Optional[float] = None,
+        actor_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Finalize a claimed invocation attempt as completed or failed.
 
@@ -441,5 +540,11 @@ class GovernanceService:
             "last_execution_ms": execution_ms,
         }
         return await self.repo.update_handoff(
-            proposal_id, expected_revision, dict(proposal.get("handoff") or {}), invocation=new_invocation,
+            proposal_id,
+            expected_revision,
+            dict(proposal.get("handoff") or {}),
+            invocation=new_invocation,
+            event_type="invocation_completed" if success else "invocation_failed",
+            actor_id=actor_id,
+            event_details={"status": status, "error": error},
         )

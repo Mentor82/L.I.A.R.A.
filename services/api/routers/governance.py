@@ -290,10 +290,18 @@ async def list_sys_governance_proposals(
     decision: str = Query(default="all"),
     limit: int = Query(default=50, ge=1, le=500),
     principal: Principal = Depends(get_verified_principal),
+    service: Any = Depends(get_governance_service),
 ) -> dict[str, Any]:
+    """List governance proposals from PostgreSQL (the authoritative store).
+
+    Fetches the full unfiltered/unlimited set via GovernanceService.list_proposals
+    (decision="all", limit=None) as the aggregation base -- summary stats below
+    are computed across every proposal regardless of the decision/limit query
+    params, which only narrow the returned `items` page, matching the
+    pre-migration file-backed behavior exactly.
+    """
     response.headers["Cache-Control"] = "no-store"
-    app_state = request.app.state
-    all_items = list(_sync_sys_governance_store(app_state).values())
+    all_items = (await service.list_proposals(decision="all", limit=None))["items"]
     decision_counts = {"pending": 0, "approved": 0, "rejected": 0}
     invocation_states: dict[str, int] = {}
     policy_blocked = 0
@@ -342,27 +350,19 @@ async def list_sys_governance_events(
     proposal_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     principal: Principal = Depends(get_verified_principal),
+    service: Any = Depends(get_governance_service),
 ) -> dict[str, Any]:
-    """List governance events from the legacy JSONL file.
+    """List governance events from PostgreSQL (the authoritative store).
 
-    Stays file-backed for now: invoke_tool()'s own invocation lifecycle events
-    (Phase 4 territory) and the compensating rollback proposal (see
-    act_on_sys_governance_proposal's docstring) are still JSONL-only, so
-    switching this read endpoint to the Postgres-backed governance_events table
-    before those producers migrate would silently hide their events. Apply/
-    rollback below dual-write into both stores for this reason.
+    claim_operation/complete_operation (apply/rollback/create/decide) and
+    update_handoff (invocation claim/complete) all insert a governance_events
+    row in the same transaction as their state change, so this now covers
+    every producer -- including invoke_tool()'s invocation lifecycle and any
+    compensating rollback proposal, which previously only existed in the
+    legacy JSONL file this endpoint read from.
     """
     response.headers["Cache-Control"] = "no-store"
-    app_state = request.app.state
-    events = _load_sys_governance_events(_sys_governance_events_path(app_state), proposal_id=proposal_id)
-    # Reverse the already-chronological append order rather than sorting by
-    # the string timestamp field: two events appended in quick succession
-    # (e.g. an "attempted" event immediately followed by a "completed" one)
-    # can end up with an identical timestamp string at low clock resolution,
-    # and a stable sort(reverse=True) preserves original order *within* a tie
-    # -- which silently un-reverses that pair relative to the rest of the
-    # (correctly newest-first) list. File append order has no such ambiguity.
-    events.reverse()
+    events = await service.list_events(proposal_id=proposal_id, limit=None)
     return {
         "status": "success",
         "count": min(len(events), limit),

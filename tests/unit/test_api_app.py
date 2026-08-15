@@ -35,6 +35,7 @@ from services.memory_adapter import InProcessMemoryAdapter
 from services.config import Settings
 from services.tools.governance import create_pending_sys_governance_proposal
 from services.api.app import _cors_allowed_origins
+from services.api.security import Principal
 from services.inference.tts_adapter import TtsAdapterError
 
 
@@ -2005,12 +2006,15 @@ async def test_sys_governance_api_syncs_workspace_agent_handoff(monkeypatch, tmp
     monkeypatch.setenv("LIARA_SYS_GOVERNANCE_EVENTS_PATH", str(tmp_path / "sys_governance_handoff.jsonl"))
     app = create_api_app(orchestrator=FakeOrchestrator(), memory_adapter=adapter)
 
-    proposal = create_pending_sys_governance_proposal(
+    # Simulates what WorkspaceAgent._governance_handoff() does in production:
+    # create the checkpoint proposal via GovernanceService, not the legacy
+    # file-based create_pending_sys_governance_proposal().
+    proposal = await app.state.governance_service.create_checkpoint_proposal(
         command="tee",
         parameters={"command": "tee", "args": ["demo.txt"], "stdin_text": "ok\n"},
+        principal=Principal(actor_id="workspace_agent", roles=["service"]),
         capability="workspace_write",
         rationale="test automatic handoff",
-        requested_by="workspace_agent",
         traceability={"request_id": "req-auto", "run_id": "run-auto", "source": "workspace_agent"},
         handoff={"state": "awaiting_decision", "step_id": "write"},
     )

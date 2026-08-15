@@ -129,7 +129,11 @@ class PostgresGovernanceRepository:
                 conn.rollback()
             if isinstance(exc, GovernanceError):
                 raise
-            raise GovernanceError(f"Database governance query failed: {exc}") from exc
+            # Never surface raw DB/driver exception text (may contain SQL,
+            # table/column names, connection details) in the public
+            # GovernanceError message -- log the real cause server-side only.
+            logger.error("Database governance query failed", exc_info=exc)
+            raise GovernanceError("Database governance operation failed") from exc
         finally:
             if conn is not None:
                 self._pool.putconn(conn)
@@ -252,8 +256,9 @@ class PostgresGovernanceRepository:
 
         return await asyncio.to_thread(self._run_in_connection, _sync_get)
 
-    async def list_proposals(self, decision: str = "all", limit: int = 50) -> List[dict[str, Any]]:
-        """List proposals with filtering."""
+    async def list_proposals(self, decision: str = "all", limit: Optional[int] = 50) -> List[dict[str, Any]]:
+        """List proposals with filtering. limit=None means no SQL LIMIT (full scan),
+        used by callers that need accurate aggregate stats across all proposals."""
         if self._pool is None:
             items = list(self._get_proposals_dict().values())
             if decision != "all":
@@ -263,29 +268,22 @@ class PostgresGovernanceRepository:
 
         def _sync_list(conn):
             with conn.cursor() as cur:
-                if decision != "all":
-                    cur.execute(
-                        """
-                        SELECT proposal_id, revision, decision, state, tool_name, command,
-                               parameters, policy_check, capability, rationale, requested_by,
-                               decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
-                               handoff, transaction, invocation, invocation_digest, max_invocations
-                        FROM governance_proposals WHERE decision = %s
-                        ORDER BY created_at DESC LIMIT %s;
-                        """,
-                        (decision, limit),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT proposal_id, revision, decision, state, tool_name, command,
-                               parameters, policy_check, capability, rationale, requested_by,
-                               decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
-                               handoff, transaction, invocation, invocation_digest, max_invocations
-                        FROM governance_proposals ORDER BY created_at DESC LIMIT %s;
-                        """,
-                        (limit,),
-                    )
+                where_clause = "WHERE decision = %s" if decision != "all" else ""
+                limit_clause = "LIMIT %s" if limit is not None else ""
+                params: list[Any] = [decision] if decision != "all" else []
+                if limit is not None:
+                    params.append(limit)
+                cur.execute(
+                    f"""
+                    SELECT proposal_id, revision, decision, state, tool_name, command,
+                           parameters, policy_check, capability, rationale, requested_by,
+                           decided_by, decision_reason, decision_at, traceability, created_at, updated_at,
+                           handoff, transaction, invocation, invocation_digest, max_invocations
+                    FROM governance_proposals {where_clause}
+                    ORDER BY created_at DESC {limit_clause};
+                    """,
+                    tuple(params),
+                )
                 rows = cur.fetchall()
                 return [_row_to_proposal_dict(row) for row in rows]
 
@@ -457,6 +455,9 @@ class PostgresGovernanceRepository:
         expected_revision: int,
         handoff: dict[str, Any],
         invocation: Optional[dict[str, Any]] = None,
+        event_type: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        event_details: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """CAS-guarded update of the handoff column (and optionally invocation),
         keyed on revision alone.
@@ -467,6 +468,13 @@ class PostgresGovernanceRepository:
         decision CAS: callers must pass the *fresh* revision returned by that
         decision CAS (execute_atomic_cas_decision's return value), not the
         pre-decision revision, since the decision CAS already bumped it once.
+
+        event_type, when given, also inserts a governance_events row in the
+        SAME transaction as the CAS update -- callers that don't need an
+        audit-trail entry for this particular handoff transition (e.g. the
+        raw passthrough used for workspace-agent resume-result persistence,
+        which follows a decision CAS that already logged its own event) can
+        omit it and no event row is written, preserving prior behavior.
         """
         now = datetime.now(UTC).isoformat()
 
@@ -493,6 +501,18 @@ class PostgresGovernanceRepository:
             prop["updated_at"] = now
             p_path = Path(self._app_state.sys_tool_proposals_path) if self._app_state and getattr(self._app_state, "sys_tool_proposals_path", None) else sys_governance_store_path()
             persist_sys_governance_proposals(dict_store, p_path)
+            if event_type:
+                self._in_memory_events.append({
+                    "event_id": f"evt-{uuid4().hex[:12]}",
+                    "proposal_id": proposal_id,
+                    "proposal_revision": prop["revision"],
+                    "event_type": event_type,
+                    "decision": prop.get("decision"),
+                    "state": prop.get("state"),
+                    "actor_id": actor_id,
+                    "traceability": event_details or {},
+                    "created_at": now,
+                })
             return dict(prop)
 
         def _sync_update_handoff(conn):
@@ -521,6 +541,26 @@ class PostgresGovernanceRepository:
                     raise GovernanceConflictError(
                         f"update_handoff CAS failed for proposal {proposal_id}: "
                         f"expected revision={expected_revision}, actual revision={existing[0]}"
+                    )
+                if event_type:
+                    cur.execute(
+                        """
+                        INSERT INTO governance_events (
+                            event_id, proposal_id, operation_id, proposal_revision, event_type, decision, state, actor_id, traceability, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """,
+                        (
+                            f"evt-{uuid4().hex[:12]}",
+                            proposal_id,
+                            None,
+                            row[1],
+                            event_type,
+                            row[2],
+                            row[3],
+                            actor_id,
+                            json.dumps(redact_and_bound_payload(event_details or {})),
+                            now,
+                        ),
                     )
                 return {
                     "proposal_id": row[0],
@@ -611,7 +651,7 @@ class PostgresGovernanceRepository:
                 "proposal_id": proposal_id,
                 "operation_id": operation_id,
                 "proposal_revision": prop["revision"],
-                "event_type": "operation_started",
+                "event_type": f"governance_{operation_type}_attempted",
                 "decision": prop.get("decision", "approved"),
                 "state": target_state,
                 "actor_id": actor_id,
@@ -765,7 +805,7 @@ class PostgresGovernanceRepository:
                         proposal_id,
                         operation_id,
                         new_rev,
-                        "operation_started",
+                        f"governance_{operation_type}_attempted",
                         dec,
                         target_state,
                         actor_id,
@@ -822,12 +862,13 @@ class PostgresGovernanceRepository:
             prop["state"] = final_proposal_state
             prop["updated_at"] = now
 
+            op_type = existing_op.get("operation_type", "operation")
             self._in_memory_events.append({
                 "event_id": f"evt-{uuid4().hex[:12]}",
                 "proposal_id": proposal_id,
                 "operation_id": operation_id,
                 "proposal_revision": prop["revision"],
-                "event_type": "operation_completed" if final_op_state == "completed" else "operation_failed",
+                "event_type": f"governance_{op_type}_completed" if final_op_state == "completed" else f"governance_{op_type}_failed",
                 "decision": prop.get("decision", "approved"),
                 "state": final_proposal_state,
                 "actor_id": actor_id,
@@ -880,10 +921,11 @@ class PostgresGovernanceRepository:
 
                 new_rev = row[0]
                 dec = row[1]
+                op_type = op_row[2] or "operation"
 
                 # Insert terminal governance event
                 event_id = f"evt-{uuid4().hex[:12]}"
-                event_type = "operation_completed" if final_op_state == "completed" else "operation_failed"
+                event_type = f"governance_{op_type}_completed" if final_op_state == "completed" else f"governance_{op_type}_failed"
                 cur.execute(
                     """
                     INSERT INTO governance_events (
@@ -956,8 +998,9 @@ class PostgresGovernanceRepository:
 
         return await asyncio.to_thread(self._run_in_connection, _sync_get_latest)
 
-    async def list_events(self, proposal_id: Optional[str] = None, limit: int = 100) -> List[dict[str, Any]]:
-        """List immutable governance_events rows, optionally filtered to one proposal."""
+    async def list_events(self, proposal_id: Optional[str] = None, limit: Optional[int] = 100) -> List[dict[str, Any]]:
+        """List immutable governance_events rows, optionally filtered to one proposal.
+        limit=None means no SQL LIMIT (full scan)."""
         if self._pool is None:
             events = list(self._in_memory_events)
             if proposal_id:
@@ -967,25 +1010,20 @@ class PostgresGovernanceRepository:
 
         def _sync_list_events(conn):
             with conn.cursor() as cur:
-                if proposal_id:
-                    cur.execute(
-                        """
-                        SELECT event_id, proposal_id, operation_id, proposal_revision, event_type,
-                               decision, state, actor_id, traceability, created_at
-                        FROM governance_events WHERE proposal_id = %s
-                        ORDER BY created_at DESC LIMIT %s;
-                        """,
-                        (proposal_id, limit),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT event_id, proposal_id, operation_id, proposal_revision, event_type,
-                               decision, state, actor_id, traceability, created_at
-                        FROM governance_events ORDER BY created_at DESC LIMIT %s;
-                        """,
-                        (limit,),
-                    )
+                where_clause = "WHERE proposal_id = %s" if proposal_id else ""
+                limit_clause = "LIMIT %s" if limit is not None else ""
+                params: list[Any] = [proposal_id] if proposal_id else []
+                if limit is not None:
+                    params.append(limit)
+                cur.execute(
+                    f"""
+                    SELECT event_id, proposal_id, operation_id, proposal_revision, event_type,
+                           decision, state, actor_id, traceability, created_at
+                    FROM governance_events {where_clause}
+                    ORDER BY created_at DESC {limit_clause};
+                    """,
+                    tuple(params),
+                )
                 rows = cur.fetchall()
                 return [
                     {

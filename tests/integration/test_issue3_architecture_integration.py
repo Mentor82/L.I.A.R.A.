@@ -548,7 +548,10 @@ async def test_pg_cas_transaction_rollback_on_failure():
             decision_reason="test atomic rollback",
         )
     
-    assert "Database governance query failed" in str(exc_info.value)
+    # Public message must be stable/generic -- the raw driver exception text
+    # ("DB Disk Full / Constraint Failure") must never leak into it.
+    assert "Database governance operation failed" in str(exc_info.value)
+    assert "DB Disk Full" not in str(exc_info.value)
     # Verify connection rollback was called to ensure atomic transaction abort
     assert mock_conn.rollback.called
 
@@ -627,9 +630,16 @@ async def test_forbidden_principal_403_enforcement():
 async def test_production_no_legacy_file_read_fallback(monkeypatch):
     """Verify production mode strictly disables reading legacy file storage as fallback."""
     monkeypatch.setenv("LIARA_ENV", "production")
-    
+
+    import frontend.admin_tui.data_layer as data_layer_module
     from frontend.admin_tui.data_layer import AdminDataLayer
-    
+
+    # Force the HTTP-first attempt to fail so this deterministically exercises
+    # the "API unreachable" case, regardless of whether a real API happens to
+    # be running at the default LIARA_API_BASE_URL on the machine running the
+    # test (same gap as test_admin_tui_models.py::test_load_audit_events_reads_sys_audit_log).
+    monkeypatch.setattr(data_layer_module, "HTTPX_AVAILABLE", False)
+
     data_layer = AdminDataLayer()
     # When API is unavailable in production, fallback must NOT return stale file audit entries
     events = data_layer.load_audit_events()
@@ -819,3 +829,85 @@ async def test_forged_acted_by_does_not_impersonate(monkeypatch):
     assert latest_op is not None
     assert latest_op["actor_id"] == "genuine.verified.actor"
     assert latest_op["actor_id"] != "forged.impersonated.actor"
+
+
+# -----------------------------------------------------------------------------
+# Test 13: Nephy Follow-up -- Workspace-Agent Checkpoint Decided Purely From
+# PostgreSQL, No JSON Store Involved
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_workspace_checkpoint_proposal_decided_purely_from_postgres(tmp_path, monkeypatch):
+    """WorkspaceAgent creates a checkpoint proposal via GovernanceService
+    (not the legacy file-based create_pending_sys_governance_proposal), and
+    the API lists + decides it using only PostgreSQL -- the legacy JSON
+    store path is pointed at a file that must never be created."""
+    from uuid import uuid4
+
+    from services.api.security import Principal
+    from services.api.services.governance_service import GovernanceService
+    from services.orchestrator.workspace_agent import WorkspaceAgent, WorkspaceStep, WorkspaceStepKind
+    from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
+
+    # Legacy file store path: pointed at a tmp file that this test asserts
+    # was never created, proving no producer or reader touched it.
+    legacy_store_path = tmp_path / "sys_governance_should_not_exist.json"
+    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_STORE_PATH", str(legacy_store_path))
+    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_EVENTS_PATH", str(tmp_path / "sys_governance_should_not_exist.jsonl"))
+
+    pool = _get_real_postgres_pool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
+    gov_service = GovernanceService(repo, PostgresSysAuditRepository(pool))
+
+    workspace_agent = WorkspaceAgent(
+        inference_invoker=None,
+        tool_coordinator=None,
+        memory_service=None,
+        governance_service=gov_service,
+    )
+
+    marker = uuid4().hex[:8]
+    step = WorkspaceStep(id="mkdir", kind=WorkspaceStepKind.MKDIR, path=f"checkpoint-{marker}")
+    step_result = await workspace_agent._governance_handoff(
+        step=step,
+        params={"command": "mkdir", "args": ["-p", f"checkpoint-{marker}"], "target_path": f"checkpoint-{marker}"},
+        trace={"request_id": f"req-{marker}", "run_id": f"run-{marker}", "session_id": f"session-{marker}"},
+        classification={"risk_level": "medium", "reasons": ["mutation_requires_review"]},
+        # Deliberately no checkpoint payload: this test verifies the plain
+        # create->list->decide round-trip is purely Postgres-backed. The
+        # checkpoint-present resume_from_governance_proposal() path is
+        # already covered by test_workspace_handoff_approval_invokes_once_and_resumes
+        # in tests/unit/test_workspace_agent.py.
+        checkpoint=None,
+    )
+    proposal_id = step_result.evidence["proposal_id"]
+
+    assert not legacy_store_path.exists()
+
+    adapter = _make_in_process_adapter()
+    orch = _FakeOrchestrator()
+    orch.workspace_agent = workspace_agent
+    app = create_api_app(orchestrator=orch, memory_adapter=adapter)
+    app.state.governance_repository = repo
+    app.state.governance_service = gov_service
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        listed = await client.get("/tools/sys/governance/proposals", params={"decision": "pending"})
+        assert listed.status_code == 200
+        item = next(value for value in listed.json()["items"] if value["proposal_id"] == proposal_id)
+        assert item["handoff"]["state"] == "awaiting_decision"
+        assert item["handoff"]["step_id"] == "mkdir"
+
+        decided = await client.post(
+            "/tools/sys/governance/decisions",
+            json={
+                "proposal_id": proposal_id,
+                "decision": "approved",
+                "decided_by": "test.runner",
+                "decision_reason": "approve checkpoint decided purely from Postgres",
+            },
+        )
+        assert decided.status_code == 200
+        assert decided.json()["item"]["decision"] == "approved"
+
+    assert not legacy_store_path.exists()

@@ -211,6 +211,12 @@ def create_api_app(
     # chat.py's log_blocked/log_executed/log_judge_pre_action/log_started calls
     # write to Postgres from here on instead of sys_audit.jsonl.
     configure_sys_audit_repository(audit_repo)
+    # Late-bind GovernanceService into WorkspaceAgent: it's constructed
+    # inside Orchestrator.__init__, before this Postgres-backed service
+    # exists, so it starts with governance_service=None and gets wired here.
+    workspace_agent = getattr(orch, "workspace_agent", None)
+    if workspace_agent is not None:
+        workspace_agent.governance_service = gov_service
 
     # Mount subrouters
     app.include_router(system_router)

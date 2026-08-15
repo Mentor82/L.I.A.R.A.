@@ -239,7 +239,7 @@ async def invoke_tool(
             try:
                 await service.complete_invocation(
                     str(governance_proposal["proposal_id"]), claimed_revision,
-                    success=False, error=str(exc),
+                    success=False, error=str(exc), actor_id=principal.actor_id,
                 )
                 append_sys_governance_event(
                     {
@@ -262,6 +262,7 @@ async def invoke_tool(
                 str(governance_proposal["proposal_id"]), claimed_revision,
                 success=succeeded, status=result.status,
                 error=result.error, execution_ms=result.execution_ms,
+                actor_id=principal.actor_id,
             )
             append_sys_governance_event(
                 {

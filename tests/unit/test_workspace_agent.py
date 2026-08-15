@@ -24,6 +24,9 @@ from services.orchestrator.workspace_agent import (
     is_workspace_run_followup,
 )
 from services.orchestrator.orchestrator import Orchestrator
+from services.api.services.governance_service import GovernanceService
+from services.api.storage.governance_repository import PostgresGovernanceRepository
+from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
 
 
 class FakeInference:
@@ -201,6 +204,14 @@ def _plan():
             },
         ],
     }
+
+
+def _make_governance_service() -> GovernanceService:
+    """In-memory (no real Postgres pool) GovernanceService for tests that
+    exercise WorkspaceAgent's checkpoint-proposal creation path."""
+    repo = PostgresGovernanceRepository(None, in_memory_store={}, app_state=None)
+    audit_repo = PostgresSysAuditRepository(None)
+    return GovernanceService(repo, audit_repo)
 
 
 def test_complex_workspace_detection_is_narrow():
@@ -414,16 +425,14 @@ async def test_transient_mutation_timeout_is_retried_once_and_recorded():
 
 
 @pytest.mark.asyncio
-async def test_governance_block_creates_idempotent_pending_handoff(monkeypatch, tmp_path):
-    store_path = tmp_path / "sys_governance_workspace.json"
-    events_path = tmp_path / "sys_governance_workspace.jsonl"
-    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_STORE_PATH", str(store_path))
-    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_EVENTS_PATH", str(events_path))
+async def test_governance_block_creates_idempotent_pending_handoff():
+    governance_service = _make_governance_service()
     tools = GovernanceBlockedTools()
     agent = WorkspaceAgent(
         inference_invoker=FakeInference(_plan()),
         tool_coordinator=tools,
         memory_service=FakeMemory(),
+        governance_service=governance_service,
     )
 
     result = await agent.run("build it", request_id="req-gov", run_id="run-gov", session_id="session-gov")
@@ -433,8 +442,7 @@ async def test_governance_block_creates_idempotent_pending_handoff(monkeypatch, 
     step_result = result.steps[0]
     assert step_result.status == "awaiting_decision"
     proposal_id = step_result.evidence["proposal_id"]
-    proposals = json.loads(store_path.read_text(encoding="utf-8"))
-    proposal = proposals[proposal_id]
+    proposal = await governance_service.get_proposal(proposal_id)
     assert proposal["decision"] == "pending"
     assert proposal["command"] == "mkdir"
     assert proposal["parameters"] == tools.requests[0].parameters
@@ -451,20 +459,20 @@ async def test_governance_block_creates_idempotent_pending_handoff(monkeypatch, 
         {"request_id": "req-gov", "run_id": "run-gov", "session_id": "session-gov"},
     )
     assert repeated.evidence["proposal_id"] == proposal_id
-    assert len(json.loads(store_path.read_text(encoding="utf-8"))) == 1
-    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    all_proposals = await governance_service.repo.list_proposals(decision="all", limit=None)
+    assert len(all_proposals) == 1
+    events = await governance_service.list_events(proposal_id=proposal_id, limit=None)
     assert [event["event_type"] for event in events] == ["proposal_created"]
 
 
 @pytest.mark.asyncio
-async def test_approved_governance_checkpoint_resumes_without_replaying_blocked_step(monkeypatch, tmp_path):
-    store_path = tmp_path / "sys_governance_resume.json"
-    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_STORE_PATH", str(store_path))
-    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_EVENTS_PATH", str(tmp_path / "sys_governance_resume.jsonl"))
+async def test_approved_governance_checkpoint_resumes_without_replaying_blocked_step():
+    governance_service = _make_governance_service()
     agent = WorkspaceAgent(
         inference_invoker=FakeInference(_plan()),
         tool_coordinator=GovernanceBlockedTools(),
         memory_service=FakeMemory(),
+        governance_service=governance_service,
     )
     waiting = await agent.run(
         "build it",
@@ -473,7 +481,7 @@ async def test_approved_governance_checkpoint_resumes_without_replaying_blocked_
         session_id="session-resume",
     )
     proposal_id = waiting.steps[0].evidence["proposal_id"]
-    proposal = json.loads(store_path.read_text(encoding="utf-8"))[proposal_id]
+    proposal = await governance_service.get_proposal(proposal_id)
     proposal["decision"] = "approved"
     continuation_tools = FakeTools()
     agent.tool_coordinator = continuation_tools
@@ -497,17 +505,16 @@ async def test_approved_governance_checkpoint_resumes_without_replaying_blocked_
 
 
 @pytest.mark.asyncio
-async def test_governance_resume_rejects_rejected_or_tampered_checkpoint(monkeypatch, tmp_path):
-    store_path = tmp_path / "sys_governance_reject.json"
-    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_STORE_PATH", str(store_path))
-    monkeypatch.setenv("LIARA_SYS_GOVERNANCE_EVENTS_PATH", str(tmp_path / "sys_governance_reject.jsonl"))
+async def test_governance_resume_rejects_rejected_or_tampered_checkpoint():
+    governance_service = _make_governance_service()
     agent = WorkspaceAgent(
         inference_invoker=FakeInference(_plan()),
         tool_coordinator=GovernanceBlockedTools(),
         memory_service=FakeMemory(),
+        governance_service=governance_service,
     )
     waiting = await agent.run("build it", request_id="req-reject", run_id="run-reject", session_id="session-reject")
-    proposal = json.loads(store_path.read_text(encoding="utf-8"))[waiting.steps[0].evidence["proposal_id"]]
+    proposal = await governance_service.get_proposal(waiting.steps[0].evidence["proposal_id"])
     approved_execution = ToolExecutionResult(
         tool_name="sys",
         status="success",
