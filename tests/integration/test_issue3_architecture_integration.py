@@ -969,3 +969,123 @@ async def test_create_checkpoint_proposal_10_concurrent_same_handoff_key():
     # "key"-substring redaction pattern.
     winning_proposal = await repo.get_proposal(proposal_ids.pop())
     assert winning_proposal["handoff"]["handoff_key"] == handoff_key
+
+
+class _AlwaysFailingAuditRepo:
+    """Simulates a durable sys-audit outage: every log_event() call raises,
+    regardless of fail_closed -- used to verify GovernanceService's
+    pre-mutation audit call actually gates the mutation, not just logs
+    around it."""
+
+    async def log_event(self, *args, **kwargs):
+        from services.api.exceptions import AuditPersistenceError
+        raise AuditPersistenceError("simulated durable audit outage")
+
+
+# -----------------------------------------------------------------------------
+# Test 15: Nephy Follow-up #3 -- Audit-Before-Mutation Fail-Closed Ordering
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_create_proposal_audit_failure_leaves_no_proposal_row():
+    """If the pre-mutation audit write fails, create_proposal() must raise
+    before save_proposal() ever runs -- no governance_proposals row and no
+    proposal_created governance_event may exist for this proposal_id."""
+    from uuid import uuid4
+
+    from services.api.exceptions import AuditPersistenceError
+    from services.api.security import Principal
+    from services.api.services.governance_service import GovernanceService
+
+    pool = _get_real_postgres_pool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
+    gov_service = GovernanceService(repo, _AlwaysFailingAuditRepo())
+
+    marker = uuid4().hex[:8]
+    with pytest.raises(AuditPersistenceError):
+        await gov_service.create_proposal(
+            command="health",
+            parameters={},
+            principal=Principal(actor_id="test.runner", roles=["user"]),
+            request_id=f"req-audit-fail-{marker}",
+        )
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM governance_proposals WHERE traceability->>'request_id' = %s;",
+                (f"req-audit-fail-{marker}",),
+            )
+            assert cur.fetchone()[0] == 0
+
+            cur.execute(
+                "SELECT count(*) FROM governance_events WHERE event_type = 'proposal_created' "
+                "AND traceability->>'request_id' = %s;",
+                (f"req-audit-fail-{marker}",),
+            )
+            assert cur.fetchone()[0] == 0
+    finally:
+        pool.putconn(conn)
+
+
+@pytest.mark.asyncio
+async def test_decide_proposal_audit_failure_leaves_decision_uncommitted():
+    """If the pre-mutation audit write fails, decide_proposal() must raise
+    before execute_atomic_cas_decision() ever runs -- revision/decision/
+    state must stay unchanged and no proposal_decided event may exist."""
+    from uuid import uuid4
+
+    from services.api.exceptions import AuditPersistenceError
+    from services.api.security import Principal
+    from services.api.services.governance_service import GovernanceService
+    from services.tools.builtin.sys_audit_repository import PostgresSysAuditRepository
+
+    pool = _get_real_postgres_pool()
+    repo = PostgresGovernanceRepository(pool_instance=pool)
+
+    marker = uuid4().hex[:8]
+    proposal_id = f"sys-prop-audit-fail-{marker}"
+    await repo.save_proposal({
+        "proposal_id": proposal_id, "command": "health", "revision": 1,
+        "state": "created", "decision": "pending", "requested_by": "test.runner",
+    })
+
+    # A real (working) audit repo confirms the CAS itself succeeds under
+    # normal conditions before proving the failing repo blocks it.
+    working_gov_service = GovernanceService(repo, PostgresSysAuditRepository(pool))
+    failing_gov_service = GovernanceService(repo, _AlwaysFailingAuditRepo())
+
+    with pytest.raises(AuditPersistenceError):
+        await failing_gov_service.decide_proposal(
+            proposal_id=proposal_id,
+            decision="approved",
+            principal=Principal(actor_id="test.runner", roles=["user", "admin"]),
+            decision_reason="should never commit",
+        )
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT revision, decision, state FROM governance_proposals WHERE proposal_id = %s;",
+                (proposal_id,),
+            )
+            row = cur.fetchone()
+            assert row == (1, "pending", "created")
+
+            cur.execute(
+                "SELECT count(*) FROM governance_events WHERE proposal_id = %s AND event_type = %s;",
+                (proposal_id, "proposal_decided"),
+            )
+            assert cur.fetchone()[0] == 0
+    finally:
+        pool.putconn(conn)
+
+    # Sanity check: the exact same decision succeeds with a working audit repo.
+    decided = await working_gov_service.decide_proposal(
+        proposal_id=proposal_id,
+        decision="approved",
+        principal=Principal(actor_id="test.runner", roles=["user", "admin"]),
+        decision_reason="works with a healthy audit repo",
+    )
+    assert decided["decision"] == "approved"

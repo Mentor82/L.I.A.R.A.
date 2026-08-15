@@ -116,14 +116,8 @@ class GovernanceService:
             },
         }
 
-        # 1. Save proposal to PostgreSQL
-        saved_proposal = await self.repo.save_proposal(proposal)
-
-        # 2. Log pre-execution audit event
-        await self.audit_repo.log_event(
+        audit_kwargs = dict(
             tool_name="sys_governance_proposal",
-            lifecycle_stage="started",
-            outcome="allow" if policy["allowed"] else "block",
             proposal_id=proposal_id,
             request_id=req_id,
             session_id=session_id,
@@ -131,6 +125,29 @@ class GovernanceService:
             actor_id=principal.actor_id,
             context=context,
             metadata={"command": command, "policy_check": policy},
+        )
+
+        # 1. Fail-closed pre-mutation audit proof: no proposal may be
+        # created without first durably recording that creation was
+        # attempted. "started", not "completed" -- the mutation hasn't
+        # happened yet, so this must not read as a success signal.
+        await self.audit_repo.log_event(
+            lifecycle_stage="started",
+            outcome="allow" if policy["allowed"] else "block",
+            fail_closed=True,
+            **audit_kwargs,
+        )
+
+        # 2. Save proposal to PostgreSQL
+        saved_proposal = await self.repo.save_proposal(proposal)
+
+        # 3. Best-effort terminal confirmation -- not fail-closed: the
+        # mutation already committed, so a logging failure here must not
+        # make a successful create() look like it failed.
+        await self.audit_repo.log_event(
+            lifecycle_stage="completed",
+            outcome="allow" if policy["allowed"] else "block",
+            **audit_kwargs,
         )
 
         return saved_proposal
@@ -209,6 +226,26 @@ class GovernanceService:
             "handoff": normalized_handoff,
         }
 
+        audit_kwargs = dict(
+            tool_name="sys_governance_proposal",
+            proposal_id=proposal_id,
+            request_id=traceability.get("request_id"),
+            session_id=traceability.get("session_id"),
+            run_id=traceability.get("run_id"),
+            actor_id=principal.actor_id,
+            context=str(traceability.get("context") or "workspace_agent.governance_handoff"),
+            metadata={"command": command, "policy_check": policy_check},
+        )
+
+        # 1. Fail-closed pre-mutation audit proof (same rationale as
+        # create_proposal). If the insert below loses the handoff_key race,
+        # this "started" event describes an attempt for a proposal_id that
+        # ends up superseded by the winner instead of the canonical row --
+        # an accepted, documented tradeoff of auditing before a CAS/unique-
+        # constraint outcome is known (see create_checkpoint_proposal's
+        # class docstring on the idempotency guarantee itself).
+        await self.audit_repo.log_event(lifecycle_stage="started", outcome="allow", fail_closed=True, **audit_kwargs)
+
         try:
             saved_proposal = await self.repo.save_proposal(proposal)
         except GovernanceConflictError:
@@ -221,18 +258,9 @@ class GovernanceService:
                 return existing
             raise
 
-        await self.audit_repo.log_event(
-            tool_name="sys_governance_proposal",
-            lifecycle_stage="started",
-            outcome="allow",
-            proposal_id=proposal_id,
-            request_id=traceability.get("request_id"),
-            session_id=traceability.get("session_id"),
-            run_id=traceability.get("run_id"),
-            actor_id=principal.actor_id,
-            context=str(traceability.get("context") or "workspace_agent.governance_handoff"),
-            metadata={"command": command, "policy_check": policy_check},
-        )
+        # 2. Best-effort terminal confirmation -- not fail-closed, mirrors
+        # create_proposal's rationale.
+        await self.audit_repo.log_event(lifecycle_stage="completed", outcome="allow", **audit_kwargs)
 
         return saved_proposal
 
@@ -304,7 +332,25 @@ class GovernanceService:
         current_state = proposal.get("state", "created")
         new_state = "decided"
 
-        # Execute CAS transition in PostgreSQL
+        audit_kwargs = dict(
+            tool_name="sys_governance_decision",
+            proposal_id=proposal_id,
+            request_id=request_id or proposal_id,
+            session_id=session_id,
+            run_id=run_id or request_id or proposal_id,
+            actor_id=principal.actor_id,
+            context=context,
+            metadata={"decision": decision, "reason": decision_reason},
+        )
+
+        # 1. Fail-closed pre-mutation audit proof: no decision may be
+        # committed without first durably recording that it was attempted.
+        # "started", not "completed" -- if the CAS below loses a concurrent
+        # race (GovernanceConflictError), this event correctly describes an
+        # attempt that never took effect, not a false success signal.
+        await self.audit_repo.log_event(lifecycle_stage="started", outcome=decision, fail_closed=True, **audit_kwargs)
+
+        # 2. Execute CAS transition in PostgreSQL
         updated = await self.repo.execute_atomic_cas_decision(
             proposal_id=proposal_id,
             expected_revision=req_rev,
@@ -325,20 +371,10 @@ class GovernanceService:
             invocation_update=invocation_update,
         )
 
-        # Log audit event for decision
-        await self.audit_repo.log_event(
-            tool_name="sys_governance_decision",
-            lifecycle_stage="completed",
-            outcome=decision,
-            proposal_id=proposal_id,
-            request_id=request_id or proposal_id,
-            session_id=session_id,
-            run_id=run_id or request_id or proposal_id,
-            actor_id=principal.actor_id,
-            context=context,
-            metadata={"decision": decision, "reason": decision_reason},
-            fail_closed=True,
-        )
+        # 3. Best-effort terminal confirmation -- not fail-closed: the CAS
+        # already committed, so a logging failure here must not make a
+        # successful decision look like it failed.
+        await self.audit_repo.log_event(lifecycle_stage="completed", outcome=decision, **audit_kwargs)
 
         # Merge fields
         full_proposal = dict(proposal)
