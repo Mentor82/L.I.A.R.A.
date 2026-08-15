@@ -209,24 +209,28 @@ class AdminDataLayer:
         event_types: Optional[List[str]] = None,
     ) -> List[AuditEvent]:
         """Load audit events from API contract first, with file storage fallback."""
-        # 1. Try fetching via API contract
+        # 1. Try fetching via API contract. /admin/sys-audit/summary only ever
+        # returns pre-aggregated stats (no per-event items), so this must use
+        # the raw-entries endpoint instead -- session_id/event_type filtering
+        # stays client-side since the endpoint has no such query params.
         if HTTPX_AVAILABLE:
             try:
                 client = self._get_http_client()
-                params: Dict[str, Any] = {"limit": limit}
-                if session_id:
-                    params["session_id"] = session_id
-                resp = client.get(f"{self.api_base_url}/admin/sys-audit/summary", params=params)
+                params: Dict[str, Any] = {"limit": max(limit, 200) if limit > 0 else 500}
+                resp = client.get(f"{self.api_base_url}/admin/sys-audit/events", params=params)
                 if resp.status_code == 200:
                     payload = resp.json()
-                    items = payload.get("items") or payload.get("recent_events") or []
+                    items = payload.get("items") or []
                     events: List[AuditEvent] = []
                     allowed_types = {
                         str(et).strip().lower() for et in (event_types or []) if str(et).strip()
                     }
+                    requested_session = str(session_id or "").strip()
                     for item in items:
                         if isinstance(item, dict):
                             evt = self._to_audit_event(item)
+                            if requested_session and evt.session_id != requested_session:
+                                continue
                             if allowed_types and evt.event_type.lower() not in allowed_types:
                                 continue
                             events.append(evt)

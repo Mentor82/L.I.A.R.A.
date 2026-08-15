@@ -432,7 +432,15 @@ class TestAdminDataLayer:
         assert payload["summary"]["outcome_counts"]["blocked"] == 1
         assert payload["summary"]["policy_basis_runs"] == 1
 
-    def test_load_audit_events_reads_sys_audit_log(self, tmp_path):
+    def test_load_audit_events_reads_sys_audit_log(self, tmp_path, monkeypatch):
+        # Force the HTTP-first attempt to fail so this exercises the file
+        # fallback it's actually testing, regardless of whether a real API
+        # happens to be reachable at the default LIARA_API_BASE_URL on the
+        # machine running the test.
+        import frontend.admin_tui.data_layer as data_layer_module
+
+        monkeypatch.setattr(data_layer_module, "HTTPX_AVAILABLE", False)
+
         data_layer = AdminDataLayer(repo_root=str(tmp_path))
         audit_dir = tmp_path / "logs" / "services"
         audit_dir.mkdir(parents=True)

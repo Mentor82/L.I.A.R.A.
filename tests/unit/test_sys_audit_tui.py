@@ -15,8 +15,10 @@ from services.tui.sys_audit_tui import (
     _discover_project_log_files,
     _entry_detail_pairs,
     _event_log_max_lines,
+    _fetch_sys_entries_via_http,
     _load_entries,
     _load_project_entries,
+    _load_sys_entries,
     _traceability_drilldown,
     _monitoring_status_line,
     _operator_signal,
@@ -139,6 +141,102 @@ class TestLoadEntries:
         p = tmp_path / "audit.jsonl"
         p.write_text("", encoding="utf-8")
         assert _load_entries(p) == []
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+@pytest.mark.skipif(not sys_audit_tui_module._HTTPX_AVAILABLE, reason="httpx not installed")
+class TestLoadSysEntriesHttpFirst:
+    """Phase 6: 'sys' scope tries the admin API before falling back to the
+    local JSONL file, mirroring admin_tui/data_layer.py's convention."""
+
+    def test_http_success_normalizes_and_skips_file(self, tmp_path, monkeypatch):
+        missing_log = tmp_path / "does_not_exist.jsonl"
+        payload = {
+            "status": "success",
+            "items": [{"command": "curl", "policy_decision": "allowed", "timestamp": 1000}],
+        }
+
+        def fake_get(url, *, params=None, headers=None, timeout=None):
+            assert url.endswith("/admin/sys-audit/events")
+            return _FakeHttpResponse(200, payload)
+
+        monkeypatch.setattr(sys_audit_tui_module.httpx, "get", fake_get)
+
+        entries = _load_sys_entries(missing_log, explicit_log_path=False)
+        assert len(entries) == 1
+        assert entries[0]["command"] == "curl"
+        assert "risk_level" in entries[0]
+
+    def test_http_failure_falls_back_to_file(self, tmp_path, monkeypatch):
+        entries_on_disk = _sample_entries()
+        p = _make_jsonl(entries_on_disk, tmp_path / "audit.jsonl")
+
+        def fake_get(*args, **kwargs):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(sys_audit_tui_module.httpx, "get", fake_get)
+        monkeypatch.delenv("LIARA_ENV", raising=False)
+
+        entries = _load_sys_entries(p, explicit_log_path=False)
+        assert len(entries) == len(entries_on_disk)
+
+    def test_http_non_200_falls_back_to_file(self, tmp_path, monkeypatch):
+        entries_on_disk = _sample_entries()
+        p = _make_jsonl(entries_on_disk, tmp_path / "audit.jsonl")
+
+        def fake_get(*args, **kwargs):
+            return _FakeHttpResponse(500, {})
+
+        monkeypatch.setattr(sys_audit_tui_module.httpx, "get", fake_get)
+        monkeypatch.delenv("LIARA_ENV", raising=False)
+
+        entries = _load_sys_entries(p, explicit_log_path=False)
+        assert len(entries) == len(entries_on_disk)
+
+    def test_explicit_log_path_skips_http_entirely(self, tmp_path, monkeypatch):
+        entries_on_disk = _sample_entries()
+        p = _make_jsonl(entries_on_disk, tmp_path / "audit.jsonl")
+
+        def fake_get(*args, **kwargs):
+            raise AssertionError("HTTP should not be attempted with an explicit --log path")
+
+        monkeypatch.setattr(sys_audit_tui_module.httpx, "get", fake_get)
+
+        entries = _load_sys_entries(p, explicit_log_path=True)
+        assert len(entries) == len(entries_on_disk)
+
+    def test_production_mode_disables_file_fallback_on_http_failure(self, tmp_path, monkeypatch):
+        entries_on_disk = _sample_entries()
+        p = _make_jsonl(entries_on_disk, tmp_path / "audit.jsonl")
+
+        def fake_get(*args, **kwargs):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(sys_audit_tui_module.httpx, "get", fake_get)
+        monkeypatch.setenv("LIARA_ENV", "production")
+
+        entries = _load_sys_entries(p, explicit_log_path=False)
+        assert entries == []
+
+    def test_fetch_returns_none_when_httpx_unavailable(self, monkeypatch):
+        monkeypatch.setattr(sys_audit_tui_module, "_HTTPX_AVAILABLE", False)
+        assert _fetch_sys_entries_via_http() is None
+
+    def test_fetch_returns_none_on_malformed_payload(self, monkeypatch):
+        def fake_get(*args, **kwargs):
+            return _FakeHttpResponse(200, {"status": "success"})  # no "items" key
+
+        monkeypatch.setattr(sys_audit_tui_module.httpx, "get", fake_get)
+
+        assert _fetch_sys_entries_via_http() is None
 
 
 class TestProjectAuditLoaders:

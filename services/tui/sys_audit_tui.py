@@ -34,6 +34,12 @@ from services.tools.builtin.sys_audit import (
     find_suspicious_entries,
 )
 
+try:
+    import httpx
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _HTTPX_AVAILABLE = False
+
 
 def _audit_log_path() -> Path:
     return Path(__file__).resolve().parents[2] / "logs" / "services" / "sys_audit.jsonl"
@@ -41,6 +47,71 @@ def _audit_log_path() -> Path:
 
 def _project_logs_root() -> Path:
     return Path(__file__).resolve().parents[2] / "logs"
+
+
+_API_BASE_ENV = "LIARA_API_BASE_URL"
+_API_BASE_DEFAULT = "http://127.0.0.1:8010"
+_HTTP_FETCH_LIMIT_DEFAULT = 2000
+_HTTP_TIMEOUT_SECONDS = 5.0
+
+
+def _api_base_url() -> str:
+    return (os.getenv(_API_BASE_ENV) or _API_BASE_DEFAULT).rstrip("/")
+
+
+def _http_auth_headers() -> dict[str, str]:
+    token = os.getenv("LIARA_ADMIN_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _fetch_sys_entries_via_http(*, limit: int = _HTTP_FETCH_LIMIT_DEFAULT) -> list[dict[str, Any]] | None:
+    """Fetch raw sys-audit entries from the admin API.
+
+    Returns None on any failure (unreachable API, non-200, malformed
+    payload) so the caller falls back to the local JSONL file -- mirrors
+    admin_tui/data_layer.py's HTTP-first-then-file convention.
+    """
+    if not _HTTPX_AVAILABLE:
+        return None
+    try:
+        resp = httpx.get(
+            f"{_api_base_url()}/admin/sys-audit/events",
+            params={"limit": limit},
+            headers=_http_auth_headers(),
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return None
+        return items
+    except Exception:
+        return None
+
+
+def _load_sys_entries(log_path: Path, *, explicit_log_path: bool) -> list[dict[str, Any]]:
+    """Load 'sys'-scope audit entries: HTTP-first against the admin API,
+    falling back to the local JSONL file.
+
+    An explicit --log path always reads the file directly (dev/debug escape
+    hatch, same convention as the /admin/sys-audit/* log_path override).
+    Production mode also disables the file fallback, mirroring
+    admin_tui/data_layer.py, so an unreachable API in production yields no
+    entries rather than silently reading a possibly-stale local file.
+    """
+    if not explicit_log_path:
+        http_items = _fetch_sys_entries_via_http()
+        if http_items is not None:
+            return [
+                _normalize_json_entry(item, path=log_path)
+                for item in http_items
+                if isinstance(item, dict)
+            ]
+        if (os.getenv("LIARA_ENV", "development").strip().lower()) == "production":
+            return []
+    return _load_entries(log_path)
 
 
 _EVENT_LOG_MAX_LINES_DEFAULT = 2000
@@ -786,6 +857,7 @@ def create_sys_audit_app(
     domain_filter: str | None = None,
     max_files: int = 400,
     max_lines_per_file: int = 80,
+    explicit_log_path: bool = False,
 ):
     """Create Textual app class for live sys-audit inspection."""
     App, Binding, Vertical, Horizontal, ModalScreen, Header, Footer, Static, RichLog, DataTable, Button, Label, TextArea = _load_textual_symbols()
@@ -952,6 +1024,7 @@ def create_sys_audit_app(
             self.domain_filter = _filter_label(domain_filter)
             self.max_files = max(1, max_files)
             self.max_lines_per_file = max(1, max_lines_per_file)
+            self.explicit_log_path = explicit_log_path
             self._inflight = False
             self._auto_refresh_enabled = True
             self._current_recent_entries: list[dict[str, Any]] = []
@@ -1043,14 +1116,13 @@ def create_sys_audit_app(
             self._schedule_refresh()
 
         def action_cycle_source(self) -> None:
-            if self.scope == "project":
-                entries = _load_project_entries(
-                    _project_logs_root(),
-                    max_files=self.max_files,
-                    max_lines_per_file=self.max_lines_per_file,
-                )
-            else:
-                entries = _load_entries(self.log_path)
+            entries = _entries_for_scope(
+                scope=self.scope,
+                log_path=self.log_path,
+                max_files=self.max_files,
+                max_lines_per_file=self.max_lines_per_file,
+                explicit_log_path=self.explicit_log_path,
+            )
             options = self._source_cycle_options(entries)
             self.source_filter = self._cycle(self.source_filter, options)
             self.query_one("#events", RichLog).write(f"[yellow]source filter[/yellow]: {self.source_filter}")
@@ -1069,14 +1141,13 @@ def create_sys_audit_app(
             self._schedule_refresh()
 
         def action_cycle_domain(self) -> None:
-            if self.scope == "project":
-                entries = _load_project_entries(
-                    _project_logs_root(),
-                    max_files=self.max_files,
-                    max_lines_per_file=self.max_lines_per_file,
-                )
-            else:
-                entries = _load_entries(self.log_path)
+            entries = _entries_for_scope(
+                scope=self.scope,
+                log_path=self.log_path,
+                max_files=self.max_files,
+                max_lines_per_file=self.max_lines_per_file,
+                explicit_log_path=self.explicit_log_path,
+            )
             options = ["all", *sorted({str(e.get("domain") or e.get("source") or "unknown") for e in entries})]
             self.domain_filter = self._cycle(self.domain_filter, options)
             self.query_one("#events", RichLog).write(f"[yellow]domain filter[/yellow]: {self.domain_filter}")
@@ -1130,14 +1201,13 @@ def create_sys_audit_app(
             refresh_started = time.perf_counter()
 
             try:
-                if self.scope == "project":
-                    entries = _load_project_entries(
-                        _project_logs_root(),
-                        max_files=self.max_files,
-                        max_lines_per_file=self.max_lines_per_file,
-                    )
-                else:
-                    entries = _load_entries(self.log_path)
+                entries = _entries_for_scope(
+                    scope=self.scope,
+                    log_path=self.log_path,
+                    max_files=self.max_files,
+                    max_lines_per_file=self.max_lines_per_file,
+                    explicit_log_path=self.explicit_log_path,
+                )
                 filtered_entries = _apply_filters(
                     entries,
                     blocked_only=self.blocked_only,
@@ -1315,6 +1385,7 @@ def run_sys_audit_tui(*, log_path: Path, limit: int, blocked_only: bool, interva
         source_filter="all",
         risk_filter="all",
         family_filter="all",
+        explicit_log_path=True,
     )
     app = app_cls()
     app.run()
@@ -1640,6 +1711,7 @@ def _entries_for_scope(
     log_path: Path,
     max_files: int,
     max_lines_per_file: int,
+    explicit_log_path: bool = False,
 ) -> list[dict[str, Any]]:
     if scope == "project":
         return _load_project_entries(
@@ -1647,7 +1719,7 @@ def _entries_for_scope(
             max_files=max_files,
             max_lines_per_file=max_lines_per_file,
         )
-    return _load_entries(log_path)
+    return _load_sys_entries(log_path, explicit_log_path=explicit_log_path)
 
 
 def _render_all(
@@ -1663,6 +1735,7 @@ def _render_all(
     domain_filter: str,
     max_files: int,
     max_lines_per_file: int,
+    explicit_log_path: bool = False,
 ) -> None:
     from rich.rule import Rule
 
@@ -1671,6 +1744,7 @@ def _render_all(
         log_path=log_path,
         max_files=max_files,
         max_lines_per_file=max_lines_per_file,
+        explicit_log_path=explicit_log_path,
     )
     filtered_entries = _apply_filters(
         entries,
@@ -1712,6 +1786,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     from rich.console import Console
 
     args = _parse_args(argv)
+    explicit_log_path = args.log is not None
     log_path = Path(args.log) if args.log else _audit_log_path()
     console = Console()
 
@@ -1732,6 +1807,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             domain_filter=args.domain,
             max_files=args.max_files,
             max_lines_per_file=args.max_lines_per_file,
+            explicit_log_path=explicit_log_path,
         )
         app = app_cls()
         app.run()
@@ -1754,6 +1830,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     domain_filter=args.domain,
                     max_files=args.max_files,
                     max_lines_per_file=args.max_lines_per_file,
+                    explicit_log_path=explicit_log_path,
                 )
                 time.sleep(args.interval)
         except KeyboardInterrupt:
@@ -1772,6 +1849,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             domain_filter=args.domain,
             max_files=args.max_files,
             max_lines_per_file=args.max_lines_per_file,
+            explicit_log_path=explicit_log_path,
         )
 
 

@@ -1121,6 +1121,49 @@ async def sys_audit_summary(
     }
 
 
+@router.get("/admin/sys-audit/events")
+async def sys_audit_events(
+    request: Request,
+    response: Response,
+    limit: int = Query(default=500, ge=1, le=5000),
+    blocked_only: bool = Query(default=False),
+    source: str | None = Query(default=None),
+    risk_level: str | None = Query(default=None),
+    command_family: str | None = Query(default=None),
+    log_path: str | None = Query(default=None),
+    principal: Principal = Depends(require_admin_principal),
+) -> dict[str, Any]:
+    """Raw filtered sys-audit entries (vs. /summary's pre-aggregated stats).
+
+    Backs TUI/dashboard clients (e.g. services/tui/sys_audit_tui.py) that
+    render per-event tables and compute their own client-side aggregates.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    entries = await _load_sys_audit_entries_for_admin(
+        request, log_path=log_path, limit=limit, risk_level=risk_level, command_family=command_family,
+    )
+    filtered = filter_sys_audit_entries(
+        entries,
+        blocked_only=blocked_only,
+        source=source,
+        risk_level=risk_level,
+        command_family=command_family,
+    )
+    return {
+        "status": "success",
+        "count": len(filtered),
+        "items": filtered,
+        "filters": {
+            "blocked_only": blocked_only,
+            "source": source or "all",
+            "risk_level": risk_level or "all",
+            "command_family": command_family or "all",
+            "limit": limit,
+            "log_path": log_path,
+        },
+    }
+
+
 @router.get("/admin/sys-audit/suspicious")
 async def sys_audit_suspicious(
     request: Request,
