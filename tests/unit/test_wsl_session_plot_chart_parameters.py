@@ -60,6 +60,27 @@ def test_extracts_explicit_session_id_from_query():
     assert selection.action == "collect"
 
 
+def test_negated_destroy_english_resolves_to_the_actual_intent():
+    """A destroy keyword under negation must never win just by substring
+    presence -- once filtered out, the single remaining (non-negated) match
+    is the real intent, not a priority-order pick of "destroy"."""
+    selection = select_wsl_session_action("don't destroy it, just show status")
+    assert selection.action == "status"
+
+
+def test_negated_destroy_german_resolves_to_the_actual_intent():
+    selection = select_wsl_session_action("nicht löschen, nur Status")
+    assert selection.action == "status"
+
+
+def test_competing_non_negated_signals_fail_closed_to_plan():
+    """Genuine ambiguity (both destroy and status keywords present, neither
+    negated) must fail closed to "plan" rather than picking a winner by
+    category precedence -- destroy is too consequential to guess."""
+    selection = select_wsl_session_action("should I destroy it or just check status")
+    assert selection.action == "plan"
+
+
 # ---------------------------------------------------------------------------
 # ToolExecutor.prepare_tool_requests round-trips
 # ---------------------------------------------------------------------------

@@ -56,9 +56,8 @@ _PLAN_KW = frozenset([
     "plane", "planen", "zeige plan", "vorschau",
 ])
 
-# Checked in this precedence order: destroy first (narrow, high-consequence
-# phrases minimize false positives from other categories' broader vocabulary),
-# plan/create last (lowest-risk, safest to fall back into).
+# Category order is no longer used to pick a winner among competing matches
+# (see select_wsl_session_action) -- kept as a stable iteration order only.
 _KEYWORD_TABLE: tuple[tuple[str, frozenset[str]], ...] = (
     ("destroy", _DESTROY_KW),
     ("validate", _VALIDATE_KW),
@@ -70,21 +69,70 @@ _KEYWORD_TABLE: tuple[tuple[str, frozenset[str]], ...] = (
 
 SESSION_SCOPED_ACTIONS: frozenset[str] = frozenset({"status", "collect", "validate", "destroy"})
 
+# Bilingual negation markers. A keyword match in the same clause as one of
+# these (German commonly negates *after* the verb, e.g. "lösche nicht") is
+# treated as not matched at all, rather than trusting bare substring
+# presence. This matters most for "destroy": a query like "don't destroy it,
+# just show status" must never classify as destroy.
+_NEGATION_MARKERS = (
+    "don't", "do not", "dont", "not ", "never",
+    "nicht", "kein ", "keine ", "ohne", "without",
+)
+
+# Negation is scoped to the clause containing the match (split on sentence-
+# /clause-level punctuation) rather than a raw character window -- a fixed
+# window bleeds across short clauses (e.g. "nicht löschen, nur Status" would
+# otherwise let "nicht" negate the unrelated "Status" match too, since both
+# sit within a small window of each other).
+_CLAUSE_BOUNDARY_RE = re.compile(r"[,.;!?]")
+
+
+def _is_negated(text: str, match_start: int, match_end: int) -> bool:
+    clause_start = 0
+    for boundary in _CLAUSE_BOUNDARY_RE.finditer(text):
+        if boundary.start() < match_start:
+            clause_start = boundary.start() + 1
+        else:
+            break
+    boundary_after = _CLAUSE_BOUNDARY_RE.search(text, match_end)
+    clause_end = boundary_after.start() if boundary_after else len(text)
+    clause = text[clause_start:clause_end]
+    return any(marker in clause for marker in _NEGATION_MARKERS)
+
 
 def select_wsl_session_action(query: str) -> WslSessionActionSelection:
     """Classify free-text intent into a wsl_session lifecycle action.
 
     Falls back to "plan" (read-only, no session_id needed, already an
-    allow-eligible action in the pre-action Judge profile) when intent is
-    ambiguous or empty -- the only action always safe to run blind.
+    allow-eligible action in the pre-action Judge profile) in three cases:
+    empty/ambiguous input with no keyword match at all; a keyword match that
+    is negated (e.g. "don't destroy"); or genuinely competing, non-negated
+    matches across more than one action category -- in that last case this
+    deliberately does NOT fall back to picking by category precedence, since
+    a priority order could silently prefer "destroy" over a co-occurring
+    "status" mention. "plan" is the only action always safe to run blind.
     """
     text = (query or "").lower()
     session_match = _SESSION_ID_RE.search(query or "")
     explicit_session_id = session_match.group(0) if session_match else None
 
+    matched: dict[str, str] = {}
     for action, keywords in _KEYWORD_TABLE:
+        if action in matched:
+            continue
         for keyword in keywords:
-            if keyword in text:
-                return WslSessionActionSelection(action, keyword, explicit_session_id)
+            idx = text.find(keyword)
+            if idx == -1:
+                continue
+            if _is_negated(text, idx, idx + len(keyword)):
+                continue
+            matched[action] = keyword
+            break
 
+    if len(matched) == 1:
+        (action, keyword), = matched.items()
+        return WslSessionActionSelection(action, keyword, explicit_session_id)
+
+    # Zero matches (ambiguous/empty) or multiple competing categories: fail
+    # closed to the one action that's always safe to run without confirmation.
     return WslSessionActionSelection("plan", None, explicit_session_id)
