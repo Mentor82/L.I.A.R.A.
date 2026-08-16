@@ -39,6 +39,7 @@ async def select_tools(
     *,
     input_profile: Optional[InputSituationProfile] = None,
     query: str,
+    tools_override: Optional[List[str]] = None,
 ) -> List[str]:
     """Select candidate tools based on heuristic profile & tool registry capabilities."""
     if not query:
@@ -55,7 +56,7 @@ async def select_tools(
             from services.contracts import RouterRequest
             req = RouterRequest(
                 query=query,
-                tools_override=getattr(orchestrator, "_effective_tools_override", None),
+                tools_override=tools_override,
                 input_profile=profile,
             )
             decision = await orchestrator.router.route(req)

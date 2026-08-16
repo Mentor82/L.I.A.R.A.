@@ -1081,7 +1081,7 @@ class Orchestrator:
     async def _select_tools(self, query: str = "", tools_override: Optional[List[str]] = None, **kwargs: Any) -> List[str]:
         q = query or kwargs.get("query", "")
         profile = kwargs.get("input_profile") or getattr(self, "_active_input_profile", None)
-        res = tool_discovery.select_tools(self, input_profile=profile, query=q)
+        res = tool_discovery.select_tools(self, input_profile=profile, query=q, tools_override=tools_override)
         if hasattr(res, "__await__"):
             return await res
         return res
