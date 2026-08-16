@@ -239,6 +239,7 @@ class Orchestrator:
         self._session_control_state: Dict[str, Dict[str, Any]] = {}
         self._session_score_feedback: Dict[str, Dict[str, Any]] = {}
         self._session_score_history: Dict[str, List[Dict[str, Any]]] = {}
+        self._wsl_session_by_chat_session: Dict[str, str] = {}
 
         self._last_route_debug: Dict[str, Any] = {}
         self._last_executor_debug: Dict[str, Any] = {}

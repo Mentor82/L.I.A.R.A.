@@ -12,6 +12,7 @@ from xml.etree import ElementTree
 
 from services.contracts import ExecutorRequest, ExecutorResult, ToolExecutionRequest
 from services.orchestrator.sys_selector import select_sys_command, CommandCategory
+from services.orchestrator.wsl_session_selector import select_wsl_session_action, SESSION_SCOPED_ACTIONS
 
 
 class ToolExecutor:
@@ -499,7 +500,75 @@ class ToolExecutor:
             if request.sandbox_root:
                 parameters["sandbox_root"] = request.sandbox_root
             return parameters
+        if tool_name == "wsl_session":
+            return self._build_wsl_session_parameters(
+                request.query,
+                routing_metadata=request.routing_metadata,
+            )
+        if tool_name == "plot_chart":
+            return self._build_plot_chart_parameters(request.query)
         return {"query": request.query}
+
+    @staticmethod
+    def _build_wsl_session_parameters(
+        query: str,
+        *,
+        routing_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build wsl_session tool parameters via select_wsl_session_action.
+
+        No LLM function-calling exists in this pipeline (see the module-level
+        docstring in wsl_session_selector.py), so `action` is derived
+        heuristically from the free-text query, mirroring how _build_sys_parameters
+        derives /sys commands via sys_selector. `session_id` is resolved from an
+        explicit session id literally present in the query, falling back to the
+        caller-tracked "last created" session id passed via routing_metadata --
+        never guessed or fabricated.
+        """
+        selection = select_wsl_session_action(query)
+        parameters: dict[str, Any] = {"action": selection.action}
+
+        if selection.action in SESSION_SCOPED_ACTIONS:
+            routing = routing_metadata or {}
+            session_id = selection.explicit_session_id or str(routing.get("wsl_session_id") or "")
+            if session_id:
+                parameters["session_id"] = session_id
+            # else: leave session_id unset -- the tool's own existing
+            # "session_id is required for this action" failure handles this
+            # gracefully; no new error path needed here.
+        return parameters
+
+    @staticmethod
+    def _build_plot_chart_parameters(query: str) -> dict[str, Any]:
+        """Build plot_chart tool parameters heuristically from the query.
+
+        Only improves chart_type/title fidelity. The resulting y_values remain
+        a synthetic, query-hash-derived fallback series (via the tool's own
+        _fallback_series_from_query) -- not real data -- until a real producer
+        for x_values/y_values exists; extracting real numeric series from
+        freeform natural language is out of scope here.
+        """
+        text = (query or "").lower()
+        bar_keywords = (
+            "bar chart", "bar graph", "bars",
+            "balkendiagramm", "säulendiagramm", "saeulendiagramm", "balken",
+        )
+        chart_type = "bar" if any(keyword in text for keyword in bar_keywords) else "line"
+
+        title = (query or "").strip()
+        title = re.sub(
+            r"^(plot|chart|graph|zeichne|erstelle(?:\s+(?:ein|einen))?)\s+",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+        title = title[:80] if title else ""
+
+        return {
+            "query": query,
+            "chart_type": chart_type,
+            "title": title or "LIARA Chart",
+        }
 
     def prepare_tool_requests(self, request: ExecutorRequest) -> list[ToolExecutionRequest]:
         """Build the exact requests that will be judged and executed.
@@ -650,6 +719,8 @@ class ToolExecutor:
         failed_tools: list[str] = []
         tool_errors: Dict[str, str] = {}
         governance_required: Dict[str, Any] = {}
+        wsl_session_created_id: str | None = None
+        wsl_session_destroyed_id: str | None = None
 
         for tool_name, result in results_dict.items():
             tool_statuses[tool_name] = result.status
@@ -667,6 +738,15 @@ class ToolExecutor:
                     )
                 else:
                     tool_outputs[tool_name] = result.output
+                if tool_name == "wsl_session" and isinstance(result.output, dict):
+                    if request_parameters.get("action") == "create":
+                        created_id = result.output.get("session_id")
+                        if created_id:
+                            wsl_session_created_id = str(created_id)
+                    elif request_parameters.get("action") == "destroy":
+                        destroyed_id = request_parameters.get("session_id")
+                        if destroyed_id:
+                            wsl_session_destroyed_id = str(destroyed_id)
             else:
                 failed_count += 1
                 failed_tools.append(tool_name)
@@ -700,5 +780,7 @@ class ToolExecutor:
                 "failed_tools": failed_tools,
                 "tool_errors": tool_errors,
                 "governance_required": governance_required,
+                "wsl_session_created_id": wsl_session_created_id,
+                "wsl_session_destroyed_id": wsl_session_destroyed_id,
             },
         )

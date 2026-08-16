@@ -186,23 +186,28 @@ async def execute_tools(
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     run_id: Optional[str] = None,
-    tool_parameters: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Execute selected tools via ToolExecutor."""
     if not selected_tools:
         return {}
+
+    chat_session_id = session_id or getattr(orchestrator, "_active_session_id", "") or ""
 
     prepared = None
     exec_req = None
     if hasattr(orchestrator, "executor") and hasattr(orchestrator.executor, "execute"):
         try:
             from services.contracts import ExecutorRequest
+            tracked_wsl_session_id = ""
+            if hasattr(orchestrator, "_wsl_session_by_chat_session"):
+                tracked_wsl_session_id = orchestrator._wsl_session_by_chat_session.get(chat_session_id, "")
             exec_req = ExecutorRequest(
                 tool_names=selected_tools,
                 query=query,
-                session_id=session_id or getattr(orchestrator, "_active_session_id", "") or "",
+                session_id=chat_session_id,
                 run_id=run_id or "",
                 user_id=user_id or getattr(orchestrator, "_active_user_id", "") or "",
+                routing_metadata=({"wsl_session_id": tracked_wsl_session_id} if tracked_wsl_session_id else {}),
             )
             prepared = (
                 orchestrator.executor.prepare_tool_requests(exec_req)
@@ -263,6 +268,19 @@ async def execute_tools(
                 res = await orchestrator.executor.execute(exec_req, prepared_requests=prepared)
             else:
                 res = await orchestrator.executor.execute(exec_req)
+
+            if hasattr(res, "metadata") and isinstance(res.metadata, dict) and hasattr(orchestrator, "_wsl_session_by_chat_session"):
+                created_id = res.metadata.get("wsl_session_created_id")
+                if created_id and chat_session_id:
+                    orchestrator._wsl_session_by_chat_session[chat_session_id] = str(created_id)
+                destroyed_id = res.metadata.get("wsl_session_destroyed_id")
+                if destroyed_id and chat_session_id:
+                    # Lifecycle hardening: only clear the tracked binding when it
+                    # matches the destroyed id -- an unrelated/explicit destroy of
+                    # a different session id must not wipe out a still-live
+                    # tracked binding for this chat session.
+                    if orchestrator._wsl_session_by_chat_session.get(chat_session_id) == str(destroyed_id):
+                        del orchestrator._wsl_session_by_chat_session[chat_session_id]
 
             if hasattr(res, "tool_outputs") and isinstance(res.tool_outputs, dict):
                 return res.tool_outputs
