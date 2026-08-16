@@ -150,3 +150,46 @@ def test_403_with_generic_error_status_is_access_denied_not_connector_unavailabl
 
     result_401 = _analyze_tool_outputs({"github_api": {"status": "error", "error": "401 Unauthorized"}})
     assert result_401.evidence_states[0]["state"] == "access_denied"
+
+
+def test_two_tool_calls_with_distinct_query_fields_stay_separate_targets():
+    """Nephy round 3: every classified assertion used to get target=query --
+    the *overall*, possibly multi-entity request text -- so two tool calls
+    investigating two different things in one turn collapsed onto the same
+    target and got silently merged into one. web_discovery-style outputs
+    carry their own per-call "query" field; that must now be used as the
+    target instead, keeping the two observations distinct."""
+    result = _analyze_tool_outputs(
+        {
+            "web_search_a": {
+                "kind": "web_discovery",
+                "evidence_scope": "discovery",
+                "query": "octocat github account",
+                "candidate_count": 1,
+                "results": [{"title": "octocat", "url": "https://github.com/octocat"}],
+                "summary_text": "octocat: found",
+            },
+            "web_search_b": {
+                "kind": "web_discovery",
+                "evidence_scope": "discovery",
+                "query": "definitely-nonexistent-user-xyz github account",
+                "candidate_count": 0,
+                "results": [],
+                "summary_text": "No parseable search candidates were returned.",
+            },
+        },
+        query="Check octocat and definitely-nonexistent-user-xyz on GitHub",
+    )
+    assert len(result.evidence_states) == 2
+    by_target = {item["target"]: item["state"] for item in result.evidence_states}
+    assert by_target["octocat github account"] == "found"
+    assert by_target["definitely-nonexistent-user-xyz github account"] == "not_found_in_search"
+
+
+def test_tool_output_without_its_own_query_field_falls_back_to_overall_query():
+    result = _analyze_tool_outputs(
+        {"github_api": {"status": "success", "summary_text": "octocat: 100000+ followers."}},
+        query="octocat GitHub account",
+    )
+    assert len(result.evidence_states) == 1
+    assert result.evidence_states[0]["target"] == "octocat GitHub account"

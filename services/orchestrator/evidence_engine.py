@@ -316,6 +316,34 @@ class EvidenceEngine:
     }
 
     @staticmethod
+    def _resolve_evidence_target(output: Any, query: str) -> str:
+        """Derive the target a single tool observation is actually about.
+
+        Nephy round 2: classifying every observation against the full,
+        possibly multi-entity request text (the raw `query` passed into
+        analyze()) means two tool calls investigating two different things
+        in the same turn (e.g. "check account A and repo B") end up with
+        the *same* target string. merge_evidence_assertions() then treats
+        them as observations of one thing and can silently collapse one
+        entity's state into the other's, and the validator's multi-target
+        guard never sees more than one distinct target to begin with.
+
+        web_discovery/web_lookup (services/orchestrator/executor.py) already
+        carry the actual per-call search phrase in `output["query"]` --
+        that's a real, tool-call-specific identifier, not the whole request.
+        Prefer it when present. There is currently no other per-call
+        identifier (no resource_id/canonical_url/entity_id) anywhere in the
+        real tool_outputs shapes, so anything else falls back to the overall
+        query -- consistent with this issue's standing "no fictional
+        connector, only what real tool outputs actually carry" scope.
+        """
+        if isinstance(output, dict):
+            tool_query = str(output.get("query") or "").strip()
+            if tool_query:
+                return tool_query
+        return query
+
+    @staticmethod
     def _classify_tool_output_state(tool_name: str, output: Any, query: str) -> EvidenceAssertion:
         """Classify one tool output into an EvidenceAssertion.
 
@@ -324,11 +352,13 @@ class EvidenceEngine:
         (which this classifier never fabricates) can produce
         DOES_NOT_EXIST_CONFIRMED/PRIVATE_CONFIRMED (see evidence_state.py).
         """
+        target = EvidenceEngine._resolve_evidence_target(output, query)
+
         if not isinstance(output, dict):
             text = str(output or "").strip()
             if not text:
-                return EvidenceAssertion.unresolved(target=query, source=tool_name, summary="Empty tool output.")
-            return EvidenceAssertion.found(target=query, source=tool_name, summary=text[:200])
+                return EvidenceAssertion.unresolved(target=target, source=tool_name, summary="Empty tool output.")
+            return EvidenceAssertion.found(target=target, source=tool_name, summary=text[:200])
 
         status = str(output.get("status") or "").strip().lower()
         evidence_scope = str(output.get("evidence_scope") or "").strip().lower()
@@ -341,9 +371,9 @@ class EvidenceEngine:
         # CONNECTOR_UNAVAILABLE would let it bypass the ACCESS_DENIED-vs-
         # PRIVATE_CONFIRMED guard downstream (ACCESS_DENIED != PRIVATE).
         if status == "denied" or "401" in error_text or "403" in error_text:
-            return EvidenceAssertion.access_denied(target=query, source=tool_name, summary=error_text[:200])
+            return EvidenceAssertion.access_denied(target=target, source=tool_name, summary=error_text[:200])
         if status in {"failed", "error", "blocked"}:
-            return EvidenceAssertion.connector_unavailable(target=query, source=tool_name, summary=error_text[:200])
+            return EvidenceAssertion.connector_unavailable(target=target, source=tool_name, summary=error_text[:200])
 
         if evidence_scope == "discovery":
             candidate_count = output.get("candidate_count")
@@ -352,19 +382,19 @@ class EvidenceEngine:
                 isinstance(results, list) and len(results) == 0
             )
             if is_empty:
-                return EvidenceAssertion.not_found_in_search(target=query, source=tool_name)
+                return EvidenceAssertion.not_found_in_search(target=target, source=tool_name)
             return EvidenceAssertion.found(
-                target=query, source=tool_name, summary=str(output.get("summary_text") or "")[:200], confidence=0.6
+                target=target, source=tool_name, summary=str(output.get("summary_text") or "")[:200], confidence=0.6
             )
 
         has_recognizable_shape = any(
             key in output for key in ("summary_text", "output", "content", "results", "items", "count")
         )
         if not has_recognizable_shape:
-            return EvidenceAssertion.unresolved(target=query, source=tool_name)
+            return EvidenceAssertion.unresolved(target=target, source=tool_name)
 
         summary = str(output.get("summary_text") or output.get("output") or output.get("content") or "")[:200]
-        return EvidenceAssertion.found(target=query, source=tool_name, summary=summary, confidence=0.8)
+        return EvidenceAssertion.found(target=target, source=tool_name, summary=summary, confidence=0.8)
 
     def _collect_evidence(
         self,

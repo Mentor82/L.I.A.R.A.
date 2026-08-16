@@ -536,6 +536,70 @@ class UnresolvedConnectorToolCoordinator:
         return results
 
 
+class CrossTargetToolCoordinator:
+    """Two tool calls investigating two different entities in one turn --
+    each output carries its own per-call "query" field, distinct from the
+    other and from the overall (multi-entity) request text. Nephy round 3:
+    proves the live EvidenceEngine no longer collapses both onto one shared
+    target via target=query. Uses the two real, judge/registry-recognized
+    tool names already exercised elsewhere in this file (web_search,
+    current_time) -- made-up tool names get blocked by the pre-action judge
+    before reaching this coordinator at all, which is an unrelated gate,
+    not the thing this test is about."""
+
+    async def execute_tools_parallel(self, requests):
+        from services.contracts import ToolExecutionResult
+
+        results = {}
+        for req in requests:
+            if req.tool_name == "web_search":
+                results[req.tool_name] = ToolExecutionResult(
+                    tool_name=req.tool_name,
+                    status="success",
+                    output={
+                        "kind": "web_discovery",
+                        "evidence_scope": "discovery",
+                        "query": "octocat github account",
+                        "candidate_count": 1,
+                        "results": [{"title": "octocat", "url": "https://github.com/octocat"}],
+                        "summary_text": "octocat: found",
+                    },
+                )
+            else:
+                results[req.tool_name] = ToolExecutionResult(
+                    tool_name=req.tool_name,
+                    status="success",
+                    output={
+                        "kind": "web_discovery",
+                        "evidence_scope": "discovery",
+                        "query": "definitely-nonexistent-user-xyz github account",
+                        "candidate_count": 0,
+                        "results": [],
+                        "summary_text": "No parseable search candidates were returned.",
+                    },
+                )
+        return results
+
+
+class CrossTargetOverclaimingInferenceGateway:
+    """Correctly reports the found entity, over-claims non-existence for
+    the entity that only has a search miss."""
+
+    async def infer(self, request):
+        from services.contracts import InferenceResult
+
+        return InferenceResult(
+            content=(
+                "The octocat account was found. "
+                "The definitely-nonexistent-user-xyz account does not exist."
+            ),
+            provider="mock",
+            model="mock-model",
+            ttft_ms=1.0,
+            gen_ms=1.0,
+        )
+
+
 class OverclaimingInferenceGateway:
     """LLM response asserts non-existence despite only a search miss."""
 
@@ -674,3 +738,74 @@ class TestEvidenceStateIntegrityFlow:
 
         assert response.validation_result["decision"] in {"block", "revise"}
         assert commit_calls == []
+
+    @pytest.mark.asyncio
+    async def test_two_entities_in_one_turn_stay_distinct_targets_through_the_real_pipeline(self, real_memory_layer):
+        """Nephy round 3: _classify_tool_output_state used to assign every
+        observation target=query (the whole, possibly multi-entity request
+        text), so two tool calls about two different entities in the same
+        turn silently collapsed onto one shared target -- merge_evidence_
+        assertions() would then treat them as the same thing, and the
+        validator's multi-target guard never saw more than one distinct
+        target. This spies on the real EvidenceEngine.analyze() call inside
+        a live Orchestrator.run() to prove the two observations now reach
+        the validator as two genuinely separate targets, not the previous
+        risk of one merged/collapsed target."""
+        orchestrator = Orchestrator(
+            tool_coordinator=CrossTargetToolCoordinator(),
+            inference_gateway=CrossTargetOverclaimingInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        captured = {}
+        real_analyze = orchestrator.evidence_engine.analyze
+
+        def _spy_analyze(*args, **kwargs):
+            result = real_analyze(*args, **kwargs)
+            captured["evidence_states"] = result.evidence_states
+            return result
+
+        orchestrator.evidence_engine.analyze = _spy_analyze
+
+        # OrchestratorRequest.tools_override is not actually wired into tool
+        # selection today (a pre-existing, unrelated gap: _select_tools
+        # accepts the param but never uses it, and the router's own
+        # RouterRequest.tools_override always reads a never-set
+        # `_effective_tools_override` attribute). Real tool selection goes
+        # through orchestrator.router's own query-based heuristic, which has
+        # no reason to pick two made-up tool names. Forcing the two tool
+        # calls this test needs by replacing _select_tools directly, so the
+        # test stays deterministic without depending on that routing path.
+        async def _select_two_tools(*args, **kwargs):
+            return ["web_search", "current_time"]
+
+        orchestrator._select_tools = _select_two_tools
+
+        # The pre-action judge fail-closed-blocks any action string it
+        # doesn't recognize (services/judge/engine.py's evaluate_pre_action
+        # only has profiles for "sys", "compute.run", "compute.generate" --
+        # a plain joined tool-name action like "web_search,current_time"
+        # has none and hits the default block). That gate is unrelated to
+        # this fix and pre-existing; disabling it here isolates what this
+        # test actually verifies -- target derivation through the real
+        # EvidenceEngine reaching the validator via a real Orchestrator.run().
+        orchestrator.judge_engine = None
+
+        request = OrchestratorRequest(
+            session_id="evidence-test-session-5",
+            run_id="evidence-test-run-5",
+            user_id="evidence-test-user",
+            query="Do octocat and definitely-nonexistent-user-xyz exist on GitHub?",
+        )
+
+        response = await orchestrator.run(request)
+
+        evidence_states = captured["evidence_states"]
+        assert len(evidence_states) == 2
+        targets = {item["target"] for item in evidence_states}
+        assert targets == {"octocat github account", "definitely-nonexistent-user-xyz github account"}
+        by_target = {item["target"]: item["state"] for item in evidence_states}
+        assert by_target["octocat github account"] == "found"
+        assert by_target["definitely-nonexistent-user-xyz github account"] == "not_found_in_search"
+
+        assert response.validation_result["decision"] in {"block", "revise"}
+        assert "negative_existence_without_evidence" in (response.validation_result.get("risk_flags") or [])
