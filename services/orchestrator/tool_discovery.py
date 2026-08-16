@@ -198,16 +198,25 @@ async def execute_tools(
     if hasattr(orchestrator, "executor") and hasattr(orchestrator.executor, "execute"):
         try:
             from services.contracts import ExecutorRequest
+            # Forward the router's own decision metadata (intent, retrieval_intent,
+            # ...) -- set moments earlier by select_tools() below -- so downstream
+            # parameter builders (e.g. _build_sys_parameters's retrieval_intent
+            # branch) actually see it instead of always getting an empty dict.
+            route_metadata: Dict[str, Any] = {}
+            if hasattr(orchestrator, "_last_route_debug") and isinstance(orchestrator._last_route_debug, dict):
+                route_metadata = dict(orchestrator._last_route_debug.get("metadata") or {})
             tracked_wsl_session_id = ""
             if hasattr(orchestrator, "_wsl_session_by_chat_session"):
                 tracked_wsl_session_id = orchestrator._wsl_session_by_chat_session.get(chat_session_id, "")
+            if tracked_wsl_session_id:
+                route_metadata["wsl_session_id"] = tracked_wsl_session_id
             exec_req = ExecutorRequest(
                 tool_names=selected_tools,
                 query=query,
                 session_id=chat_session_id,
                 run_id=run_id or "",
                 user_id=user_id or getattr(orchestrator, "_active_user_id", "") or "",
-                routing_metadata=({"wsl_session_id": tracked_wsl_session_id} if tracked_wsl_session_id else {}),
+                routing_metadata=route_metadata,
             )
             prepared = (
                 orchestrator.executor.prepare_tool_requests(exec_req)
