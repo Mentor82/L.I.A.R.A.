@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 
+from dataclasses import replace
+
 from services.judge.adapters import (
     evaluate_post_result_validator,
     evaluate_pre_action_simulation,
     evaluate_pre_action_sys,
     evaluate_pre_action_compute_generate,
     evaluate_pre_action_simulation_mode,
+    evaluate_pre_action_orientation,
+    evaluate_pre_action_plot_chart,
+    evaluate_pre_action_wsl_session,
 )
 from services.config import Settings
 from services.judge.adapters.reward_model_post_action_adapter import RewardModelPostActionAdapter
@@ -118,37 +123,73 @@ class JudgeEngine:
             return simulation_mode_decision
 
         # === Standard Pre-Action Profiles ===
-        # Only run if NOT in simulation mode
-        if context.action in {"sys", "/sys"}:
-            base_decision = evaluate_pre_action_sys(context)
+        # Only run if NOT in simulation mode.
+        #
+        # context.action is a comma-joined list of tool names when more than
+        # one tool is selected in a turn (create_judge_context_for_pre_action
+        # builds it as ",".join(tool_names)). Evaluating that combined string
+        # against single-action profiles below would never match any of
+        # them, so every multi-tool turn fell through to the default
+        # "no profile found" block regardless of which real, individually-
+        # profiled tools were actually involved. Splitting and evaluating
+        # each tool name against its own profile fixes that while keeping
+        # the fail-closed default for any genuinely unrecognized tool name.
+        sub_actions = [part.strip() for part in context.action.split(",") if part.strip()]
+        if not sub_actions:
+            sub_actions = [context.action]
+
+        decisions = [self._evaluate_single_action(context, action) for action in sub_actions]
+        return self._merge_all(decisions)
+
+    def _evaluate_single_action(self, context: JudgeContext, action: str) -> JudgeDecision:
+        """Route one tool name to its pre-action profile.
+
+        `context` carries the shared input/metadata for the whole turn;
+        only `action` is overridden per tool name. Known limitation: the
+        shared input payload (typically {"tools": [...], "query": ...} for
+        multi-tool turns) is not yet segmented per tool, so a profile
+        expecting its own tool-specific fields (e.g. sys's "command") will
+        still see the shared payload -- this only fixes the "no profile
+        found" dispatch gap, not per-tool input segmentation.
+        """
+        single_context = replace(context, action=action)
+
+        if action in {"sys", "/sys"}:
+            base_decision = evaluate_pre_action_sys(single_context)
             reward_decision = None
             if self.reward_pre_adapter is not None:
                 reward_decision = self.reward_pre_adapter.evaluate_with_reward_score(
-                    action=context.action,
+                    action=action,
                     input_data=context.input or {},
                     context=context.metadata or {},
                 )
             return self._merge_decisions(base_decision, reward_decision)
-        if context.action in {"compute.run", "compute/run"}:
-            base_decision = evaluate_pre_action_simulation(context)
+        if action in {"compute.run", "compute/run"}:
+            base_decision = evaluate_pre_action_simulation(single_context)
             reward_decision = None
             if self.reward_pre_adapter is not None:
                 reward_decision = self.reward_pre_adapter.evaluate_with_reward_score(
-                    action=context.action,
+                    action=action,
                     input_data=context.input or {},
                     context=context.metadata or {},
                 )
             return self._merge_decisions(base_decision, reward_decision)
-        if context.action in {"compute.generate", "compute/generate"}:
-            base_decision = evaluate_pre_action_compute_generate(context)
+        if action in {"compute.generate", "compute/generate"}:
+            base_decision = evaluate_pre_action_compute_generate(single_context)
             reward_decision = None
             if self.reward_pre_adapter is not None:
                 reward_decision = self.reward_pre_adapter.evaluate_with_reward_score(
-                    action=context.action,
+                    action=action,
                     input_data=context.input or {},
                     context=context.metadata or {},
                 )
             return self._merge_decisions(base_decision, reward_decision)
+        if action == "orientation":
+            return evaluate_pre_action_orientation(single_context)
+        if action == "plot_chart":
+            return evaluate_pre_action_plot_chart(single_context)
+        if action == "wsl_session":
+            return evaluate_pre_action_wsl_session(single_context)
 
         return JudgeDecision.block(
             confidence=0.0,
@@ -158,10 +199,42 @@ class JudgeEngine:
                     status="fail",
                     severity="high",
                     reason_code="judge.profile.not_found",
-                    message=f"No pre-action judge profile for action '{context.action}'.",
+                    message=f"No pre-action judge profile for action '{action}'.",
                 )
             ],
             issues=["No pre-action judge profile found for action."],
+        )
+
+    @staticmethod
+    def _merge_all(decisions: list[JudgeDecision]) -> JudgeDecision:
+        """Combine per-tool pre-action decisions: the most restrictive wins.
+
+        Mirrors _merge_decisions' rank-based reduction, generalized from one
+        optional secondary decision to N per-tool decisions from a
+        multi-tool turn.
+        """
+        if len(decisions) == 1:
+            return decisions[0]
+
+        winner = decisions[0]
+        for candidate in decisions[1:]:
+            if _DECISION_RANK[candidate.decision] > _DECISION_RANK[winner.decision]:
+                winner = candidate
+
+        checks = [check for decision in decisions for check in decision.checks]
+        issues = list(dict.fromkeys(issue for decision in decisions for issue in decision.issues))
+        confidence = min(float(decision.confidence) for decision in decisions)
+
+        return JudgeDecision(
+            decision=winner.decision,
+            passed=winner.passed,
+            confidence=confidence,
+            checks=checks,
+            issues=issues,
+            constraints=dict(winner.constraints or {}),
+            reason_code=winner.reason_code,
+            simulated=any(decision.simulated for decision in decisions),
+            next_action=winner.next_action,
         )
 
     def evaluate_post_result(self, context: JudgeContext) -> JudgeDecision:
