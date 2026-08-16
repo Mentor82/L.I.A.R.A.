@@ -9,3 +9,4 @@ transformers>=4.40,<5.0
 prompt-toolkit>=3.0,<4.0
 textual>=8.2.3
 neo4j>=5.14,<7.0
+imageio-ffmpeg==0.6.0
