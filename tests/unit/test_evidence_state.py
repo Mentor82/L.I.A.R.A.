@@ -477,18 +477,44 @@ class TestEvidenceTarget:
         target = EvidenceTarget(namespace="github", canonical_ref="https://github.com/octocat")
         assert target.merge_key() == ("github", "https://github.com/octocat")
 
-    def test_identifiers_includes_canonical_ref_display_name_and_aliases(self):
+    def test_whitespace_only_display_name_is_sanitized_to_empty(self):
+        """Nephy round 1 finding: a whitespace-only display_name (e.g. " ")
+        is truthy in Python and would otherwise pass the old "if value"
+        filter in identifiers(), then match almost any response window as
+        a literal substring. __post_init__ must strip it to empty at
+        construction time, not rely on identifiers() to catch it later."""
+        target = EvidenceTarget(namespace="github", canonical_ref="https://github.com/octocat", display_name="   ")
+        assert target.display_name == ""
+
+    def test_whitespace_only_and_non_string_aliases_are_dropped(self):
+        """Nephy round 1 finding: aliases must be sanitized (stripped,
+        filtered to non-empty real strings) at the contract boundary, not
+        left to every producer to independently get right."""
         target = EvidenceTarget(
             namespace="github",
             canonical_ref="https://github.com/octocat",
-            display_name="octocat",
+            aliases=frozenset({"  octocat  ", "   ", ""}),
+        )
+        assert target.aliases == frozenset({"octocat"})
+
+    def test_identifiers_includes_canonical_ref_and_aliases_but_not_display_name(self):
+        """User/Nephy decision, Issue #12 round 1: display_name is
+        presentation-only and must never carry claim-binding authority on
+        its own -- only canonical_ref and explicitly declared aliases do.
+        A connector that wants its display label to be bindable must add it
+        to aliases explicitly."""
+        target = EvidenceTarget(
+            namespace="github",
+            canonical_ref="https://github.com/octocat",
+            display_name="octocat display label",
             aliases=frozenset({"github account octocat"}),
         )
         assert target.identifiers() == frozenset(
-            {"https://github.com/octocat", "octocat", "github account octocat"}
+            {"https://github.com/octocat", "github account octocat"}
         )
+        assert "octocat display label" not in target.identifiers()
 
-    def test_identifiers_filters_empty_display_name(self):
+    def test_identifiers_with_no_aliases_is_just_canonical_ref(self):
         target = EvidenceTarget(namespace="github", canonical_ref="https://github.com/octocat")
         assert target.identifiers() == frozenset({"https://github.com/octocat"})
 

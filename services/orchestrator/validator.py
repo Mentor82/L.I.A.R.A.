@@ -549,7 +549,11 @@ class ResponseValidator:
         text_only_multi_target = len(text_only_distinct_targets) > 1
 
         def _canonical_identifiers(canonical: Dict[str, Any]) -> list[str]:
-            values = [str(canonical.get("canonical_ref") or ""), str(canonical.get("display_name") or "")]
+            # display_name is deliberately excluded (user/Nephy decision,
+            # Issue #12 round 1): it's presentation-only per the contract.
+            # Only canonical_ref and explicitly declared aliases carry
+            # claim-binding authority -- mirrors EvidenceTarget.identifiers().
+            values = [str(canonical.get("canonical_ref") or "")]
             aliases = canonical.get("aliases")
             if isinstance(aliases, (list, tuple, set, frozenset)):
                 values.extend(str(alias) for alias in aliases)

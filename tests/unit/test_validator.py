@@ -801,15 +801,17 @@ class TestEvidenceStateIntegrity:
     def test_canonical_confirmed_absent_for_a_does_not_authorize_claim_about_b(self):
         """Issue #12 scenario 3, canonical version: two canonical targets
         with unrelated identifiers -- a confirmed-absent A must not
-        authorize a claim naming only B."""
+        authorize a claim naming only B. display_name carries no
+        claim-binding authority (user/Nephy decision, round 1); "octocat"/
+        "torvalds" are declared as explicit aliases instead."""
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         target_b = {
             "namespace": "github", "canonical_ref": "https://github.com/torvalds",
-            "kind": "account", "display_name": "torvalds", "aliases": [],
+            "kind": "account", "display_name": "torvalds", "aliases": ["torvalds"],
         }
         context = ValidationContext(
             original_query="q",
@@ -836,11 +838,11 @@ class TestEvidenceStateIntegrity:
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         target_b = {
             "namespace": "github", "canonical_ref": "https://github.com/torvalds",
-            "kind": "account", "display_name": "torvalds", "aliases": [],
+            "kind": "account", "display_name": "torvalds", "aliases": ["torvalds"],
         }
         context = ValidationContext(
             original_query="q",
@@ -868,7 +870,7 @@ class TestEvidenceStateIntegrity:
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         context = ValidationContext(
             original_query="q",
@@ -888,19 +890,50 @@ class TestEvidenceStateIntegrity:
         assert result.checks["evidence_state_integrity"] == "fail"
         assert "negative_existence_without_evidence" in result.risk_flags
 
-    def test_same_display_name_different_namespace_never_cross_authorizes_claim(self):
+    def test_generic_display_name_alone_never_binds_a_claim(self):
+        """User/Nephy decision, Issue #12 round 1: display_name has no
+        claim-binding authority on its own. A generic display_name (e.g.
+        "Account") with only one canonical target in scope would otherwise
+        bind almost any claim with no ambiguity to catch it -- the
+        ambiguity-fail-closed check only helps when two or more targets
+        collide, so display_name must be excluded structurally, not rely
+        on that check. Since no alias is declared here, the claim finds no
+        canonical match at all and falls to the (empty) text-only pool."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "Account", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The Account does not exist.",
+            tools_used=["github_api"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "octocat", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+
+    def test_same_alias_different_namespace_never_cross_authorizes_claim(self):
         """Issue #12 scenario 5 / Nephy mandate 4a, validator half: two
-        canonical targets sharing an identical display_name across
+        canonical targets sharing an identical explicit alias across
         different namespaces must both match in step 1 -- which makes the
         claim ambiguous, not resolvable to either one."""
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "ref-a",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         target_b = {
             "namespace": "gitlab", "canonical_ref": "ref-b",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         context = ValidationContext(
             original_query="q",
@@ -921,18 +954,18 @@ class TestEvidenceStateIntegrity:
         assert "negative_existence_without_evidence" in result.risk_flags
 
     def test_confirmed_target_a_never_authorizes_claim_about_similar_looking_target_b(self):
-        """Nephy mandate 4c: A's identifier ("octocat") is a literal
-        substring of B's ("octocat-enterprise"), so both match in the
-        response window -- ambiguous, must fail closed rather than let A's
+        """Nephy mandate 4c: A's alias ("octocat") is a literal substring
+        of B's ("octocat-enterprise"), so both match in the response
+        window -- ambiguous, must fail closed rather than let A's
         confirmation silently back a claim actually about B."""
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         target_b = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat-enterprise",
-            "kind": "account", "display_name": "octocat-enterprise", "aliases": [],
+            "kind": "account", "display_name": "octocat-enterprise", "aliases": ["octocat-enterprise"],
         }
         context = ValidationContext(
             original_query="q",
@@ -962,11 +995,11 @@ class TestEvidenceStateIntegrity:
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "https://github.com/torvalds",
-            "kind": "account", "display_name": "torvalds", "aliases": [],
+            "kind": "account", "display_name": "torvalds", "aliases": ["torvalds"],
         }
         target_b = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         context = ValidationContext(
             original_query="q",
@@ -992,14 +1025,14 @@ class TestEvidenceStateIntegrity:
         have incorrectly matched a canonical assertion via a shared word
         in its free-text target field, and assert the canonical-aware
         result stays strict instead: target A's canonical identifiers
-        (its actual identity) don't mention 'enterprise' at all, even
-        though its free-text target string happens to. A must not
-        authorize a claim about the unrelated text-only target B, which
-        also lacks the required state."""
+        (its actual identity -- just the "octocat" alias) don't mention
+        'enterprise' at all, even though its free-text target string
+        happens to. A must not authorize a claim about the unrelated
+        text-only target B, which also lacks the required state."""
         validator = ResponseValidator(strict_mode=False)
         target_a = {
             "namespace": "github", "canonical_ref": "https://github.com/octocat",
-            "kind": "account", "display_name": "octocat", "aliases": [],
+            "kind": "account", "display_name": "octocat", "aliases": ["octocat"],
         }
         context = ValidationContext(
             original_query="q",
@@ -1012,7 +1045,7 @@ class TestEvidenceStateIntegrity:
                     "target": "octocat enterprise support",  # free-text target shares the "enterprise" token
                     "source": "github_api",
                     "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
-                    "canonical_target": target_a,  # but its real identity fields don't mention "enterprise"
+                    "canonical_target": target_a,  # but its real identity (alias) doesn't mention "enterprise"
                 },
                 {"state": "not_found_in_search", "target": "enterprise", "source": "web_search"},
             ],

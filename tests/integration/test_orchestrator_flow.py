@@ -607,6 +607,10 @@ class CanonicalCrossTargetToolCoordinator:
                         "canonical_ref": "https://github.com/octocat",
                         "canonical_namespace": "github_user",
                         "canonical_display_name": "octocat account",
+                        # display_name carries no claim-binding authority
+                        # (user/Nephy decision, Issue #12 round 1) -- the
+                        # response text must match an explicit alias instead.
+                        "canonical_aliases": ["octocat account"],
                     },
                 )
             else:
@@ -623,6 +627,7 @@ class CanonicalCrossTargetToolCoordinator:
                         "canonical_ref": "https://github.com/octocat/Hello-World",
                         "canonical_namespace": "github_repo",
                         "canonical_display_name": "octocat Hello World repo",
+                        "canonical_aliases": ["octocat Hello World repo"],
                     },
                 )
         return results

@@ -153,6 +153,22 @@ class EvidenceTarget:
         if not self.canonical_ref:
             raise ValueError("EvidenceTarget requires a non-empty canonical_ref")
 
+        # Nephy round 1: identifiers() feeds the validator's literal
+        # substring claim-binding match -- a whitespace-only display_name
+        # or alias (e.g. " ") would otherwise pass the old "if value"
+        # truthiness filter (non-empty strings are truthy) and then match
+        # almost any response window, letting an unrelated claim bind to
+        # this target. Sanitize here, at the contract boundary, rather than
+        # relying on every producer (the engine's _coerce_aliases included)
+        # to independently get this right -- defense in depth, not the only
+        # line of defense.
+        self.display_name = (self.display_name or "").strip()
+        self.aliases = frozenset(
+            stripped
+            for alias in self.aliases
+            if isinstance(alias, str) and (stripped := alias.strip())
+        )
+
     def merge_key(self) -> tuple[str, str]:
         """Exact-equality aggregation key. Never prefix/substring matching --
         this is what keeps parent/child resources (an account vs. one of its
@@ -162,12 +178,24 @@ class EvidenceTarget:
         return (self.namespace, self.canonical_ref)
 
     def identifiers(self) -> frozenset[str]:
-        """All strings that count as referring to this target: its
-        canonical_ref, its display_name, and its explicitly declared
-        aliases. Used for whole-string (never fragment/token) claim-binding
-        matches -- see ResponseValidator._check_evidence_state_integrity.
+        """All strings that carry claim-binding authority for this target:
+        its canonical_ref and its explicitly declared aliases. Used for
+        whole-string (never fragment/token) claim-binding matches -- see
+        ResponseValidator._check_evidence_state_integrity.
+
+        display_name is deliberately excluded (user/Nephy decision,
+        Issue #12 round 1): the contract defines display_name as
+        presentation-only, and letting it silently carry identity authority
+        would blur that line -- a generic display_name (e.g. "Account")
+        with only one canonical target in scope could otherwise bind an
+        unrelated claim with no ambiguity to catch it (the ambiguity-fail-
+        closed check in the validator only helps when two or more targets
+        collide; a single generic display_name never triggers it). If a
+        connector's presentation label should also be claim-bindable, it
+        must be explicitly added to `aliases` too -- an explicit assertion
+        of identity, not an implicit one borrowed from a UI label.
         """
-        candidates = {self.canonical_ref, self.display_name} | self.aliases
+        candidates = {self.canonical_ref} | self.aliases
         return frozenset(value for value in candidates if value)
 
     def to_dict(self) -> dict[str, Any]:
@@ -413,8 +441,12 @@ def _merge_canonical_targets(a: EvidenceTarget, b: EvidenceTarget) -> EvidenceTa
     (namespace, canonical_ref) identity (that's the precondition for this
     function being called at all -- see _group_key), so their
     independently-declared aliases can be combined without inferring
-    anything new. display_name prefers a's (the winning side), falling back
-    to b's when a's is empty, rather than being dropped.
+    anything new. `kind`/`display_name` prefer `a`'s value, falling back to
+    `b`'s when `a`'s is empty. Callers must pass the actual state-winner as
+    `a` when one exists (see _merge_pair) -- calling this with a fixed
+    (existing, new) order regardless of which one wins the state would make
+    the preferred display_name/kind track the wrong side whenever `new`
+    wins (Nephy round 1 finding).
     """
     return EvidenceTarget(
         namespace=a.namespace,
@@ -450,13 +482,14 @@ def _merge_pair(existing: EvidenceAssertion, new: EvidenceAssertion) -> Evidence
     conflict -- since two assertions sharing a merge_key() have already
     explicitly agreed on the same identity.
     """
-    merged_identity: EvidenceTarget | None = None
-    if existing.canonical_target is not None and new.canonical_target is not None:
-        merged_identity = _merge_canonical_targets(existing.canonical_target, new.canonical_target)
+    both_canonical = existing.canonical_target is not None and new.canonical_target is not None
 
     if existing.state == EvidenceState.CONFLICTING_EVIDENCE:
-        if merged_identity is not None:
-            existing.canonical_target = merged_identity
+        # No state-winner to speak of here -- existing stays the result as-is,
+        # just with its identity's aliases enriched (existing-first order,
+        # consistent with it being the side that's kept).
+        if both_canonical:
+            existing.canonical_target = _merge_canonical_targets(existing.canonical_target, new.canonical_target)
         return existing
 
     existing_confirmed = existing.state in _CONFIRMATION_REQUIRED_STATES
@@ -465,6 +498,12 @@ def _merge_pair(existing: EvidenceAssertion, new: EvidenceAssertion) -> Evidence
     is_existence_contradiction = frozenset({existing.state, new.state}) in _EXISTENCE_CONTRADICTING_PAIRS
 
     if is_confirmed_disagreement or is_existence_contradiction:
+        # Neither side "wins" in a conflict -- existing-first order here is
+        # arbitrary but consistent with the summary text below, which also
+        # states existing before new.
+        merged_identity = (
+            _merge_canonical_targets(existing.canonical_target, new.canonical_target) if both_canonical else None
+        )
         conflicting = EvidenceAssertion.conflicting_evidence(
             target=new.target,
             source=f"{existing.source}+{new.source}",
@@ -488,10 +527,13 @@ def _merge_pair(existing: EvidenceAssertion, new: EvidenceAssertion) -> Evidence
         # its aliases (if any) still get folded in below.
         winner, loser, decision = existing, new, "alias_union"
 
-    if merged_identity is not None:
-        winner.canonical_target = merged_identity
+    if both_canonical:
+        # winner first (Nephy round 1 finding): _merge_canonical_targets'
+        # display_name/kind preference must track whichever side actually
+        # won the state, not always "existing" regardless of outcome.
+        winner.canonical_target = _merge_canonical_targets(winner.canonical_target, loser.canonical_target)
         winner.metadata["canonicalization"] = {
-            "merge_key": f"{merged_identity.namespace}:{merged_identity.canonical_ref}",
+            "merge_key": f"{winner.canonical_target.namespace}:{winner.canonical_target.canonical_ref}",
             "decision": decision,
             "losing_source": loser.source,
         }
