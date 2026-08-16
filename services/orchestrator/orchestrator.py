@@ -1074,8 +1074,8 @@ class Orchestrator:
         return is_safe_for_context_upsert(text)
 
     @staticmethod
-    def _relation_node_key(text: str) -> str:
-        return relation_node_key(text)
+    def _relation_node_key(prefix: str, text: str) -> str:
+        return relation_node_key(prefix, text)
 
     # Tool Discovery Delegation
     async def _select_tools(self, query: str = "", tools_override: Optional[List[str]] = None, **kwargs: Any) -> List[str]:
