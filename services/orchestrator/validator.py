@@ -526,16 +526,85 @@ class ResponseValidator:
         # against, so the cheaper "is the state present at all" check is
         # kept (also avoids false positives when the LLM doesn't literally
         # restate the target's exact identifier next to the claim).
-        distinct_targets = {str(item.get("target") or "") for item in assertions if item.get("target")}
-        multi_target = len(distinct_targets) > 1
+        #
+        # Issue #12: assertions carrying a canonical_target get a strictly
+        # stronger, two-step check instead of the free-text fallback below --
+        # target resolution and state authorization are kept as separate
+        # steps on purpose (Nephy plan-review correction). Restricting the
+        # identifier search to assertions that already carry the required
+        # state would silently exclude the claim's real target from
+        # consideration and let an unrelated confirmed target's identifier
+        # win by default -- reopening the exact cross-target leak this
+        # method exists to close, one layer deeper. So step 1 below (which
+        # canonical target does this claim refer to?) is evaluated across
+        # every canonical-bearing assertion regardless of state; only once
+        # a claim is bound to exactly one target does step 2 ask whether
+        # that specific target carries the required state -- with no
+        # fallback to a different target's state, and no fallback to the
+        # legacy text-target check either.
+        text_only_assertions = [item for item in assertions if item.get("canonical_target") is None]
+        text_only_distinct_targets = {
+            str(item.get("target") or "") for item in text_only_assertions if item.get("target")
+        }
+        text_only_multi_target = len(text_only_distinct_targets) > 1
+
+        def _canonical_identifiers(canonical: Dict[str, Any]) -> list[str]:
+            values = [str(canonical.get("canonical_ref") or ""), str(canonical.get("display_name") or "")]
+            aliases = canonical.get("aliases")
+            if isinstance(aliases, (list, tuple, set, frozenset)):
+                values.extend(str(alias) for alias in aliases)
+            return [value.lower() for value in values if value]
 
         def _claim_supported_by_target(match: "re.Match[str]", required_state: str, window: int = 100) -> bool:
-            if not multi_target:
-                return required_state in states
             s_start, s_end = match.span()
             lo, hi = max(0, s_start - window), min(len(response), s_end + window)
             nearby = response[lo:hi].lower()
+
+            # Step 1: which canonical target (if any) does this claim refer
+            # to? Whole-string (never fragment/token) identifier matching,
+            # independent of `required_state` -- see the module note above.
+            canonical_matches: dict[tuple[str, str], Dict[str, Any]] = {}
             for item in assertions:
+                canonical = item.get("canonical_target")
+                if not isinstance(canonical, dict):
+                    continue
+                namespace = str(canonical.get("namespace") or "")
+                canonical_ref = str(canonical.get("canonical_ref") or "")
+                if not namespace or not canonical_ref:
+                    continue
+                key = (namespace, canonical_ref)
+                if key in canonical_matches:
+                    continue
+                if any(identifier in nearby for identifier in _canonical_identifiers(canonical)):
+                    canonical_matches[key] = canonical
+
+            if len(canonical_matches) > 1:
+                return False  # ambiguous overlap -- fail closed, no fallback
+
+            if len(canonical_matches) == 1:
+                (bound_key,) = canonical_matches.keys()
+                # Step 2: does THAT specific target carry the required
+                # state? No fallback to a different target's state, and no
+                # fallback to the text heuristic below, even if this target
+                # simply lacks the required state.
+                for item in assertions:
+                    canonical = item.get("canonical_target")
+                    if not isinstance(canonical, dict):
+                        continue
+                    key = (str(canonical.get("namespace") or ""), str(canonical.get("canonical_ref") or ""))
+                    if key == bound_key and str(item.get("state") or "") == required_state:
+                        return True
+                return False
+
+            # Step 3: no canonical target was identified at all -- fall back
+            # to the pre-#12 tokenized text-target check, restricted to
+            # unresolved/text-only assertions so a canonical-bearing
+            # assertion can't "re-enter" the check through its legacy free-
+            # text `target` string (step 1 already determined this claim
+            # isn't about any known canonical target).
+            if not text_only_multi_target:
+                return required_state in {str(item.get("state") or "") for item in text_only_assertions}
+            for item in text_only_assertions:
                 if str(item.get("state") or "") != required_state:
                     continue
                 target = str(item.get("target") or "").strip().lower()

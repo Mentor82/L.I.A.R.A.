@@ -2,6 +2,14 @@
 
 This module intentionally does not generate final user wording.
 It only builds an evidence package consumed by the answer layer.
+
+Canonical target identity (Issue #12): _classify_tool_output_state attaches
+an EvidenceTarget to an assertion only when the tool output explicitly
+carries both a canonical_ref and a canonical_namespace field (see
+_resolve_canonical_target) -- never derived from tool_name, the free-text
+query, or any other heuristic. No real connector in this repo populates
+these fields as of this writing; only synthetic test tool-outputs exercise
+this path today. Real connectors may adopt the convention incrementally.
 """
 
 from __future__ import annotations
@@ -10,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from services.contracts.evidence_state import EvidenceAssertion, merge_evidence_assertions
+from services.contracts.evidence_state import EvidenceAssertion, EvidenceTarget, merge_evidence_assertions
 
 
 FACTUAL_QUERY_RE = re.compile(
@@ -344,8 +352,78 @@ class EvidenceEngine:
         return query
 
     @staticmethod
+    def _coerce_aliases(value: Any) -> frozenset[str]:
+        """Turn a tool-output "canonical_aliases" value into a clean
+        frozenset of strings.
+
+        A naive "iterable -> frozenset" would silently explode a plain
+        string like "octocat" into {"o", "c", "t", ...}, since str is
+        itself iterable -- a single string must be treated as ONE singleton
+        alias, never iterated character-by-character. A list/tuple/set/
+        frozenset of strings is taken element-wise. Every alias is stripped
+        of whitespace and empty results are dropped; anything else (None,
+        non-string elements) is ignored rather than raising, since this is
+        parsing untrusted tool-output data, not validating a caller's
+        typed contract.
+        """
+        if value is None:
+            return frozenset()
+        if isinstance(value, str):
+            candidates: Any = [value]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            candidates = value
+        else:
+            return frozenset()
+        return frozenset(
+            stripped
+            for item in candidates
+            if isinstance(item, str) and (stripped := item.strip())
+        )
+
+    @staticmethod
+    def _resolve_canonical_target(output: Any) -> EvidenceTarget | None:
+        """Attach a stronger, connector-verified identity to an assertion
+        when the tool output explicitly provides one (Issue #12).
+
+        Returns None (the explicit "unresolved identity" state) unless
+        `output` is a dict carrying BOTH a non-empty "canonical_ref" and a
+        non-empty "canonical_namespace" -- never derives one field from the
+        other, or from `tool_name`, since that would be guessing rather
+        than using a real connector-native identifier. This is a generic,
+        connector-agnostic convention: as of this writing no real connector
+        (web_discovery, web_lookup, generic sys-style output) populates
+        these fields -- only synthetic test tool-outputs exercise this path,
+        mirroring the *_CONFIRMED-states-have-no-automatic-producer
+        precedent already established for EvidenceState in Issue #8 Phase 1.
+        """
+        if not isinstance(output, dict):
+            return None
+        canonical_ref = str(output.get("canonical_ref") or "").strip()
+        canonical_namespace = str(output.get("canonical_namespace") or "").strip()
+        if not canonical_ref or not canonical_namespace:
+            return None
+        return EvidenceTarget(
+            namespace=canonical_namespace,
+            canonical_ref=canonical_ref,
+            display_name=str(output.get("canonical_display_name") or "").strip(),
+            aliases=EvidenceEngine._coerce_aliases(output.get("canonical_aliases")),
+        )
+
+    @staticmethod
     def _classify_tool_output_state(tool_name: str, output: Any, query: str) -> EvidenceAssertion:
-        """Classify one tool output into an EvidenceAssertion.
+        """Classify one tool output into an EvidenceAssertion, then attach a
+        canonical identity (Issue #12) when the output explicitly provides
+        one -- see _resolve_canonical_target.
+        """
+        assertion = EvidenceEngine._classify_by_shape(tool_name, output, query)
+        canonical_target = EvidenceEngine._resolve_canonical_target(output)
+        if canonical_target is not None:
+            assertion.canonical_target = canonical_target
+        return assertion
+
+    @staticmethod
+    def _classify_by_shape(tool_name: str, output: Any, query: str) -> EvidenceAssertion:
+        """Classify one tool output into an EvidenceAssertion by shape alone.
 
         Never promotes a search-miss or a malformed/failed tool output into
         a confirmed-absence state -- only an explicit EvidenceConfirmation

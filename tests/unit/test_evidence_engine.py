@@ -193,3 +193,132 @@ def test_tool_output_without_its_own_query_field_falls_back_to_overall_query():
     )
     assert len(result.evidence_states) == 1
     assert result.evidence_states[0]["target"] == "octocat GitHub account"
+
+
+# ---------------------------------------------------------------------------
+# Issue #12: canonical target identity attached to classified assertions
+# ---------------------------------------------------------------------------
+
+def test_canonical_ref_and_namespace_attach_evidence_target():
+    result = _analyze_tool_outputs(
+        {
+            "github_api": {
+                "status": "success",
+                "summary_text": "octocat: found",
+                "canonical_ref": "https://github.com/octocat",
+                "canonical_namespace": "github",
+            }
+        }
+    )
+    assert len(result.evidence_states) == 1
+    canonical = result.evidence_states[0]["canonical_target"]
+    assert canonical is not None
+    assert canonical["namespace"] == "github"
+    assert canonical["canonical_ref"] == "https://github.com/octocat"
+
+
+def test_canonical_ref_without_namespace_stays_unresolved():
+    """Nephy mandate 2: never guess one field from the other."""
+    result = _analyze_tool_outputs(
+        {"github_api": {"status": "success", "summary_text": "octocat: found", "canonical_ref": "https://github.com/octocat"}}
+    )
+    assert result.evidence_states[0]["canonical_target"] is None
+
+
+def test_canonical_namespace_without_ref_stays_unresolved():
+    result = _analyze_tool_outputs(
+        {"github_api": {"status": "success", "summary_text": "octocat: found", "canonical_namespace": "github"}}
+    )
+    assert result.evidence_states[0]["canonical_target"] is None
+
+
+def test_canonical_aliases_are_captured_from_the_declaring_observation():
+    result = _analyze_tool_outputs(
+        {
+            "github_api": {
+                "status": "success",
+                "summary_text": "octocat: found",
+                "canonical_ref": "https://github.com/octocat",
+                "canonical_namespace": "github",
+                "canonical_aliases": ["octocat", "github account octocat"],
+            }
+        }
+    )
+    assert set(result.evidence_states[0]["canonical_target"]["aliases"]) == {"octocat", "github account octocat"}
+
+
+def test_single_string_canonical_alias_is_a_singleton_not_exploded_into_characters():
+    """Nephy plan-review correction, hardening point 1: a naive
+    'iterable -> frozenset' would explode a plain string character-by-
+    character, since str is itself iterable."""
+    result = _analyze_tool_outputs(
+        {
+            "github_api": {
+                "status": "success",
+                "summary_text": "octocat: found",
+                "canonical_ref": "https://github.com/octocat",
+                "canonical_namespace": "github",
+                "canonical_aliases": "octocat",
+            }
+        }
+    )
+    assert result.evidence_states[0]["canonical_target"]["aliases"] == ["octocat"]
+
+
+def test_existing_classification_branches_unchanged_without_canonical_fields():
+    """Regression anchor for the _classify_tool_output_state rename/wrap:
+    pre-existing scenarios without any canonical_ref field must classify
+    identically to before Issue #12."""
+    search_miss = _analyze_tool_outputs(
+        {
+            "web_search": {
+                "kind": "web_discovery",
+                "evidence_scope": "discovery",
+                "candidate_count": 0,
+                "results": [],
+            }
+        }
+    )
+    assert search_miss.evidence_states[0]["state"] == "not_found_in_search"
+    assert search_miss.evidence_states[0]["canonical_target"] is None
+
+    access_denied = _analyze_tool_outputs({"github_api": {"status": "denied", "error": "403 Forbidden"}})
+    assert access_denied.evidence_states[0]["state"] == "access_denied"
+    assert access_denied.evidence_states[0]["canonical_target"] is None
+
+    malformed = _analyze_tool_outputs({"browser_connector": {"unexpected_field": "garbage"}})
+    assert malformed.evidence_states[0]["state"] == "unresolved"
+    assert malformed.evidence_states[0]["canonical_target"] is None
+
+
+def test_two_tool_calls_with_distinct_canonical_ref_stay_separate_targets():
+    """Mirrors test_two_tool_calls_with_distinct_query_fields_stay_separate_targets,
+    but proving separation via canonical_ref instead of the free-text query
+    field -- the parent/child case (account vs. repo) survives classify+merge."""
+    result = _analyze_tool_outputs(
+        {
+            "web_search_account": {
+                "kind": "web_discovery",
+                "evidence_scope": "discovery",
+                "query": "octocat",
+                "candidate_count": 1,
+                "results": [{"title": "octocat", "url": "https://github.com/octocat"}],
+                "canonical_ref": "https://github.com/octocat",
+                "canonical_namespace": "github_user",
+            },
+            "web_search_repo": {
+                "kind": "web_discovery",
+                "evidence_scope": "discovery",
+                "query": "octocat/Hello-World",
+                "candidate_count": 0,
+                "results": [],
+                "canonical_ref": "https://github.com/octocat/Hello-World",
+                "canonical_namespace": "github_repo",
+            },
+        },
+        query="Does octocat and definitely-nonexistent-octocat-repo exist on GitHub",
+    )
+    assert len(result.evidence_states) == 2
+    by_ref = {item["canonical_target"]["canonical_ref"]: item["state"] for item in result.evidence_states}
+    assert by_ref["https://github.com/octocat"] == "found"
+    assert by_ref["https://github.com/octocat/Hello-World"] == "not_found_in_search"

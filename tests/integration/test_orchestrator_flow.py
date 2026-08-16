@@ -581,6 +581,72 @@ class CrossTargetToolCoordinator:
         return results
 
 
+class CanonicalCrossTargetToolCoordinator:
+    """Issue #12: two tool calls investigating an account and one of its
+    repositories in one turn -- deliberately overlapping "octocat"
+    substrings, each carrying an explicit canonical_ref/canonical_namespace
+    so the real EvidenceEngine can attach a resolved EvidenceTarget instead
+    of relying on the free-text query field alone."""
+
+    async def execute_tools_parallel(self, requests):
+        from services.contracts import ToolExecutionResult
+
+        results = {}
+        for req in requests:
+            if req.tool_name == "web_search":
+                results[req.tool_name] = ToolExecutionResult(
+                    tool_name=req.tool_name,
+                    status="success",
+                    output={
+                        "kind": "web_discovery",
+                        "evidence_scope": "discovery",
+                        "query": "octocat account",
+                        "candidate_count": 1,
+                        "results": [{"title": "octocat", "url": "https://github.com/octocat"}],
+                        "summary_text": "octocat: found",
+                        "canonical_ref": "https://github.com/octocat",
+                        "canonical_namespace": "github_user",
+                        "canonical_display_name": "octocat account",
+                    },
+                )
+            else:
+                results[req.tool_name] = ToolExecutionResult(
+                    tool_name=req.tool_name,
+                    status="success",
+                    output={
+                        "kind": "web_discovery",
+                        "evidence_scope": "discovery",
+                        "query": "octocat Hello World repo",
+                        "candidate_count": 0,
+                        "results": [],
+                        "summary_text": "No parseable search candidates were returned.",
+                        "canonical_ref": "https://github.com/octocat/Hello-World",
+                        "canonical_namespace": "github_repo",
+                        "canonical_display_name": "octocat Hello World repo",
+                    },
+                )
+        return results
+
+
+class CanonicalOverclaimingInferenceGateway:
+    """Correctly reports the found account, over-claims non-existence for
+    the repository that only has a search miss."""
+
+    async def infer(self, request):
+        from services.contracts import InferenceResult
+
+        return InferenceResult(
+            content=(
+                "The octocat account was found. "
+                "The octocat Hello World repo does not exist."
+            ),
+            provider="mock",
+            model="mock-model",
+            ttft_ms=1.0,
+            gen_ms=1.0,
+        )
+
+
 class CrossTargetOverclaimingInferenceGateway:
     """Correctly reports the found entity, over-claims non-existence for
     the entity that only has a search miss."""
@@ -806,6 +872,72 @@ class TestEvidenceStateIntegrityFlow:
         by_target = {item["target"]: item["state"] for item in evidence_states}
         assert by_target["octocat github account"] == "found"
         assert by_target["definitely-nonexistent-user-xyz github account"] == "not_found_in_search"
+
+        assert response.validation_result["decision"] in {"block", "revise"}
+        assert "negative_existence_without_evidence" in (response.validation_result.get("risk_flags") or [])
+
+    @pytest.mark.asyncio
+    async def test_canonical_identity_survives_the_real_pipeline_and_keeps_parent_child_distinct(self, real_memory_layer):
+        """Issue #12: proves the canonical target identity contract reaches
+        the validator through a real Orchestrator.run(), not just isolated
+        unit tests. An account and one of its repositories deliberately
+        share the "octocat" substring; without a canonical identity they
+        would merely happen to stay separate because their free-text query
+        strings differ (Issue #8 round 3's mechanism). Here they carry an
+        explicit canonical_ref/canonical_namespace instead, and must stay
+        distinct because of that -- not by accident of text -- while an
+        overclaiming response about the repository still gets blocked."""
+        orchestrator = Orchestrator(
+            tool_coordinator=CanonicalCrossTargetToolCoordinator(),
+            inference_gateway=CanonicalOverclaimingInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        captured = {}
+        real_analyze = orchestrator.evidence_engine.analyze
+
+        def _spy_analyze(*args, **kwargs):
+            result = real_analyze(*args, **kwargs)
+            captured["evidence_states"] = result.evidence_states
+            return result
+
+        orchestrator.evidence_engine.analyze = _spy_analyze
+
+        # Same pre-existing, unrelated bypasses as the round-3 test above:
+        # tools_override is now wired (Issue #14), but "web_search"/
+        # "current_time" are still not real registered tools, so the
+        # pre-action judge (Issue #13's fix only added profiles for the
+        # real registry entries) would still fail-closed-block them.
+        async def _select_two_tools(*args, **kwargs):
+            return ["web_search", "current_time"]
+
+        orchestrator._select_tools = _select_two_tools
+        orchestrator.judge_engine = None
+
+        request = OrchestratorRequest(
+            session_id="evidence-test-session-6",
+            run_id="evidence-test-run-6",
+            user_id="evidence-test-user",
+            # No "hello" here on purpose -- CASUAL_QUERY_RE in evidence_engine.py
+            # treats it as a greeting and short-circuits to required_evidence_level
+            # "low", which never selects "tool_output" as an evidence source.
+            query="Do octocat and octocat's sample repository exist on GitHub?",
+        )
+
+        response = await orchestrator.run(request)
+
+        evidence_states = captured["evidence_states"]
+        assert len(evidence_states) == 2
+        canonical_keys = {
+            (item["canonical_target"]["namespace"], item["canonical_target"]["canonical_ref"])
+            for item in evidence_states
+        }
+        assert canonical_keys == {
+            ("github_user", "https://github.com/octocat"),
+            ("github_repo", "https://github.com/octocat/Hello-World"),
+        }
+        by_ref = {item["canonical_target"]["canonical_ref"]: item["state"] for item in evidence_states}
+        assert by_ref["https://github.com/octocat"] == "found"
+        assert by_ref["https://github.com/octocat/Hello-World"] == "not_found_in_search"
 
         assert response.validation_result["decision"] in {"block", "revise"}
         assert "negative_existence_without_evidence" in (response.validation_result.get("risk_flags") or [])

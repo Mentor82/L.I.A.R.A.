@@ -169,6 +169,7 @@ from .evidence_state import (
     EvidenceAssertion,
     EvidenceConfirmation,
     EvidenceState,
+    EvidenceTarget,
     merge_evidence_assertions,
 )
 
@@ -237,6 +238,7 @@ __all__ = [
     "ConfirmationKind",
     "EvidenceConfirmation",
     "EvidenceAssertion",
+    "EvidenceTarget",
     "merge_evidence_assertions",
     "InputMoodProfile",
     "InputEnvironmentProfile",

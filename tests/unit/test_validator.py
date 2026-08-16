@@ -795,3 +795,228 @@ class TestEvidenceStateIntegrity:
         result = validator.validate(context)
         assert result.checks["evidence_state_integrity"] == "fail"
         assert "unsupported_state_promotion" in result.risk_flags
+
+    # -- Issue #12: canonical target identity claim-binding ---------------
+
+    def test_canonical_confirmed_absent_for_a_does_not_authorize_claim_about_b(self):
+        """Issue #12 scenario 3, canonical version: two canonical targets
+        with unrelated identifiers -- a confirmed-absent A must not
+        authorize a claim naming only B."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        target_b = {
+            "namespace": "github", "canonical_ref": "https://github.com/torvalds",
+            "kind": "account", "display_name": "torvalds", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The torvalds account does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "octocat", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+                {"state": "not_found_in_search", "target": "torvalds", "source": "web_search", "canonical_target": target_b},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+        assert result.decision == "block"
+
+    def test_canonical_confirmed_still_authorizes_its_own_targets_claim(self):
+        """Sanity control: the same evidence_states as above, but the claim
+        names A (the confirmed target) -- must pass."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        target_b = {
+            "namespace": "github", "canonical_ref": "https://github.com/torvalds",
+            "kind": "account", "display_name": "torvalds", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The octocat account does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "octocat", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+                {"state": "not_found_in_search", "target": "torvalds", "source": "web_search", "canonical_target": target_b},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "pass"
+        assert "negative_existence_without_evidence" not in result.risk_flags
+
+    def test_missing_canonical_target_falls_back_to_text_heuristic_not_wildcard_match(self):
+        """Nephy mandate 4b, validator half: an assertion with
+        canonical_target=None must never be treated as automatically
+        matching any claim -- it stays confined to the (already narrow)
+        text-only fallback, restricted to other text-only assertions."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The unrelated-resource does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "octocat", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+                {"state": "not_found_in_search", "target": "unrelated-resource", "source": "web_search"},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+
+    def test_same_display_name_different_namespace_never_cross_authorizes_claim(self):
+        """Issue #12 scenario 5 / Nephy mandate 4a, validator half: two
+        canonical targets sharing an identical display_name across
+        different namespaces must both match in step 1 -- which makes the
+        claim ambiguous, not resolvable to either one."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "ref-a",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        target_b = {
+            "namespace": "gitlab", "canonical_ref": "ref-b",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The octocat account does not exist.",
+            tools_used=["github_api", "gitlab_api"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "octocat (github)", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+                {"state": "not_found_in_search", "target": "octocat (gitlab)", "source": "gitlab_api", "canonical_target": target_b},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+
+    def test_confirmed_target_a_never_authorizes_claim_about_similar_looking_target_b(self):
+        """Nephy mandate 4c: A's identifier ("octocat") is a literal
+        substring of B's ("octocat-enterprise"), so both match in the
+        response window -- ambiguous, must fail closed rather than let A's
+        confirmation silently back a claim actually about B."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        target_b = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat-enterprise",
+            "kind": "account", "display_name": "octocat-enterprise", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The octocat-enterprise account does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "octocat", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+                {"state": "not_found_in_search", "target": "octocat-enterprise", "source": "web_search", "canonical_target": target_b},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+        assert result.decision == "block"
+
+    def test_claim_bound_to_target_without_required_state_does_not_fall_back_to_a_different_confirmed_target(self):
+        """Nephy plan-review correction, direct regression test: only B's
+        identifier appears near the claim; A's does not. B lacks the
+        confirmed state; A (elsewhere in evidence_states) has it. The claim
+        must fail -- once bound to B in step 1, only B's own state may
+        authorize it, never A's."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/torvalds",
+            "kind": "account", "display_name": "torvalds", "aliases": [],
+        }
+        target_b = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The octocat account does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed", "target": "torvalds", "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,
+                },
+                {"state": "not_found_in_search", "target": "octocat", "source": "web_search", "canonical_target": target_b},
+                {"state": "not_found_in_search", "target": "some-other-text-target", "source": "web_search"},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+
+    def test_canonical_match_is_strictly_more_precise_than_text_fallback(self):
+        """Construct a case where the pre-#12 token-fragment fallback would
+        have incorrectly matched a canonical assertion via a shared word
+        in its free-text target field, and assert the canonical-aware
+        result stays strict instead: target A's canonical identifiers
+        (its actual identity) don't mention 'enterprise' at all, even
+        though its free-text target string happens to. A must not
+        authorize a claim about the unrelated text-only target B, which
+        also lacks the required state."""
+        validator = ResponseValidator(strict_mode=False)
+        target_a = {
+            "namespace": "github", "canonical_ref": "https://github.com/octocat",
+            "kind": "account", "display_name": "octocat", "aliases": [],
+        }
+        context = ValidationContext(
+            original_query="q",
+            response="The enterprise resource does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed",
+                    "target": "octocat enterprise support",  # free-text target shares the "enterprise" token
+                    "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                    "canonical_target": target_a,  # but its real identity fields don't mention "enterprise"
+                },
+                {"state": "not_found_in_search", "target": "enterprise", "source": "web_search"},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags

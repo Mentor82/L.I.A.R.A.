@@ -21,6 +21,30 @@ guaranteed for tool-sourced claims only; a memory/file/database result
 being silently over-claimed would not yet be caught by this contract. Those
 channels need to be classified into EvidenceState the same way before the
 invariant can be considered fully general across the pipeline.
+
+Canonical target identity (Issue #12): EvidenceAssertion.target is free
+text -- two different spellings of the same real entity are never
+recognized as one, which is safe (never over-merges) but not precise. This
+module additionally offers a stricter, optional EvidenceTarget identity: a
+connector-native, stable reference (a real URL, resource ID, primary key,
+etc.), never derived by parsing, hashing, or fuzzy-matching free text.
+Equivalence between two identifiers is established ONLY when a single
+observation explicitly asserts its own aliases alongside its canonical_ref
+-- two SEPARATE observations are never compared against each other by
+their free text to decide they're "the same," no matter how similar they
+look. An assertion without a canonical_target (the common case today, since
+no real connector populates one yet -- see EvidenceEngine's
+_resolve_canonical_target docstring) is the explicit "unresolved identity"
+state, not a weaker guess at a resolved one; it therefore never merges with,
+and never authorizes a claim on behalf of, any canonical-identified target,
+and vice versa. This is a deliberate, permanent split, not a temporary gap:
+an assertion with a canonical_target and one without, for what a human
+might call "the same" real-world entity, are intentionally never merged
+across that boundary -- there is no basis to assume they refer to the same
+thing without an explicit connector-asserted link. Retrieval channels
+beyond tool_output (memory, files, databases, RAG, graph) remain out of
+scope for producing EvidenceTarget-bearing assertions in this issue, same
+as they remain out of scope for EvidenceState above.
 """
 
 from __future__ import annotations
@@ -99,6 +123,64 @@ _CONFIRMATION_REQUIRED_STATES = (EvidenceState.DOES_NOT_EXIST_CONFIRMED, Evidenc
 
 
 @dataclass(slots=True)
+class EvidenceTarget:
+    """A connector-verified, stable identity for the resource/entity an
+    EvidenceAssertion is about (Issue #12).
+
+    Constructed only from a real, connector-native identifier (a canonical
+    URL, resource ID, primary key, etc.) -- never derived by parsing,
+    hashing, or fuzzy-matching free text. Absence of an EvidenceTarget
+    (EvidenceAssertion.canonical_target is None) is the explicit "unresolved
+    identity" state: it must never be treated as equivalent to, or silently
+    upgraded into, a resolved one.
+    """
+
+    namespace: str
+    canonical_ref: str
+    kind: str = "entity"
+    display_name: str = ""
+    aliases: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        # Whitespace-only normalization, nothing more: no lowercasing, no
+        # URL/slash normalization, no entity resolution. " github " and
+        # "github" must not silently become two identities, but that is the
+        # full extent of what this class does on its own.
+        self.namespace = (self.namespace or "").strip()
+        self.canonical_ref = (self.canonical_ref or "").strip()
+        if not self.namespace:
+            raise ValueError("EvidenceTarget requires a non-empty namespace")
+        if not self.canonical_ref:
+            raise ValueError("EvidenceTarget requires a non-empty canonical_ref")
+
+    def merge_key(self) -> tuple[str, str]:
+        """Exact-equality aggregation key. Never prefix/substring matching --
+        this is what keeps parent/child resources (an account vs. one of its
+        repositories) and same-display-name-different-namespace targets
+        structurally distinct, by construction rather than special-casing.
+        """
+        return (self.namespace, self.canonical_ref)
+
+    def identifiers(self) -> frozenset[str]:
+        """All strings that count as referring to this target: its
+        canonical_ref, its display_name, and its explicitly declared
+        aliases. Used for whole-string (never fragment/token) claim-binding
+        matches -- see ResponseValidator._check_evidence_state_integrity.
+        """
+        candidates = {self.canonical_ref, self.display_name} | self.aliases
+        return frozenset(value for value in candidates if value)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "namespace": self.namespace,
+            "canonical_ref": self.canonical_ref,
+            "kind": self.kind,
+            "display_name": self.display_name,
+            "aliases": sorted(self.aliases),
+        }
+
+
+@dataclass(slots=True)
 class EvidenceAssertion:
     """A single provenance-carrying evidence-state fact about one target."""
 
@@ -110,6 +192,7 @@ class EvidenceAssertion:
     reason_code: str | None = None
     confirmed_by: EvidenceConfirmation | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    canonical_target: EvidenceTarget | None = None
 
     def __post_init__(self) -> None:
         # Defense in depth: the two "strong negative" states are
@@ -291,6 +374,7 @@ class EvidenceAssertion:
             "reason_code": self.reason_code,
             "confirmed_by": self.confirmed_by.to_dict() if self.confirmed_by is not None else None,
             "metadata": dict(self.metadata or {}),
+            "canonical_target": self.canonical_target.to_dict() if self.canonical_target is not None else None,
         }
 
 
@@ -322,10 +406,111 @@ _STATE_STRENGTH: dict[EvidenceState, int] = {
 _EXISTENCE_CONTRADICTING_PAIRS = frozenset({frozenset({EvidenceState.FOUND, EvidenceState.DOES_NOT_EXIST_CONFIRMED})})
 
 
+def _merge_canonical_targets(a: EvidenceTarget, b: EvidenceTarget) -> EvidenceTarget:
+    """Union two EvidenceTargets that already share the same merge_key().
+
+    Safe, not fuzzy: both sides already explicitly agree on the same
+    (namespace, canonical_ref) identity (that's the precondition for this
+    function being called at all -- see _group_key), so their
+    independently-declared aliases can be combined without inferring
+    anything new. display_name prefers a's (the winning side), falling back
+    to b's when a's is empty, rather than being dropped.
+    """
+    return EvidenceTarget(
+        namespace=a.namespace,
+        canonical_ref=a.canonical_ref,
+        kind=a.kind or b.kind,
+        display_name=a.display_name or b.display_name,
+        aliases=a.aliases | b.aliases,
+    )
+
+
+def _group_key(assertion: EvidenceAssertion) -> tuple[str, ...]:
+    """The dict key merge_evidence_assertions groups on: a canonical
+    (namespace, canonical_ref) tuple when available, else the raw target
+    string -- discriminated by a leading tag so the two key spaces can never
+    collide even if a text target happened to look like a canonical tuple.
+    """
+    if assertion.canonical_target is not None:
+        namespace, canonical_ref = assertion.canonical_target.merge_key()
+        return ("canonical", namespace, canonical_ref)
+    return ("text", assertion.target)
+
+
+def _merge_pair(existing: EvidenceAssertion, new: EvidenceAssertion) -> EvidenceAssertion:
+    """Decide the merged result for two assertions sharing one group key.
+
+    Same strength/sticky-conflict/existence-contradiction rules regardless
+    of whether the shared key is a canonical (namespace, canonical_ref) pair
+    or a raw target string -- one implementation for both, so there is
+    exactly one place this logic can drift. When both sides carry a
+    canonical_target (always true for a canonical-keyed pair, never true for
+    a text-keyed one), their aliases are unioned onto whichever assertion
+    ends up as the result -- regardless of override, conflict, or sticky
+    conflict -- since two assertions sharing a merge_key() have already
+    explicitly agreed on the same identity.
+    """
+    merged_identity: EvidenceTarget | None = None
+    if existing.canonical_target is not None and new.canonical_target is not None:
+        merged_identity = _merge_canonical_targets(existing.canonical_target, new.canonical_target)
+
+    if existing.state == EvidenceState.CONFLICTING_EVIDENCE:
+        if merged_identity is not None:
+            existing.canonical_target = merged_identity
+        return existing
+
+    existing_confirmed = existing.state in _CONFIRMATION_REQUIRED_STATES
+    new_confirmed = new.state in _CONFIRMATION_REQUIRED_STATES
+    is_confirmed_disagreement = existing_confirmed and new_confirmed and existing.state != new.state
+    is_existence_contradiction = frozenset({existing.state, new.state}) in _EXISTENCE_CONTRADICTING_PAIRS
+
+    if is_confirmed_disagreement or is_existence_contradiction:
+        conflicting = EvidenceAssertion.conflicting_evidence(
+            target=new.target,
+            source=f"{existing.source}+{new.source}",
+            summary=(
+                f"Conflicting observations: {existing.state.value} (via {existing.source}) "
+                f"vs {new.state.value} (via {new.source})"
+            ),
+            canonical_target=merged_identity,
+        )
+        if merged_identity is not None:
+            conflicting.metadata["canonicalization"] = {
+                "merge_key": f"{merged_identity.namespace}:{merged_identity.canonical_ref}",
+                "decision": "conflict",
+            }
+        return conflicting
+
+    if _STATE_STRENGTH[new.state] > _STATE_STRENGTH[existing.state]:
+        winner, loser, decision = new, existing, "override"
+    else:
+        # Equal-or-weaker new observation does not override the state, but
+        # its aliases (if any) still get folded in below.
+        winner, loser, decision = existing, new, "alias_union"
+
+    if merged_identity is not None:
+        winner.canonical_target = merged_identity
+        winner.metadata["canonicalization"] = {
+            "merge_key": f"{merged_identity.namespace}:{merged_identity.canonical_ref}",
+            "decision": decision,
+            "losing_source": loser.source,
+        }
+    return winner
+
+
 def merge_evidence_assertions(assertions: list[EvidenceAssertion]) -> list[EvidenceAssertion]:
     """Aggregate multiple observations of the same target into one per target.
 
-    Rules (see _STATE_STRENGTH):
+    Grouping key (Issue #12): assertions carrying a canonical_target are
+    grouped by its exact (namespace, canonical_ref) tuple; assertions
+    without one (the common case today) are grouped by the raw target
+    string, exactly as before Issue #12 -- these two key spaces are never
+    merged into each other. A single ordered dict (not two buckets
+    concatenated) holds both, so the result preserves the assertions'
+    original first-seen order regardless of whether they carry a
+    canonical_target or not.
+
+    Rules (see _STATE_STRENGTH), identical for both grouping kinds:
     - The observation with strictly higher state-strength wins for a given
       target (e.g. FOUND overrides an earlier NOT_FOUND_IN_SEARCH/
       UNRESOLVED/CONNECTOR_UNAVAILABLE; a *_CONFIRMED state overrides any
@@ -340,35 +525,17 @@ def merge_evidence_assertions(assertions: list[EvidenceAssertion]) -> list[Evide
       mechanism yet, so a conflict must stay visible until one exists.
     - An equal-or-lower-strength observation never overrides an
       already-stronger one for the same target.
+    - When two canonical-keyed assertions merge (override, conflict, or
+      sticky-conflict), their explicitly declared aliases are always
+      unioned onto the result -- see _merge_pair.
     """
-    by_target: dict[str, EvidenceAssertion] = {}
+    grouped: dict[tuple[str, ...], EvidenceAssertion] = {}
     for assertion in assertions:
-        existing = by_target.get(assertion.target)
+        key = _group_key(assertion)
+        existing = grouped.get(key)
         if existing is None:
-            by_target[assertion.target] = assertion
+            grouped[key] = assertion
             continue
+        grouped[key] = _merge_pair(existing, assertion)
 
-        if existing.state == EvidenceState.CONFLICTING_EVIDENCE:
-            continue
-
-        existing_confirmed = existing.state in _CONFIRMATION_REQUIRED_STATES
-        new_confirmed = assertion.state in _CONFIRMATION_REQUIRED_STATES
-        is_confirmed_disagreement = existing_confirmed and new_confirmed and existing.state != assertion.state
-        is_existence_contradiction = frozenset({existing.state, assertion.state}) in _EXISTENCE_CONTRADICTING_PAIRS
-
-        if is_confirmed_disagreement or is_existence_contradiction:
-            by_target[assertion.target] = EvidenceAssertion.conflicting_evidence(
-                target=assertion.target,
-                source=f"{existing.source}+{assertion.source}",
-                summary=(
-                    f"Conflicting observations: {existing.state.value} (via {existing.source}) "
-                    f"vs {assertion.state.value} (via {assertion.source})"
-                ),
-            )
-            continue
-
-        if _STATE_STRENGTH[assertion.state] > _STATE_STRENGTH[existing.state]:
-            by_target[assertion.target] = assertion
-        # else: equal-or-weaker new observation does not override.
-
-    return list(by_target.values())
+    return list(grouped.values())
