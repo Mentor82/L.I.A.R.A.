@@ -460,3 +460,217 @@ class TestOrchestratorFlow:
         assert await real_memory_layer.get(MemoryTier.SESSION, "session:test:state") == session_payload
         assert await real_memory_layer.get(MemoryTier.PERSISTENT, "run:test") == persistent_payload
         assert await real_memory_layer.get(MemoryTier.RETRIEVAL, "missing", default=[]) == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #8: evidence-state integrity, end-to-end
+# ---------------------------------------------------------------------------
+
+class SearchMissToolCoordinator:
+    """web_search returns a discovery-scope zero-result output."""
+
+    async def execute_tools_parallel(self, requests):
+        from services.contracts import ToolExecutionResult
+
+        results = {}
+        for req in requests:
+            results[req.tool_name] = ToolExecutionResult(
+                tool_name=req.tool_name,
+                status="success",
+                output={
+                    "kind": "web_discovery",
+                    "evidence_scope": "discovery",
+                    "candidate_count": 0,
+                    "results": [],
+                    "summary_text": "No parseable search candidates were returned.",
+                },
+            )
+        return results
+
+
+class SearchMissThenDirectHitToolCoordinator:
+    """web_search misses; a second tool succeeds with a direct answer for
+    the same query -- the 'search miss, then direct lookup' scenario."""
+
+    async def execute_tools_parallel(self, requests):
+        from services.contracts import ToolExecutionResult
+
+        results = {}
+        for req in requests:
+            if req.tool_name == "web_search":
+                results[req.tool_name] = ToolExecutionResult(
+                    tool_name=req.tool_name,
+                    status="success",
+                    output={
+                        "kind": "web_discovery",
+                        "evidence_scope": "discovery",
+                        "candidate_count": 0,
+                        "results": [],
+                        "summary_text": "No parseable search candidates were returned.",
+                    },
+                )
+            else:
+                results[req.tool_name] = ToolExecutionResult(
+                    tool_name=req.tool_name,
+                    status="success",
+                    output={"summary_text": "Direct lookup succeeded: account exists with 100k followers."},
+                )
+        return results
+
+
+class UnresolvedConnectorToolCoordinator:
+    """web_search returns a malformed/unrecognizable output shape (the
+    generic stand-in for an unresolved connector state, per the explicit
+    scope decision not to build a real browser connector)."""
+
+    async def execute_tools_parallel(self, requests):
+        from services.contracts import ToolExecutionResult
+
+        results = {}
+        for req in requests:
+            results[req.tool_name] = ToolExecutionResult(
+                tool_name=req.tool_name,
+                status="success",
+                output={"unexpected_field": "garbage", "raw": "<binary-ish>"},
+            )
+        return results
+
+
+class OverclaimingInferenceGateway:
+    """LLM response asserts non-existence despite only a search miss."""
+
+    async def infer(self, request):
+        from services.contracts import InferenceResult
+
+        return InferenceResult(
+            content="The account does not exist.",
+            provider="mock",
+            model="mock-model",
+            ttft_ms=1.0,
+            gen_ms=1.0,
+        )
+
+
+class HedgedInferenceGateway:
+    """LLM response correctly hedges instead of asserting absence."""
+
+    async def infer(self, request):
+        from services.contracts import InferenceResult
+
+        return InferenceResult(
+            content="The current connector could not resolve the requested resource.",
+            provider="mock",
+            model="mock-model",
+            ttft_ms=1.0,
+            gen_ms=1.0,
+        )
+
+
+class DirectHitInferenceGateway:
+    """LLM response correctly reports the successful direct lookup."""
+
+    async def infer(self, request):
+        from services.contracts import InferenceResult
+
+        return InferenceResult(
+            content="Found via direct lookup: the account exists with 100k followers.",
+            provider="mock",
+            model="mock-model",
+            ttft_ms=1.0,
+            gen_ms=1.0,
+        )
+
+
+class TestEvidenceStateIntegrityFlow:
+    """Issue #8 end-to-end: absence of evidence must not become evidence of
+    absence anywhere in retrieval -> EvidenceEngine -> Validator -> response."""
+
+    @pytest.mark.asyncio
+    async def test_search_miss_overclaiming_response_gets_blocked(self, real_memory_layer):
+        orchestrator = Orchestrator(
+            tool_coordinator=SearchMissToolCoordinator(),
+            inference_gateway=OverclaimingInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        request = OrchestratorRequest(
+            session_id="evidence-test-session",
+            run_id="evidence-test-run-1",
+            user_id="evidence-test-user",
+            query="Does the octocat account exist on GitHub?",
+            tools_override=["web_search"],
+        )
+
+        response = await orchestrator.run(request)
+
+        assert response.validation_result["decision"] in {"block", "revise"}
+        assert "negative_existence_without_evidence" in (response.validation_result.get("risk_flags") or [])
+
+    @pytest.mark.asyncio
+    async def test_unresolved_connector_hedged_response_passes(self, real_memory_layer):
+        orchestrator = Orchestrator(
+            tool_coordinator=UnresolvedConnectorToolCoordinator(),
+            inference_gateway=HedgedInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        request = OrchestratorRequest(
+            session_id="evidence-test-session-2",
+            run_id="evidence-test-run-2",
+            user_id="evidence-test-user",
+            query="Is there an open tab for this resource?",
+            tools_override=["web_search"],
+        )
+
+        response = await orchestrator.run(request)
+
+        assert response.validation_result["decision"] in {"accept", "warn"}
+        assert "negative_existence_without_evidence" not in (response.validation_result.get("risk_flags") or [])
+        assert "connector_unknown_collapsed_to_false" not in (response.validation_result.get("risk_flags") or [])
+
+    @pytest.mark.asyncio
+    async def test_search_miss_then_direct_lookup_end_to_end_accepts(self, real_memory_layer):
+        orchestrator = Orchestrator(
+            tool_coordinator=SearchMissThenDirectHitToolCoordinator(),
+            inference_gateway=DirectHitInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        request = OrchestratorRequest(
+            session_id="evidence-test-session-3",
+            run_id="evidence-test-run-3",
+            user_id="evidence-test-user",
+            query="Does the octocat account exist on GitHub?",
+            tools_override=["web_search", "current_time"],
+        )
+
+        response = await orchestrator.run(request)
+
+        assert response.validation_result["decision"] in {"accept", "warn"}
+
+    @pytest.mark.asyncio
+    async def test_blocked_response_does_not_commit_to_memory(self, real_memory_layer, monkeypatch):
+        from services.orchestrator import librarian_pipeline
+
+        commit_calls = []
+
+        async def _spy_upsert_memory_commit_embedding(*args, **kwargs):
+            commit_calls.append(kwargs)
+            return True
+
+        monkeypatch.setattr(librarian_pipeline, "upsert_memory_commit_embedding", _spy_upsert_memory_commit_embedding)
+
+        orchestrator = Orchestrator(
+            tool_coordinator=SearchMissToolCoordinator(),
+            inference_gateway=OverclaimingInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        request = OrchestratorRequest(
+            session_id="evidence-test-session-4",
+            run_id="evidence-test-run-4",
+            user_id="evidence-test-user",
+            query="Does the octocat account exist on GitHub?",
+            tools_override=["web_search"],
+        )
+
+        response = await orchestrator.run(request)
+
+        assert response.validation_result["decision"] in {"block", "revise"}
+        assert commit_calls == []

@@ -32,6 +32,7 @@ class ResponseValidator:
         self.validators = {
             "fast_check": self._check_fast_check,
             "tool_evidence_integrity": self._check_tool_evidence_integrity,
+            "evidence_state_integrity": self._check_evidence_state_integrity,
             "vision_evidence_integrity": self._check_vision_evidence_integrity,
             "source_attribution": self._check_source_attribution,
             "consistency": self._check_consistency,
@@ -48,12 +49,14 @@ class ResponseValidator:
         quality_boost = self._compute_quality_boost(context)
         confidence_score = min(1.0, round(0.88 + quality_boost, 4))
 
+        extra_risk_flags: list[str] = []
         for check_name, validator_fn in self.validators.items():
             result = validator_fn(context)
             checks[check_name] = "pass" if result.get("passed", False) else "fail"
             if not result["passed"]:
                 issues.extend(result.get("issues", []))
                 confidence_score *= result.get("confidence_penalty", 0.9)
+                extra_risk_flags.extend(result.get("risk_flags", []))
 
         feedback_score = self._resolve_optional_feedback_score(context)
         if feedback_score is not None:
@@ -71,6 +74,11 @@ class ResponseValidator:
             checks=checks,
             confidence_score=confidence_score,
         )
+        # Merge in any extra reason codes individual checks emitted
+        # directly (Issue #8): _collect_risk_flags_and_issues derives one
+        # fixed flag per failed check name, but a single check can surface
+        # several distinct reason codes (e.g. evidence_state_integrity).
+        risk_flags = sorted(set(risk_flags) | set(extra_risk_flags))
         for issue in score_issues:
             if issue not in issues:
                 issues.append(issue)
@@ -132,6 +140,10 @@ class ResponseValidator:
             "unit_mismatch",
             "logic_branch_dead",
             "crash_without_try_except",
+            # Issue #8: as serious as a policy/safety violation -- these mean
+            # the response asserted something the evidence doesn't support.
+            "negative_existence_without_evidence",
+            "connector_unknown_collapsed_to_false",
         }
         if any(flag in hard_blockers for flag in (risk_flags or [])):
             return decision
@@ -455,6 +467,138 @@ class ResponseValidator:
             "passed": not issues,
             "issues": issues,
             "confidence_penalty": 0.2 if issues else 1.0,
+        }
+
+    # Issue #8: negative-existence / privacy / connector-as-absence /
+    # hypothesis-promotion pattern classes for _check_evidence_state_integrity.
+    _NEGATIVE_EXISTENCE_RE = re.compile(
+        r"\b(?:does not exist|doesn't exist|kein(?:e)?\s+(?:konto|account|user|profil)\s+(?:existiert|vorhanden)|"
+        r"not\s+(?:a\s+)?(?:real|valid|existing)|nicht\s+vorhanden|existiert\s+nicht|no\s+such\s+(?:user|account|repo))\b",
+        re.IGNORECASE,
+    )
+    _PRIVACY_CLAIM_RE = re.compile(
+        r"\b(?:is\s+private|ist\s+privat|has\s+been\s+made\s+private|privat\s+gestellt)\b",
+        re.IGNORECASE,
+    )
+    _UNAVAILABLE_AS_ABSENT_RE = re.compile(
+        r"\b(?:the\s+resource\s+is\s+(?:unavailable|absent|gone)|no\s+longer\s+exists|"
+        r"nicht\s+(?:mehr\s+)?verf(?:ü|ue)gbar\s+und\s+existiert\s+nicht)\b",
+        re.IGNORECASE,
+    )
+    _HYPOTHESIS_RE = re.compile(
+        r"\b(?:may\s+(?:be|not)|might\s+(?:be|not)|possibly|vermutlich|k(?:ö|oe)nnte|"
+        r"m(?:ö|oe)glicherweise|not\s+indexed|nicht\s+indexiert|could\s+not\s+determine)\b",
+        re.IGNORECASE,
+    )
+    _DEPENDENCY_MARKER_RE = re.compile(r"\b(?:therefore|thus|daher|folglich|deshalb|as a result|consequently)\b", re.IGNORECASE)
+
+    @classmethod
+    def _check_evidence_state_integrity(cls, context: ValidationContext) -> Dict[str, Any]:
+        """Reject responses that promote a weak/negative evidence state into
+        a stronger factual claim without a supporting evidence edge (Issue #8).
+
+        EvidenceState (services/contracts/evidence_state.py) is the
+        normative layer -- the actual source-of-truth classification of what
+        is known/unknown about a target. This check's regex analysis of the
+        final natural-language response is a conservative *enforcement
+        heuristic* on top of that normative layer, not a semantic claim
+        parser: it will have false negatives on phrasings it doesn't
+        recognize, and that is an accepted v1 limitation, not a bug to
+        silently "fix" later by treating this regex layer as if it were a
+        ground-truth claim extractor.
+        """
+        response = context.response or ""
+        states = {
+            str(item.get("state") or "")
+            for item in (getattr(context, "evidence_states", None) or [])
+            if isinstance(item, dict)
+        }
+
+        issues: list[str] = []
+        risk_flags: list[str] = []
+
+        weak_states_present = bool({"not_found_in_search", "unresolved", "connector_unavailable", "access_denied"} & states)
+        strong_states_present = bool({"does_not_exist_confirmed", "private_confirmed"} & states)
+
+        if cls._NEGATIVE_EXISTENCE_RE.search(response) and not strong_states_present:
+            if weak_states_present or not states:
+                issues.append(
+                    "Negative existence claim not backed by an explicit does-not-exist confirmation "
+                    "(evidence state is search-miss/unresolved, not confirmed absence)"
+                )
+                risk_flags.append("negative_existence_without_evidence")
+
+        if cls._PRIVACY_CLAIM_RE.search(response) and "access_denied" in states and "private_confirmed" not in states:
+            issues.append("Privacy claim derived from an access-denied response without explicit source confirmation")
+            risk_flags.append("unsupported_state_promotion")
+
+        if cls._UNAVAILABLE_AS_ABSENT_RE.search(response) and ({"connector_unavailable", "unresolved"} & states):
+            issues.append("Connector/tool failure presented as a negative world-state observation")
+            risk_flags.append("connector_unknown_collapsed_to_false")
+
+        strong_spans = list(cls._NEGATIVE_EXISTENCE_RE.finditer(response)) + list(cls._PRIVACY_CLAIM_RE.finditer(response))
+        if cls._HYPOTHESIS_RE.search(response) and strong_spans:
+            hedge_spans = [m.span() for m in cls._HYPOTHESIS_RE.finditer(response)]
+            dependency_positions = [m.start() for m in cls._DEPENDENCY_MARKER_RE.finditer(response)]
+
+            def _hedge_covers_claim(h_start: int, h_end: int, s_start: int, s_end: int) -> bool:
+                close = abs(s_start - h_end) < 60 or abs(h_start - s_end) < 60
+                if not close:
+                    return False
+                # A dependency marker ("therefore"/"thus"/...) sitting
+                # between the hedge and the claim signals a NEW, separately
+                # asserted claim, not the same hedged one restated -- so it
+                # does not count as "covered" even if the two spans are
+                # textually close.
+                lo, hi = (h_end, s_start) if h_end <= s_start else (s_end, h_start)
+                return not any(lo <= pos <= hi for pos in dependency_positions)
+
+            for match in strong_spans:
+                s_start, s_end = match.span()
+                near_hedge = any(_hedge_covers_claim(h_start, h_end, s_start, s_end) for h_start, h_end in hedge_spans)
+                if not near_hedge:
+                    issues.append("Hypothesis language present but a later unqualified factual claim was not hedged")
+                    risk_flags.append("hypothesis_promoted_to_fact")
+                    break
+
+        # Recursive-dependency guard: a flagged premise phrase must not
+        # reappear later in the same response as an unqualified downstream
+        # premise (e.g. "...does not exist. Therefore, the account was
+        # never active."). Minimal heuristic, no claim-graph infrastructure.
+        if risk_flags:
+            flagged_fragments = [m.group(0) for m in strong_spans] + [
+                m.group(0) for m in cls._UNAVAILABLE_AS_ABSENT_RE.finditer(response)
+            ]
+            for marker_match in cls._DEPENDENCY_MARKER_RE.finditer(response):
+                preceding = response[: marker_match.start()]
+                if any(frag.lower() in preceding.lower() for frag in flagged_fragments):
+                    following = response[marker_match.end() : marker_match.end() + 200]
+                    if following.strip() and not cls._HYPOTHESIS_RE.search(following):
+                        issues.append("Later claim recursively depends on an earlier unsupported state-promoted claim")
+                        risk_flags.append("recursive_unsupported_claim_dependency")
+                        break
+
+        # Severity tiering: negative_existence_without_evidence and
+        # connector_unknown_collapsed_to_false are as serious as a
+        # fabrication finding (matches tool_evidence_integrity's 0.2
+        # penalty -- pushes confidence below the 0.45 "block" threshold in
+        # _decide). unsupported_state_promotion/hypothesis_promoted_to_fact/
+        # recursive_unsupported_claim_dependency are softer, landing in the
+        # 0.45-0.75 "warn" range -- still risky enough that Phase 6 gates
+        # memory commit on them, but not an automatic hard block.
+        _SEVERE_FLAGS = {"negative_existence_without_evidence", "connector_unknown_collapsed_to_false"}
+        if set(risk_flags) & _SEVERE_FLAGS:
+            confidence_penalty = 0.25
+        elif risk_flags:
+            confidence_penalty = 0.7
+        else:
+            confidence_penalty = 1.0
+
+        return {
+            "passed": not issues,
+            "issues": issues,
+            "confidence_penalty": confidence_penalty,
+            "risk_flags": risk_flags,
         }
 
     @classmethod

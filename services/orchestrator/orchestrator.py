@@ -87,6 +87,10 @@ from .defs.prompting import build_prompt
 from .defs.routing import standardize_routing_telemetry
 from .defs.provider_selection import select_inference_provider_for_step
 from .defs.context_channels import merge_context_channels, load_conversation_history
+from .defs.evidence_adapter import (
+    map_context_channels_for_evidence_engine,
+    map_source_counts_for_evidence_engine,
+)
 from .defs.embedding_query import (
     infer_active_topic,
     summarize_history_for_embedding,
@@ -412,7 +416,7 @@ class Orchestrator:
             query=routing_query,
             librarian_decision=librarian_decision,
         )
-        context_channels = lib_res[0] if isinstance(lib_res, tuple) else lib_res
+        context_channels, source_counts = lib_res if isinstance(lib_res, tuple) else (lib_res, {})
 
         # 3. Router & Planner Decision
         router_req = RouterRequest(query=routing_query, session_id=request.session_id)
@@ -463,12 +467,31 @@ class Orchestrator:
                 trace_entry.setdefault("to", "llm_generation")
                 trace_entry["metadata"] = gen_meta if isinstance(gen_meta, dict) else {}
 
+        # 5b. Evidence-State Aggregation (Issue #8) -- classifies tool
+        # outputs (search miss, connector failure, unresolved shape, etc.)
+        # into EvidenceState before validation sees the response text, so a
+        # weak/negative evidence state can be checked against any stronger
+        # claim the response makes.
+        evidence_tool_outputs = (
+            {r.get("tool_name", f"tool_{i}"): r for i, r in enumerate(tool_results or []) if isinstance(r, dict)}
+            if isinstance(tool_results, list)
+            else (tool_results or {})
+        )
+        evidence_result = self.evidence_engine.analyze(
+            query=routing_query,
+            context_channels=map_context_channels_for_evidence_engine(context_channels),
+            source_counts=map_source_counts_for_evidence_engine(source_counts),
+            tool_outputs=evidence_tool_outputs,
+            conversation_history=profile_history,
+        )
+
         # 6. Response Validation & Reasoning Snapshots
         val_res = await self._validate_response(
             query=routing_query,
             response_text=response_text,
             tool_results=tool_results,
             input_profile=input_profile,
+            evidence_states=evidence_result.evidence_states,
         )
 
         if hasattr(val_res, "dict") and callable(val_res.dict):
@@ -491,6 +514,7 @@ class Orchestrator:
                     response_content=response_text,
                     tools_used=selected_tools,
                     tool_outputs=tool_results,
+                    evidence_states=evidence_result.evidence_states,
                 )
                 j_dec = self.judge_engine.evaluate_post_result(j_ctx)
                 if j_dec:
@@ -693,7 +717,29 @@ class Orchestrator:
             }
 
         # 7. Memory Commit
-        if request.session_id and request.user_id:
+        # Issue #8: gated on both the validation decision AND the absence of
+        # evidence-integrity risk flags -- decision alone is too coarse,
+        # since unsupported_state_promotion/hypothesis_promoted_to_fact only
+        # apply a confidence penalty and can still land on "warn". A "warn"
+        # response carrying one of these flags must not be embedded into
+        # session memory, where it could resurface as apparent "remembered
+        # fact" in a later turn -- exactly the failure mode this issue
+        # warns about.
+        _EVIDENCE_INTEGRITY_RISK_FLAGS = {
+            "negative_existence_without_evidence",
+            "unsupported_state_promotion",
+            "connector_unknown_collapsed_to_false",
+            "hypothesis_promoted_to_fact",
+            "recursive_unsupported_claim_dependency",
+        }
+        memory_commit_decision = str(_get_val_attr(val_res, "decision", default="accept") or "accept")
+        memory_commit_risk_flags = set(_get_val_attr(val_res, "risk_flags", default=[]) or [])
+        if (
+            request.session_id
+            and request.user_id
+            and memory_commit_decision in {"accept", "warn"}
+            and not (memory_commit_risk_flags & _EVIDENCE_INTEGRITY_RISK_FLAGS)
+        ):
             await librarian_pipeline.upsert_memory_commit_embedding(
                 self,
                 session_id=request.session_id,

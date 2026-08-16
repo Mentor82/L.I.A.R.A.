@@ -271,6 +271,7 @@ def validate_response(
     run_id: Optional[str] = None,
     session_id: Optional[str] = None,
     context_debug: Optional[Any] = None,
+    evidence_states: Optional[Any] = None,
     **kwargs: Any,
 ) -> Any:
     """Validate assistant response text against quality and safety rules."""
@@ -281,6 +282,7 @@ def validate_response(
     actual_tools = tools_used if isinstance(tools_used, list) else (list(tool_results.keys()) if isinstance(tool_results, dict) else [])
     actual_outputs = tool_outputs if isinstance(tool_outputs, dict) else (tool_results if isinstance(tool_results, dict) else {})
     actual_debug = context_debug or kwargs.get("context_debug") or {}
+    actual_evidence_states = list(evidence_states) if isinstance(evidence_states, list) else []
 
     validator = getattr(orchestrator, "validator", None) or ResponseValidator()
     try:
@@ -295,6 +297,7 @@ def validate_response(
                     tool_outputs=actual_outputs,
                     context_mode=str(actual_debug.get("mode") or "NONE"),
                     context_sources=actual_debug.get("sources") or {},
+                    evidence_states=actual_evidence_states,
                 )
                 val_res = validator.validate(ctx)
             except Exception:

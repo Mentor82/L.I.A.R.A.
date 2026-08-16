@@ -45,6 +45,7 @@ def evaluate_post_result_validator(context: JudgeContext) -> JudgeDecision:
     context_sources = payload.get("context_sources") or {}
     user_feedback_score = payload.get("user_feedback_score")
     user_feedback_stars = payload.get("user_feedback_stars")
+    evidence_states = payload.get("evidence_states")
 
     validation_context = ValidationContext(
         original_query=original_query,
@@ -55,6 +56,7 @@ def evaluate_post_result_validator(context: JudgeContext) -> JudgeDecision:
         context_sources=context_sources if isinstance(context_sources, dict) else {},
         user_feedback_score=(float(user_feedback_score) if isinstance(user_feedback_score, (int, float)) else None),
         user_feedback_stars=(int(user_feedback_stars) if isinstance(user_feedback_stars, (int, float)) else None),
+        evidence_states=list(evidence_states) if isinstance(evidence_states, list) else [],
     )
 
     strict_mode = bool(context.metadata.get("strict_mode", False))

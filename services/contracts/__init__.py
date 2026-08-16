@@ -159,6 +159,18 @@ from .vision import (
     VisionResponse,
     VisionTask,
 )
+from .multimodal import (
+    AudioFeatureBundle,
+    MultimodalPrefillInput,
+    VisualFeatureBundle,
+)
+from .evidence_state import (
+    ConfirmationKind,
+    EvidenceAssertion,
+    EvidenceConfirmation,
+    EvidenceState,
+    merge_evidence_assertions,
+)
 
 __all__ = [
     "ChatRequest",
@@ -218,6 +230,14 @@ __all__ = [
     "VisionRequest",
     "VisionResponse",
     "VisionTask",
+    "AudioFeatureBundle",
+    "MultimodalPrefillInput",
+    "VisualFeatureBundle",
+    "EvidenceState",
+    "ConfirmationKind",
+    "EvidenceConfirmation",
+    "EvidenceAssertion",
+    "merge_evidence_assertions",
     "InputMoodProfile",
     "InputEnvironmentProfile",
     "InputResourceBudget",

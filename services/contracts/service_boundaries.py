@@ -712,6 +712,8 @@ class ValidationContext(BaseModel):
     user_feedback_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     # Optional human star rating in [1,6]. None means "no user input".
     user_feedback_stars: Optional[int] = Field(default=None, ge=1, le=6)
+    # EvidenceAssertion.to_dict()-shaped items from EvidenceEngine (Issue #8).
+    evidence_states: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ValidationSchoolScore(BaseModel):

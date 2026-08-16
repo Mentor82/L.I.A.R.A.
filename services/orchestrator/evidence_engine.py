@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from services.contracts.evidence_state import EvidenceAssertion, merge_evidence_assertions
+
 
 FACTUAL_QUERY_RE = re.compile(
     r"\b(why|how|diagnose|analysis|compare|difference|current|latest|quelle|quellen|warum|wieso|analyse|vergleich|aktuell)\b",
@@ -39,6 +41,7 @@ class EvidenceItem:
     freshness: float = 0.5
     consistent: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    evidence_state: str | None = None  # EvidenceState.value, e.g. "not_found_in_search" (Issue #8)
 
 
 @dataclass
@@ -69,6 +72,7 @@ class EvidenceEngineResult:
     context_block: list[str]
     conflict_block: list[str]
     answerability: str
+    evidence_states: list[dict[str, Any]] = field(default_factory=list)
 
 
 class EvidenceEngine:
@@ -177,6 +181,7 @@ class EvidenceEngine:
             context_block=packaging["context_block"],
             conflict_block=packaging["conflict_block"],
             answerability=packaging["answerability"],
+            evidence_states=collection["evidence_states"],
         )
 
     def _decompose_query(self, query: str) -> dict[str, Any]:
@@ -297,6 +302,64 @@ class EvidenceEngine:
             "selection_reasoning": reasons,
         }
 
+    # EvidenceState.value -> EvidenceItem.quality, per Issue #8's plan: a
+    # weak/negative evidence state must never be treated as verified.
+    _QUALITY_BY_EVIDENCE_STATE = {
+        "found": "verified",
+        "not_found_in_search": "insufficient",
+        "unresolved": "insufficient",
+        "connector_unavailable": "weak",
+        "access_denied": "weak",
+        "conflicting_evidence": "conflicting",
+        "does_not_exist_confirmed": "verified",
+        "private_confirmed": "verified",
+    }
+
+    @staticmethod
+    def _classify_tool_output_state(tool_name: str, output: Any, query: str) -> EvidenceAssertion:
+        """Classify one tool output into an EvidenceAssertion.
+
+        Never promotes a search-miss or a malformed/failed tool output into
+        a confirmed-absence state -- only an explicit EvidenceConfirmation
+        (which this classifier never fabricates) can produce
+        DOES_NOT_EXIST_CONFIRMED/PRIVATE_CONFIRMED (see evidence_state.py).
+        """
+        if not isinstance(output, dict):
+            text = str(output or "").strip()
+            if not text:
+                return EvidenceAssertion.unresolved(target=query, source=tool_name, summary="Empty tool output.")
+            return EvidenceAssertion.found(target=query, source=tool_name, summary=text[:200])
+
+        status = str(output.get("status") or "").strip().lower()
+        evidence_scope = str(output.get("evidence_scope") or "").strip().lower()
+        error_text = str(output.get("error") or "")
+
+        if status in {"failed", "error", "blocked"}:
+            return EvidenceAssertion.connector_unavailable(target=query, source=tool_name, summary=error_text[:200])
+        if status == "denied" or "401" in error_text or "403" in error_text:
+            return EvidenceAssertion.access_denied(target=query, source=tool_name, summary=error_text[:200])
+
+        if evidence_scope == "discovery":
+            candidate_count = output.get("candidate_count")
+            results = output.get("results")
+            is_empty = (isinstance(candidate_count, int) and candidate_count == 0) or (
+                isinstance(results, list) and len(results) == 0
+            )
+            if is_empty:
+                return EvidenceAssertion.not_found_in_search(target=query, source=tool_name)
+            return EvidenceAssertion.found(
+                target=query, source=tool_name, summary=str(output.get("summary_text") or "")[:200], confidence=0.6
+            )
+
+        has_recognizable_shape = any(
+            key in output for key in ("summary_text", "output", "content", "results", "items", "count")
+        )
+        if not has_recognizable_shape:
+            return EvidenceAssertion.unresolved(target=query, source=tool_name)
+
+        summary = str(output.get("summary_text") or output.get("output") or output.get("content") or "")[:200]
+        return EvidenceAssertion.found(target=query, source=tool_name, summary=summary, confidence=0.8)
+
     def _collect_evidence(
         self,
         *,
@@ -307,6 +370,7 @@ class EvidenceEngine:
     ) -> dict[str, Any]:
         items: list[EvidenceItem] = []
         fetch_outcomes: dict[str, str] = {}
+        evidence_states: list[dict[str, Any]] = []
 
         def add_lines(source: str, text: str, max_items: int | None = None) -> None:
             if max_items is None:
@@ -336,6 +400,7 @@ class EvidenceEngine:
 
         if "tool_output" in selected_sources:
             if tool_outputs:
+                tool_assertions: list[EvidenceAssertion] = []
                 for tool_name, output in sorted(tool_outputs.items()):
                     text = ""
                     if isinstance(output, dict):
@@ -343,18 +408,25 @@ class EvidenceEngine:
                     else:
                         text = str(output)
                     text = " ".join(text.split())
+
+                    assertion = self._classify_tool_output_state(tool_name, output, query)
+                    tool_assertions.append(assertion)
+                    item_quality = self._QUALITY_BY_EVIDENCE_STATE.get(assertion.state.value, "verified")
+
                     if text:
                         items.append(
                             EvidenceItem(
                                 source="tool_output",
                                 summary=f"[{tool_name}] {text[:260]}",
-                                quality="verified",
+                                quality=item_quality,
                                 relevance=0.8,
                                 freshness=0.8,
                                 metadata={"tool": tool_name},
+                                evidence_state=assertion.state.value,
                             )
                         )
                 fetch_outcomes["tool_output"] = "ok"
+                evidence_states = [a.to_dict() for a in merge_evidence_assertions(tool_assertions)]
             else:
                 fetch_outcomes["tool_output"] = "empty"
 
@@ -383,6 +455,7 @@ class EvidenceEngine:
             "evidence_items": items,
             "fetch_outcomes": fetch_outcomes,
             "retrieval_status": retrieval_status,
+            "evidence_states": evidence_states,
         }
 
     def _semantic_filter_evidence(
@@ -469,7 +542,15 @@ class EvidenceEngine:
                 discarded.append(item)
                 continue
             if item.source in {"tool_output", "facts"}:
-                item.quality = "verified"
+                # A classified evidence_state (Issue #8) takes precedence
+                # over the blanket "tool_output source == verified" rule --
+                # a NOT_FOUND_IN_SEARCH/UNRESOLVED/CONNECTOR_UNAVAILABLE
+                # tool output must never get promoted to "verified" quality
+                # just because it came from a tool.
+                if item.evidence_state and item.evidence_state in self._QUALITY_BY_EVIDENCE_STATE:
+                    item.quality = self._QUALITY_BY_EVIDENCE_STATE[item.evidence_state]
+                else:
+                    item.quality = "verified"
                 item.relevance = max(item.relevance, 0.8)
             elif item.source in {"memory", "rag", "internal_status"}:
                 item.quality = "plausible"
@@ -613,4 +694,5 @@ class EvidenceEngine:
             "freshness": item.freshness,
             "consistent": item.consistent,
             "metadata": dict(item.metadata or {}),
+            "evidence_state": item.evidence_state,
         }

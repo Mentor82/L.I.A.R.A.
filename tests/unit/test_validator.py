@@ -584,3 +584,137 @@ class TestResponseValidator:
         score_only = validator.validate(expected_ctx)
 
         assert with_both.confidence_score == score_only.confidence_score
+
+
+class TestEvidenceStateIntegrity:
+    """Issue #8: a weak/negative evidence state must never be silently
+    promoted into a stronger factual claim in the final response."""
+
+    def test_negative_existence_claim_flagged_without_confirmed_state(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="Does the octocat account exist?",
+            response="The account does not exist.",
+            tools_used=["web_search"],
+            tool_outputs={},
+            evidence_states=[{"state": "not_found_in_search", "target": "octocat", "source": "web_search"}],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+        assert result.decision == "block"
+
+    def test_negative_existence_claim_passes_with_confirmed_state(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="Does the octocat account exist?",
+            response="The account does not exist.",
+            tools_used=["github_api"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed",
+                    "target": "octocat",
+                    "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                }
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "pass"
+        assert "negative_existence_without_evidence" not in result.risk_flags
+
+    def test_negative_existence_claim_passes_with_no_evidence_states_at_all(self):
+        """No evidence_states means the check has nothing to compare against
+        for callers that don't populate it -- must not false-positive."""
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="Plain response with no existence claims at all.",
+            tools_used=[],
+            tool_outputs={},
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "pass"
+
+    def test_access_denied_not_inferred_as_private(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="This profile is private.",
+            tools_used=["github_api"],
+            tool_outputs={},
+            evidence_states=[{"state": "access_denied", "target": "octocat", "source": "github_api"}],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "unsupported_state_promotion" in result.risk_flags
+        assert result.decision in {"warn", "revise"}
+
+    def test_connector_failure_not_read_as_absence(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="The resource is unavailable and no longer exists.",
+            tools_used=["github_api"],
+            tool_outputs={},
+            evidence_states=[{"state": "connector_unavailable", "target": "octocat", "source": "github_api"}],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "connector_unknown_collapsed_to_false" in result.risk_flags
+        assert result.decision == "block"
+
+    def test_hypothesis_language_stays_hedged_passes(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="This account may not be indexed by the search engine.",
+            tools_used=["web_search"],
+            tool_outputs={},
+            evidence_states=[{"state": "not_found_in_search", "target": "octocat", "source": "web_search"}],
+        )
+        result = validator.validate(context)
+        # not_found_in_search + no negative-existence phrasing at all -> passes cleanly.
+        assert result.checks["evidence_state_integrity"] == "pass"
+
+    def test_hypothesis_promoted_to_unqualified_fact_fails(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="The account may not exist. Therefore, the account does not exist.",
+            tools_used=["web_search"],
+            tool_outputs={},
+            evidence_states=[{"state": "not_found_in_search", "target": "octocat", "source": "web_search"}],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "hypothesis_promoted_to_fact" in result.risk_flags
+
+    def test_recursive_dependency_on_unsupported_claim_flagged(self):
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="The GitHub account does not exist. Therefore, the associated email is also invalid.",
+            tools_used=["web_search"],
+            tool_outputs={},
+            evidence_states=[{"state": "not_found_in_search", "target": "octocat", "source": "web_search"}],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "recursive_unsupported_claim_dependency" in result.risk_flags
+
+    def test_warn_tier_flags_do_not_force_block(self):
+        """unsupported_state_promotion/hypothesis_promoted_to_fact must be
+        able to land on warn, not always escalate to block -- this is the
+        exact premise Phase 6's memory-gate fix depends on."""
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="This profile is private.",
+            tools_used=["github_api"],
+            tool_outputs={},
+            evidence_states=[{"state": "access_denied", "target": "octocat", "source": "github_api"}],
+        )
+        result = validator.validate(context)
+        assert result.decision != "block"

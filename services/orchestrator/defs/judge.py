@@ -43,9 +43,17 @@ def create_judge_context_for_post_result(
     response_content: str = "",
     tools_used: List[str] = None,
     tool_outputs: dict[str, Any] = None,
+    evidence_states: list[dict[str, Any]] | None = None,
     **kwargs: Any,
 ) -> JudgeContext:
-    """Create a JudgeContext for post-result evaluation of LLM response."""
+    """Create a JudgeContext for post-result evaluation of LLM response.
+
+    evidence_states (Issue #8) is threaded through additively so Judge is
+    never blind to the evidence-state classification, even though the
+    redundant second ResponseValidator.validate() call this ultimately
+    reaches doesn't drive the orchestrator's actual accept/revise/block
+    control flow (that's the direct validate_response() call site).
+    """
     effective_run_id = run_id or kwargs.get("request_id") or getattr(orchestrator, "_active_run_id", "") or ""
     return JudgeContext(
         request_id=effective_run_id,
@@ -58,6 +66,7 @@ def create_judge_context_for_post_result(
             "response": response_content,
             "tools_used": tools_used or [],
             "tool_outputs": tool_outputs or {},
+            "evidence_states": evidence_states or [],
         },
         metadata={
             "source": "orchestrator",
