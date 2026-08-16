@@ -191,3 +191,50 @@ async def test_failed_fetch_leaves_sys_absent_no_retry_to_second_candidate():
     assert "sys::discovery" in result
     assert orch._last_executor_debug["retrieval_discovery"]["status"] == "candidate_failed"
     orch._execute_tools.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_blocked_or_failed_refetch_never_becomes_grounding():
+    """Nephy hardening #1: a non-empty "sys" payload from a blocked/failed
+    re-fetch must never be treated as successfully fetched evidence -- only
+    a genuine kind=="url_fetch" result may become grounding."""
+    for failing_payload in (
+        {"sys": {"status": "blocked", "error": "Pre-action judge blocked execution: block"}},
+        {"sys": {"kind": "tool_execution_failure", "status": "failed", "evidence": False, "error": "curl failed"}},
+    ):
+        orch = _make_orchestrator(
+            refine_result={"selected_url": "https://primary.example/item/42", "confidence": 0.9},
+            fetch_result=failing_payload,
+        )
+        tool_results = _discovery_tool_results()
+
+        result = await tool_discovery.complete_web_discovery(orch, tool_results=tool_results, run_id="r1")
+
+        assert "sys" not in result
+        assert "sys::discovery" in result
+        assert orch._last_executor_debug["retrieval_discovery"]["status"] == "candidate_failed"
+
+
+@pytest.mark.asyncio
+async def test_llm_selected_url_outside_discovered_candidates_is_rejected():
+    """Nephy hardening #2: refinement may only select AMONG discovered
+    candidates. Discovery returns A/B/C; refinement proposes D (never
+    discovered) with high confidence -> D must never be fetched, the
+    deterministic fallback must pick from A/B/C instead."""
+    tool_results = _discovery_tool_results(results=[
+        _result("Candidate A", "https://a.example/one", "banana A"),
+        _result("Candidate B", "https://b.example/two", "banana B"),
+        _result("Candidate C", "https://c.example/three", "banana C"),
+    ])
+    orch = _make_orchestrator(
+        refine_result={"selected_url": "https://d.example/hallucinated", "confidence": 0.95},
+        fetch_result={"sys": {"source": "sys", "kind": "url_fetch", "content": "fetched fallback candidate"}},
+    )
+
+    result = await tool_discovery.complete_web_discovery(orch, tool_results=tool_results, run_id="r1")
+
+    candidate = result["sys::discovery"]["selected_candidate"]
+    assert candidate["url"] in {"https://a.example/one", "https://b.example/two", "https://c.example/three"}
+    assert candidate.get("selection_source") != "inference_candidate_assessment"
+    fetched_url = orch._execute_tools.call_args.args[1]
+    assert fetched_url != "https://d.example/hallucinated"

@@ -302,6 +302,15 @@ async def execute_tools(
     return {tool: {"status": "ok", "output": f"mock output for {tool}"} for tool in selected_tools}
 
 
+def _normalize_discovery_url(url: str) -> str:
+    """Deliberately simple, exact-after-normalization URL comparison --
+    strips surrounding whitespace and a single trailing slash, lowercases
+    scheme/host by lowercasing the whole string. Never fuzzy or domain-only:
+    two different paths on the same domain are never treated as the same
+    candidate."""
+    return url.strip().rstrip("/").lower()
+
+
 def rank_discovery_candidate(
     *,
     results: List[Dict[str, Any]],
@@ -387,14 +396,26 @@ async def complete_web_discovery(
     refined_url = str(refinement.get("selected_url") or "").strip()
     candidate: Optional[Dict[str, Any]] = None
     if refined_url and float(refinement.get("confidence") or 0.0) >= 0.6:
-        candidate = {
-            "title": "Inference-derived primary candidate",
-            "url": refined_url,
-            "snippet": "Derived from retrieval intent and search candidates; not evidence until fetched.",
-            "rank": 0,
-            "score": round(float(refinement.get("confidence") or 0.0) * 10.0, 3),
-            "selection_source": "inference_candidate_assessment",
-        }
+        # Refinement may only select AMONG discovered candidates -- an LLM
+        # cannot be trusted to invent/hallucinate a URL that was never
+        # actually returned by the discovery search. Bind by a deliberately
+        # simple, exact (post-normalization) URL match, never fuzzy/domain.
+        matched_discovered = next(
+            (
+                item for item in discovery_results
+                if _normalize_discovery_url(str(item.get("url") or "")) == _normalize_discovery_url(refined_url)
+            ),
+            None,
+        )
+        if matched_discovered is not None:
+            candidate = {
+                "title": str(matched_discovered.get("title") or "Inference-derived primary candidate"),
+                "url": str(matched_discovered.get("url") or refined_url),
+                "snippet": str(matched_discovered.get("snippet") or ""),
+                "rank": 0,
+                "score": round(float(refinement.get("confidence") or 0.0) * 10.0, 3),
+                "selection_source": "inference_candidate_assessment",
+            }
     if candidate is None:
         candidate = rank_discovery_candidate(results=discovery_results, retrieval=retrieval_payload)
     discovery["selected_candidate"] = candidate
@@ -432,17 +453,24 @@ async def complete_web_discovery(
     finally:
         orchestrator._last_route_debug = original_route_debug
 
-    primary = primary_results.get("sys") if isinstance(primary_results, dict) else None
+    raw_primary = primary_results.get("sys") if isinstance(primary_results, dict) else None
+    # A non-empty "sys" payload is not proof of a successful fetch -- a
+    # blocked/failed tool dispatch also returns a non-empty dict (e.g.
+    # {"status": "blocked", "error": ...} from the pre-action Judge, or
+    # {"kind": "tool_execution_failure", "evidence": False, ...} from the
+    # executor's failure envelope). Only _normalize_sys_output's genuine
+    # agent_url_fetch branch produces kind == "url_fetch" -- that is the
+    # sole basis for treating this as grounding evidence.
+    primary = raw_primary if isinstance(raw_primary, dict) and raw_primary.get("kind") == "url_fetch" else None
     primary_debug = dict(getattr(orchestrator, "_last_executor_debug", None) or {})
     combined: Dict[str, Any] = {"sys::discovery": discovery}
     if primary is not None:
-        if isinstance(primary, dict):
-            primary["retrieval_provenance"] = {
-                "search_query": discovery.get("query"),
-                "candidate_url": candidate.get("url"),
-                "candidate_title": candidate.get("title"),
-                "candidate_score": candidate.get("score"),
-            }
+        primary["retrieval_provenance"] = {
+            "search_query": discovery.get("query"),
+            "candidate_url": candidate.get("url"),
+            "candidate_title": candidate.get("title"),
+            "candidate_score": candidate.get("score"),
+        }
         combined["sys"] = primary
     orchestrator._last_executor_debug = {
         **primary_debug,
