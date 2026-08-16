@@ -10,6 +10,7 @@ Handles:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from services.contracts import ExecutorRequest, InputSituationProfile
@@ -302,50 +303,158 @@ async def execute_tools(
 
 
 def rank_discovery_candidate(
-    orchestrator: Orchestrator,
     *,
-    candidate: Dict[str, Any],
-    query: str,
-) -> float:
-    """Rank a web discovery candidate based on title, snippet, and query similarity."""
-    if not candidate or not query:
-        return 0.0
-
-    title = str(candidate.get("title") or "").lower()
-    snippet = str(candidate.get("snippet") or candidate.get("content") or "").lower()
-    q_terms = set(re.findall(r"\w+", query.lower()))
-
-    if not q_terms:
-        return 0.0
-
-    t_terms = set(re.findall(r"\w+", title))
-    s_terms = set(re.findall(r"\w+", snippet))
-
-    t_overlap = len(q_terms & t_terms) / max(1, len(q_terms))
-    s_overlap = len(q_terms & s_terms) / max(1, len(q_terms))
-
-    return round(0.6 * t_overlap + 0.4 * s_overlap, 4)
-
-
-def complete_web_discovery(
-    orchestrator: Orchestrator,
-    *,
-    query: str,
-    candidates: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+    retrieval: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Fetch and return the top-ranked web discovery candidate."""
-    if not candidates:
+    """Rank search results from inference-produced meaning, not source keywords.
+
+    Folds goal/search_query/entities from the retrieval intent into a semantic
+    token set, then scores each of the first 8 http(s) candidates by a
+    source-hint substring bonus, token overlap with that set, and a small
+    positional decay favoring earlier search rank. Returns the single winning
+    candidate (or None if nothing qualifies) -- not a bare float score.
+    """
+    source_hint = str(retrieval.get("source_hint") or "").strip().lower()
+    semantic_text = " ".join(
+        [
+            str(retrieval.get("goal") or ""),
+            str(retrieval.get("search_query") or ""),
+            " ".join(str(value) for value in dict(retrieval.get("entities") or {}).values()),
+        ]
+    ).lower()
+    semantic_tokens = set(re.findall(r"[a-z0-9äöüß]{3,}", semantic_text))
+    ranked: List[Tuple[float, int, Dict[str, Any]]] = []
+    for index, raw in enumerate(results[:8]):
+        if not isinstance(raw, dict):
+            continue
+        url = str(raw.get("url") or "").strip()
+        if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            continue
+        haystack = " ".join(
+            (str(raw.get("title") or ""), url, str(raw.get("snippet") or ""))
+        ).lower()
+        overlap = len(semantic_tokens & set(re.findall(r"[a-z0-9äöüß]{3,}", haystack)))
+        source_bonus = 5.0 if source_hint and source_hint in haystack else 0.0
+        score = source_bonus + float(overlap) + max(0.0, 1.0 - index * 0.1)
+        ranked.append((score, index, raw))
+    if not ranked:
         return None
+    score, index, selected = max(ranked, key=lambda item: (item[0], -item[1]))
+    return {
+        "title": str(selected.get("title") or ""),
+        "url": str(selected.get("url") or ""),
+        "snippet": str(selected.get("snippet") or ""),
+        "rank": index + 1,
+        "score": round(score, 3),
+    }
 
-    ranked = [(rank_discovery_candidate(orchestrator, candidate=c, query=query), c) for c in candidates]
-    ranked.sort(key=lambda x: x[0], reverse=True)
 
-    if ranked and ranked[0][0] > 0.1:
-        top_candidate = dict(ranked[0][1])
-        top_candidate["rank_score"] = ranked[0][0]
-        return top_candidate
+async def complete_web_discovery(
+    orchestrator: Orchestrator,
+    *,
+    tool_results: Dict[str, Any],
+    run_id: str,
+) -> Dict[str, Any]:
+    """Rank web-discovery candidates and fetch the winning one.
 
-    return None
+    No-op passthrough unless tool_results["sys"] is a discovery-kind result
+    (kind == "web_discovery"). Otherwise: assess candidates via inference
+    first (InputSituationProfiler.refine_retrieval, confidence >= 0.6),
+    falling back to deterministic token-overlap ranking
+    (rank_discovery_candidate). The winning candidate's URL is then
+    re-fetched via a fresh _execute_tools call -- this traverses the same
+    pre-action Judge, W/G/B policy, governance, and audit path as any other
+    tool dispatch, no special-casing needed here. On success, the discovery
+    listing survives under "sys::discovery" while "sys" holds the genuinely
+    fetched content; on failure (or no usable candidate), only
+    "sys::discovery" survives -- no retry to a second-ranked candidate.
+    """
+    discovery = tool_results.get("sys") if isinstance(tool_results, dict) else None
+    if not isinstance(discovery, dict) or discovery.get("kind") != "web_discovery":
+        return tool_results
+
+    profile = getattr(orchestrator, "_active_input_profile", None)
+    retrieval = getattr(profile, "retrieval_intent", None) if profile is not None else None
+    retrieval_payload = retrieval.model_dump(mode="json") if retrieval is not None else {}
+    discovery_results = [item for item in list(discovery.get("results") or []) if isinstance(item, dict)]
+
+    if retrieval is not None:
+        refinement = await orchestrator.input_profiler.refine_retrieval(retrieval, discovery_results)
+    else:
+        refinement = {"selected_url": None, "confidence": 0.0, "inference_status": "not_run"}
+    discovery["candidate_assessment"] = refinement
+    refined_url = str(refinement.get("selected_url") or "").strip()
+    candidate: Optional[Dict[str, Any]] = None
+    if refined_url and float(refinement.get("confidence") or 0.0) >= 0.6:
+        candidate = {
+            "title": "Inference-derived primary candidate",
+            "url": refined_url,
+            "snippet": "Derived from retrieval intent and search candidates; not evidence until fetched.",
+            "rank": 0,
+            "score": round(float(refinement.get("confidence") or 0.0) * 10.0, 3),
+            "selection_source": "inference_candidate_assessment",
+        }
+    if candidate is None:
+        candidate = rank_discovery_candidate(results=discovery_results, retrieval=retrieval_payload)
+    discovery["selected_candidate"] = candidate
+
+    if not candidate:
+        orchestrator._last_executor_debug = {
+            **dict(getattr(orchestrator, "_last_executor_debug", None) or {}),
+            "retrieval_discovery": {
+                "status": "no_candidate",
+                "candidate_count": int(discovery.get("candidate_count") or 0),
+            },
+        }
+        return tool_results
+
+    original_route_debug = dict(getattr(orchestrator, "_last_route_debug", None) or {})
+    discovery_debug = dict(getattr(orchestrator, "_last_executor_debug", None) or {})
+    fetch_retrieval_intent = dict(retrieval_payload)
+    fetch_retrieval_intent["candidate_url"] = str(candidate["url"])
+    fetch_retrieval_intent["discovery_required"] = False
+    try:
+        # The candidate URL is compiled into a fresh request and traverses the
+        # same pre-action Judge, W/G/B policy, governance, and audit path as
+        # any other tool dispatch -- _execute_tools is simply called again,
+        # with routing_metadata carrying the direct-fetch retrieval_intent
+        # shape (Issue #21's routing_metadata forwarding makes this reach
+        # _build_sys_parameters's retrieval_intent branch).
+        orchestrator._last_route_debug = {
+            "metadata": {
+                "intent": "url_fetch",
+                "retrieval_stage": "primary_fetch",
+                "retrieval_intent": fetch_retrieval_intent,
+            },
+        }
+        primary_results = await orchestrator._execute_tools(["sys"], str(candidate["url"]), run_id=run_id)
+    finally:
+        orchestrator._last_route_debug = original_route_debug
+
+    primary = primary_results.get("sys") if isinstance(primary_results, dict) else None
+    primary_debug = dict(getattr(orchestrator, "_last_executor_debug", None) or {})
+    combined: Dict[str, Any] = {"sys::discovery": discovery}
+    if primary is not None:
+        if isinstance(primary, dict):
+            primary["retrieval_provenance"] = {
+                "search_query": discovery.get("query"),
+                "candidate_url": candidate.get("url"),
+                "candidate_title": candidate.get("title"),
+                "candidate_score": candidate.get("score"),
+            }
+        combined["sys"] = primary
+    orchestrator._last_executor_debug = {
+        **primary_debug,
+        "retrieval_discovery": {
+            "status": "candidate_fetched" if primary is not None else "candidate_failed",
+            "candidate_count": int(discovery.get("candidate_count") or 0),
+            "selected_url": candidate.get("url"),
+            "discovery_tool_statuses": discovery_debug.get("tool_statuses", {}),
+            "primary_tool_statuses": primary_debug.get("tool_statuses", {}),
+        },
+    }
+    return combined
 
 
 def build_external_write_content(

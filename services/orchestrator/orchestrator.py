@@ -435,6 +435,7 @@ class Orchestrator:
             routing_query,
             run_id=run_id,
         )
+        tool_results = await self._complete_web_discovery(tool_results, run_id=run_id)
 
         # 5. LLM Generation
         formatted_context = merge_context_channels(context_channels)
@@ -1098,11 +1099,14 @@ class Orchestrator:
         q = query or kwargs.get("query", "")
         return await tool_discovery.execute_tools(self, selected_tools=tools, query=q, **kwargs)
 
-    def _rank_discovery_candidate(self, **kwargs: Any) -> float:
-        return tool_discovery.rank_discovery_candidate(self, **kwargs)
+    @staticmethod
+    def _rank_discovery_candidate(
+        results: List[Dict[str, Any]], retrieval: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        return tool_discovery.rank_discovery_candidate(results=results, retrieval=retrieval)
 
-    def _complete_web_discovery(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        return tool_discovery.complete_web_discovery(self, **kwargs)
+    def _complete_web_discovery(self, tool_results: Dict[str, Any], *, run_id: str) -> Optional[Dict[str, Any]]:
+        return tool_discovery.complete_web_discovery(self, tool_results=tool_results, run_id=run_id)
 
     def _build_external_write_content(self, **kwargs: Any) -> Dict[str, Any]:
         return tool_discovery.build_external_write_content(self, **kwargs)

@@ -286,6 +286,35 @@ class TestOrchestratorFlow:
         assert response.validation_result["confidence_score"] > 0.0
 
     @pytest.mark.asyncio
+    async def test_complete_web_discovery_is_wired_into_every_turn(self, real_memory_layer, monkeypatch):
+        """Issue #22: _complete_web_discovery must actually run every turn (it
+        no-ops cheaply for non-discovery tool_results, same as the old
+        pre-modularization monolith did) -- not sit as dead, unreferenced code."""
+        from unittest.mock import AsyncMock
+
+        orchestrator = Orchestrator(
+            tool_coordinator=MockToolCoordinator(),
+            inference_gateway=MockInferenceGateway(),
+            memory_layer=InProcessMemoryAdapter(real_memory_layer),
+        )
+        spy = AsyncMock(side_effect=lambda tool_results, **kwargs: tool_results)
+        monkeypatch.setattr(orchestrator, "_complete_web_discovery", spy)
+
+        request = OrchestratorRequest(
+            session_id="test-session",
+            run_id="test-run-discovery-wiring",
+            user_id="test-user",
+            query="What is the latest Python version?",
+            max_tokens=256,
+        )
+        response = await orchestrator.run(request)
+
+        assert isinstance(response, OrchestratorResponse)
+        spy.assert_called_once()
+        _, call_kwargs = spy.call_args
+        assert call_kwargs.get("run_id") == "test-run-discovery-wiring"
+
+    @pytest.mark.asyncio
     async def test_tool_selection_heuristic(self, real_memory_layer):
         """Tool selection matches query keywords."""
         orchestrator = Orchestrator(
