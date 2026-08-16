@@ -334,10 +334,16 @@ class EvidenceEngine:
         evidence_scope = str(output.get("evidence_scope") or "").strip().lower()
         error_text = str(output.get("error") or "")
 
-        if status in {"failed", "error", "blocked"}:
-            return EvidenceAssertion.connector_unavailable(target=query, source=tool_name, summary=error_text[:200])
+        # Check access-denied BEFORE the generic failed/error/blocked branch:
+        # a real 401/403 commonly surfaces as status="error" with the code
+        # in the error text (e.g. {"status": "error", "error": "403
+        # Forbidden"}), not status="denied". Classifying that as generic
+        # CONNECTOR_UNAVAILABLE would let it bypass the ACCESS_DENIED-vs-
+        # PRIVATE_CONFIRMED guard downstream (ACCESS_DENIED != PRIVATE).
         if status == "denied" or "401" in error_text or "403" in error_text:
             return EvidenceAssertion.access_denied(target=query, source=tool_name, summary=error_text[:200])
+        if status in {"failed", "error", "blocked"}:
+            return EvidenceAssertion.connector_unavailable(target=query, source=tool_name, summary=error_text[:200])
 
         if evidence_scope == "discovery":
             candidate_count = output.get("candidate_count")

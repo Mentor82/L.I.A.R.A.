@@ -508,29 +508,62 @@ class ResponseValidator:
         ground-truth claim extractor.
         """
         response = context.response or ""
-        states = {
-            str(item.get("state") or "")
-            for item in (getattr(context, "evidence_states", None) or [])
-            if isinstance(item, dict)
-        }
+        assertions = [
+            item for item in (getattr(context, "evidence_states", None) or []) if isinstance(item, dict)
+        ]
+        states = {str(item.get("state") or "") for item in assertions}
 
         issues: list[str] = []
         risk_flags: list[str] = []
 
-        weak_states_present = bool({"not_found_in_search", "unresolved", "connector_unavailable", "access_denied"} & states)
-        strong_states_present = bool({"does_not_exist_confirmed", "private_confirmed"} & states)
+        # Nephy round 2: a *_CONFIRMED state for target A must never
+        # blanket-authorize a claim about target B just because both
+        # appear somewhere in the same evidence_states list. When more than
+        # one distinct target is present, a claim is only considered
+        # supported if the confirming assertion's target identifier
+        # actually appears near that specific claim in the response text.
+        # With zero or one target there is no such ambiguity to guard
+        # against, so the cheaper "is the state present at all" check is
+        # kept (also avoids false positives when the LLM doesn't literally
+        # restate the target's exact identifier next to the claim).
+        distinct_targets = {str(item.get("target") or "") for item in assertions if item.get("target")}
+        multi_target = len(distinct_targets) > 1
 
-        if cls._NEGATIVE_EXISTENCE_RE.search(response) and not strong_states_present:
-            if weak_states_present or not states:
+        def _claim_supported_by_target(match: "re.Match[str]", required_state: str, window: int = 100) -> bool:
+            if not multi_target:
+                return required_state in states
+            s_start, s_end = match.span()
+            lo, hi = max(0, s_start - window), min(len(response), s_end + window)
+            nearby = response[lo:hi].lower()
+            for item in assertions:
+                if str(item.get("state") or "") != required_state:
+                    continue
+                target = str(item.get("target") or "").strip().lower()
+                tokens = [tok for tok in re.findall(r"[a-z0-9]+", target) if len(tok) >= 3]
+                if not tokens or any(tok in nearby for tok in tokens):
+                    return True
+            return False
+
+        for match in cls._NEGATIVE_EXISTENCE_RE.finditer(response):
+            if not _claim_supported_by_target(match, "does_not_exist_confirmed"):
                 issues.append(
                     "Negative existence claim not backed by an explicit does-not-exist confirmation "
-                    "(evidence state is search-miss/unresolved, not confirmed absence)"
+                    "for this target (evidence state is search-miss/unresolved/for a different target, "
+                    "not confirmed absence of this one)"
                 )
                 risk_flags.append("negative_existence_without_evidence")
+                break
 
-        if cls._PRIVACY_CLAIM_RE.search(response) and "access_denied" in states and "private_confirmed" not in states:
-            issues.append("Privacy claim derived from an access-denied response without explicit source confirmation")
-            risk_flags.append("unsupported_state_promotion")
+        for match in cls._PRIVACY_CLAIM_RE.finditer(response):
+            if "access_denied" not in states:
+                continue
+            if not _claim_supported_by_target(match, "private_confirmed"):
+                issues.append(
+                    "Privacy claim derived from an access-denied response without explicit source "
+                    "confirmation for this target"
+                )
+                risk_flags.append("unsupported_state_promotion")
+                break
 
         if cls._UNAVAILABLE_AS_ABSENT_RE.search(response) and ({"connector_unavailable", "unresolved"} & states):
             issues.append("Connector/tool failure presented as a negative world-state observation")

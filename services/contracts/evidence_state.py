@@ -8,6 +8,19 @@ silently become NOT_EXISTS).
 Mirrors services/judge/contracts.py's structural style: str-Enum states,
 paired with a slots dataclass carrying state + provenance, with classmethod
 constructors for ergonomic construction.
+
+Scope (Nephy round 2): as of Issue #8's Phase 1-7 implementation, the only
+producer of EvidenceAssertion is EvidenceEngine's classification of
+tool_outputs (services/orchestrator/evidence_engine.py). Memory/history,
+file, and database retrieval channels do not yet emit EvidenceAssertion --
+they still flow through EvidenceEngine as plain, unstated-quality evidence
+items (see services/orchestrator/defs/evidence_adapter.py's docstring for
+the current tool_output-only wiring). The "NO_RESULT must never silently
+become NOT_EXISTS" invariant this module enforces is therefore currently
+guaranteed for tool-sourced claims only; a memory/file/database result
+being silently over-claimed would not yet be caught by this contract. Those
+channels need to be classified into EvidenceState the same way before the
+invariant can be considered fully general across the pipeline.
 """
 
 from __future__ import annotations
@@ -301,6 +314,13 @@ _STATE_STRENGTH: dict[EvidenceState, int] = {
 # ACCESS_DENIED classification never carries), stated here explicitly so
 # the invariant isn't only an emergent property nobody wrote down.
 
+# State pairs that are semantically contradictory even when not both
+# *_CONFIRMED -- a target cannot simultaneously be FOUND and have an
+# authoritative confirmation that it does not exist. (PRIVATE_CONFIRMED is
+# deliberately excluded from this: a resource can coherently be both found
+# and known-private, so FOUND/PRIVATE_CONFIRMED is not a contradiction.)
+_EXISTENCE_CONTRADICTING_PAIRS = frozenset({frozenset({EvidenceState.FOUND, EvidenceState.DOES_NOT_EXIST_CONFIRMED})})
+
 
 def merge_evidence_assertions(assertions: list[EvidenceAssertion]) -> list[EvidenceAssertion]:
     """Aggregate multiple observations of the same target into one per target.
@@ -311,8 +331,13 @@ def merge_evidence_assertions(assertions: list[EvidenceAssertion]) -> list[Evide
       UNRESOLVED/CONNECTOR_UNAVAILABLE; a *_CONFIRMED state overrides any
       weaker uncertainty state).
     - Two *_CONFIRMED assertions for the same target that disagree (different
-      state) collapse into a single CONFLICTING_EVIDENCE assertion, rather
-      than an arbitrary pick of one.
+      state), or a FOUND/DOES_NOT_EXIST_CONFIRMED pair, collapse into a
+      single CONFLICTING_EVIDENCE assertion, rather than an arbitrary pick
+      of one.
+    - CONFLICTING_EVIDENCE is sticky: once a target is flagged conflicting,
+      no later single observation may silently resolve it by outranking it
+      on raw state-strength -- there is no reconciliation-with-provenance
+      mechanism yet, so a conflict must stay visible until one exists.
     - An equal-or-lower-strength observation never overrides an
       already-stronger one for the same target.
     """
@@ -323,14 +348,20 @@ def merge_evidence_assertions(assertions: list[EvidenceAssertion]) -> list[Evide
             by_target[assertion.target] = assertion
             continue
 
+        if existing.state == EvidenceState.CONFLICTING_EVIDENCE:
+            continue
+
         existing_confirmed = existing.state in _CONFIRMATION_REQUIRED_STATES
         new_confirmed = assertion.state in _CONFIRMATION_REQUIRED_STATES
-        if existing_confirmed and new_confirmed and existing.state != assertion.state:
+        is_confirmed_disagreement = existing_confirmed and new_confirmed and existing.state != assertion.state
+        is_existence_contradiction = frozenset({existing.state, assertion.state}) in _EXISTENCE_CONTRADICTING_PAIRS
+
+        if is_confirmed_disagreement or is_existence_contradiction:
             by_target[assertion.target] = EvidenceAssertion.conflicting_evidence(
                 target=assertion.target,
                 source=f"{existing.source}+{assertion.source}",
                 summary=(
-                    f"Conflicting confirmed observations: {existing.state.value} (via {existing.source}) "
+                    f"Conflicting observations: {existing.state.value} (via {existing.source}) "
                     f"vs {assertion.state.value} (via {assertion.source})"
                 ),
             )

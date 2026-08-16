@@ -190,3 +190,59 @@ class TestMergeEvidenceAssertions:
 
     def test_empty_input(self):
         assert merge_evidence_assertions([]) == []
+
+    def test_conflict_stays_sticky_against_a_later_confirmed_observation(self):
+        """Nephy round 2: once a target is CONFLICTING_EVIDENCE, a third
+        observation must not silently resolve it just because *_CONFIRMED
+        outranks CONFLICTING_EVIDENCE on raw state-strength."""
+        exists_confirmation = EvidenceConfirmation(
+            source="api_a", kind=ConfirmationKind.AUTHORITATIVE_API_RESPONSE, detail="private per source A"
+        )
+        absent_confirmation = EvidenceConfirmation(
+            source="api_b", kind=ConfirmationKind.AUTHORITATIVE_API_RESPONSE, detail="does not exist per source B"
+        )
+        third_confirmation = EvidenceConfirmation(
+            source="api_c", kind=ConfirmationKind.AUTHORITATIVE_API_RESPONSE, detail="private per source C"
+        )
+        merged = merge_evidence_assertions(
+            [
+                EvidenceAssertion.private_confirmed(target="octocat", source="api_a", confirmed_by=exists_confirmation),
+                EvidenceAssertion.does_not_exist_confirmed(target="octocat", source="api_b", confirmed_by=absent_confirmation),
+                EvidenceAssertion.private_confirmed(target="octocat", source="api_c", confirmed_by=third_confirmation),
+            ]
+        )
+        assert len(merged) == 1
+        assert merged[0].state == EvidenceState.CONFLICTING_EVIDENCE
+
+    def test_found_and_does_not_exist_confirmed_is_a_conflict(self):
+        """FOUND vs DOES_NOT_EXIST_CONFIRMED is a real existence
+        contradiction even though only one side is *_CONFIRMED -- the
+        earlier special-case only caught both-confirmed disagreements."""
+        confirmation = EvidenceConfirmation(
+            source="cached_snapshot", kind=ConfirmationKind.AUTHORITATIVE_API_RESPONSE, detail="404 in snapshot"
+        )
+        merged = merge_evidence_assertions(
+            [
+                EvidenceAssertion.found(target="octocat", source="direct_lookup"),
+                EvidenceAssertion.does_not_exist_confirmed(
+                    target="octocat", source="cached_snapshot", confirmed_by=confirmation
+                ),
+            ]
+        )
+        assert len(merged) == 1
+        assert merged[0].state == EvidenceState.CONFLICTING_EVIDENCE
+
+    def test_found_and_private_confirmed_is_not_a_conflict(self):
+        """A resource can coherently be both found and known-private --
+        this must NOT collapse to CONFLICTING_EVIDENCE."""
+        confirmation = EvidenceConfirmation(
+            source="github_api", kind=ConfirmationKind.EXPLICIT_SOURCE_STATEMENT, detail="marked private"
+        )
+        merged = merge_evidence_assertions(
+            [
+                EvidenceAssertion.found(target="octocat", source="direct_lookup"),
+                EvidenceAssertion.private_confirmed(target="octocat", source="github_api", confirmed_by=confirmation),
+            ]
+        )
+        assert len(merged) == 1
+        assert merged[0].state == EvidenceState.PRIVATE_CONFIRMED

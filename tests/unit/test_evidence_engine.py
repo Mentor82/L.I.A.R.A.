@@ -136,3 +136,17 @@ def test_connector_execution_failure_stays_connector_unavailable():
     result = _analyze_tool_outputs({"github_api": {"status": "failed", "error": "connection timeout"}})
     assert len(result.evidence_states) == 1
     assert result.evidence_states[0]["state"] == "connector_unavailable"
+
+
+def test_403_with_generic_error_status_is_access_denied_not_connector_unavailable():
+    """Nephy round 2: a real 401/403 commonly surfaces as status='error' with
+    the code embedded in the error text, not status='denied'. Must still
+    classify as ACCESS_DENIED so the ACCESS_DENIED != PRIVATE guard applies
+    -- not CONNECTOR_UNAVAILABLE, which would silently bypass that guard."""
+    result = _analyze_tool_outputs({"github_api": {"status": "error", "error": "403 Forbidden"}})
+    assert len(result.evidence_states) == 1
+    assert result.evidence_states[0]["state"] == "access_denied"
+    assert result.evidence_states[0]["state"] != "connector_unavailable"
+
+    result_401 = _analyze_tool_outputs({"github_api": {"status": "error", "error": "401 Unauthorized"}})
+    assert result_401.evidence_states[0]["state"] == "access_denied"

@@ -718,3 +718,80 @@ class TestEvidenceStateIntegrity:
         )
         result = validator.validate(context)
         assert result.decision != "block"
+
+    def test_cross_target_confirmed_negative_does_not_authorize_a_different_targets_claim(self):
+        """Nephy round 2, finding 1: a does_not_exist_confirmed for target A
+        must not blanket-authorize a negative-existence claim about an
+        unrelated target B that only has a search-miss."""
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="The torvalds account does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed",
+                    "target": "octocat",
+                    "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                },
+                {"state": "not_found_in_search", "target": "torvalds", "source": "web_search"},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "negative_existence_without_evidence" in result.risk_flags
+        assert result.decision == "block"
+
+    def test_cross_target_confirmed_negative_still_authorizes_its_own_targets_claim(self):
+        """Sanity control for the fix above: with multiple distinct targets
+        present, a claim about the SAME target the confirmation belongs to
+        must still pass."""
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="The octocat account does not exist.",
+            tools_used=["github_api", "web_search"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "does_not_exist_confirmed",
+                    "target": "octocat",
+                    "source": "github_api",
+                    "confirmed_by": {"source": "github_api", "kind": "authoritative_api_response", "detail": "404"},
+                },
+                {"state": "not_found_in_search", "target": "torvalds", "source": "web_search"},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "pass"
+        assert "negative_existence_without_evidence" not in result.risk_flags
+
+    def test_cross_target_access_denied_does_not_authorize_a_different_targets_privacy_claim(self):
+        """Nephy round 2, finding 1 applies the same way to privacy claims:
+        a private_confirmed for target A must not authorize a privacy claim
+        about an unrelated target B that only has access_denied."""
+        validator = ResponseValidator(strict_mode=False)
+        context = ValidationContext(
+            original_query="q",
+            response="The torvalds profile is private.",
+            tools_used=["github_api"],
+            tool_outputs={},
+            evidence_states=[
+                {
+                    "state": "private_confirmed",
+                    "target": "octocat",
+                    "source": "github_api",
+                    "confirmed_by": {
+                        "source": "github_api",
+                        "kind": "explicit_source_statement",
+                        "detail": "marked private",
+                    },
+                },
+                {"state": "access_denied", "target": "torvalds", "source": "github_api"},
+            ],
+        )
+        result = validator.validate(context)
+        assert result.checks["evidence_state_integrity"] == "fail"
+        assert "unsupported_state_promotion" in result.risk_flags
