@@ -164,7 +164,11 @@ architecture-data.ts
 -> auswaehlbare Detail- und Beziehungsebene
 ```
 
-Statuswerte sind `implemented`, `partial`, `planned` und `retired`.
+Statuswerte sind `implemented`, `partial`, `prepared`, `planned` und `retired`.
+`prepared` markiert Komponenten, die im Repository existieren und verifiziert
+funktionieren, aber in keinen laufenden Fluss eingebunden sind (keine
+Live-Verdrahtung) -- getrennt von `partial` (echte Teil-Produktion) und
+`planned` (noch nicht gebaut).
 Beziehungen unterscheiden Datenfluss, Entscheidung, Mutation und Validierung.
 Neue Komponenten werden in `src/app/architecture/architecture-data.ts`
 eingetragen; die Darstellung generiert Diagramm, Suche, Details und direkte
