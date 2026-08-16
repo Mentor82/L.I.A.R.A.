@@ -307,6 +307,11 @@ export const readinessClaims: Partial<Record<string, ReadinessClaim>> = {
     verifiedAt: "2026-08-16", evidence: ["Judge-Profile fuer alle 6 registrierten Tools (sys, compute.run, compute.generate, orientation, plot_chart, wsl_session)", "Multi-Tool-Turns werden pro Tool-Name mit segmentierten Parametern bewertet, most-restrictive-wins", "Unbekannte Aktionen ohne Profil werden grundsaetzlich blockiert"],
     openGates: ["wsl_session und plot_chart besitzen zwar Judge-Profile, aber ToolExecutor._build_tool_parameters (services/orchestrator/executor.py) hat fuer keines der beiden einen Branch und faellt auf {\"query\": ...} zurueck -- separat als Issue #16 erfasst, nicht hier gefixt"],
   },
+  "evidence-engine": {
+    level: "controlled-pilot", scope: "EvidenceState-Klassifikation von Tool-Outputs; optionale kanonische EvidenceTarget-Identitaet", environment: "Lokale LIARA-Runtime",
+    verifiedAt: "2026-08-16", evidence: ["EvidenceState-Klassifikation (FOUND/NOT_FOUND_IN_SEARCH/UNRESOLVED/CONNECTOR_UNAVAILABLE/ACCESS_DENIED/PRIVATE_CONFIRMED/DOES_NOT_EXIST_CONFIRMED/CONFLICTING_EVIDENCE) laeuft live auf echten Tool-Outputs", "Validator bindet Claims zweistufig an ein aufgeloestes kanonisches Ziel, Mehrdeutigkeit blockiert fail-closed"],
+    openGates: ["Kanonische EvidenceTarget-Unterstuetzung (canonical_namespace + canonical_ref) ist implementiert und per synthetischen Tool-Outputs Ende-zu-Ende verifiziert -- aktuell liefert kein realer Connector unter services/tools/ diese Felder. Die Zielidentitaets-Schicht ist bis dahin synthetic-only und noch nicht Teil des Live-Datenflusses; nur die zustandsbasierte EvidenceState-Klassifikation selbst ist live."],
+  },
 };
 
 export const architectureEvidence: Partial<Record<string, ArchitectureEvidence[]>> = {
