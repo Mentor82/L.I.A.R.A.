@@ -142,17 +142,26 @@ class JudgeEngine:
         return self._merge_all(decisions)
 
     def _evaluate_single_action(self, context: JudgeContext, action: str) -> JudgeDecision:
-        """Route one tool name to its pre-action profile.
+        """Route one tool name to its pre-action profile, with that tool's
+        own input.
 
-        `context` carries the shared input/metadata for the whole turn;
-        only `action` is overridden per tool name. Known limitation: the
-        shared input payload (typically {"tools": [...], "query": ...} for
-        multi-tool turns) is not yet segmented per tool, so a profile
-        expecting its own tool-specific fields (e.g. sys's "command") will
-        still see the shared payload -- this only fixes the "no profile
-        found" dispatch gap, not per-tool input segmentation.
+        `context` carries the shared metadata for the whole turn, but a
+        multi-tool turn's `context.input` is only ever one flat payload
+        (create_judge_context_for_pre_action sets it from a single prepared
+        request). Every sub-action used to see that same shared input
+        regardless of which tool it actually belonged to -- e.g. `sys`
+        could see `wsl_session`'s parameters or vice versa, order-dependent
+        on which tool happened to be prepared first. `metadata.per_tool_
+        parameters` (set by tool_discovery.execute_tools) maps each real
+        tool name to the parameters actually prepared for it; resolve the
+        matching entry here so each profile evaluates its own tool's input,
+        falling back to the shared context.input when no per-tool entry
+        exists (single-tool turns, or callers not populating the map).
         """
-        single_context = replace(context, action=action)
+        per_tool = context.metadata.get("per_tool_parameters") if isinstance(context.metadata, dict) else None
+        resolved_input = per_tool.get(action) if isinstance(per_tool, dict) and action in per_tool else context.input
+
+        single_context = replace(context, action=action, input=resolved_input)
 
         if action in {"sys", "/sys"}:
             base_decision = evaluate_pre_action_sys(single_context)
@@ -160,7 +169,7 @@ class JudgeEngine:
             if self.reward_pre_adapter is not None:
                 reward_decision = self.reward_pre_adapter.evaluate_with_reward_score(
                     action=action,
-                    input_data=context.input or {},
+                    input_data=resolved_input or {},
                     context=context.metadata or {},
                 )
             return self._merge_decisions(base_decision, reward_decision)
@@ -170,7 +179,7 @@ class JudgeEngine:
             if self.reward_pre_adapter is not None:
                 reward_decision = self.reward_pre_adapter.evaluate_with_reward_score(
                     action=action,
-                    input_data=context.input or {},
+                    input_data=resolved_input or {},
                     context=context.metadata or {},
                 )
             return self._merge_decisions(base_decision, reward_decision)
@@ -180,7 +189,7 @@ class JudgeEngine:
             if self.reward_pre_adapter is not None:
                 reward_decision = self.reward_pre_adapter.evaluate_with_reward_score(
                     action=action,
-                    input_data=context.input or {},
+                    input_data=resolved_input or {},
                     context=context.metadata or {},
                 )
             return self._merge_decisions(base_decision, reward_decision)

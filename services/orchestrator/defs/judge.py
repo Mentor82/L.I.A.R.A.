@@ -9,9 +9,20 @@ def create_judge_context_for_pre_action(
     run_id: str,
     tool_names: List[str],
     query: str,
+    per_tool_parameters: dict[str, dict[str, Any]] | None = None,
     **kwargs: Any,
 ) -> JudgeContext:
-    """Create a JudgeContext for pre-action evaluation of tool dispatch."""
+    """Create a JudgeContext for pre-action evaluation of tool dispatch.
+
+    per_tool_parameters (Issue #13 round 2) maps each tool name to the
+    parameters actually prepared for that specific tool. It's carried in
+    metadata rather than folded into `input` because `input` is the flat,
+    single-action-shaped payload every existing single-tool profile already
+    reads directly (e.g. sys reads input["command"]); JudgeEngine resolves
+    the correct per-tool input from metadata before dispatching each
+    sub-action of a multi-tool turn, instead of every tool seeing whichever
+    single tool's parameters happened to be passed as `input`.
+    """
     input_payload = kwargs.get("input")
     if input_payload is None:
         if "command" in kwargs:
@@ -31,6 +42,7 @@ def create_judge_context_for_pre_action(
             "risk_hint": "medium" if len(tool_names) > 1 else "low",
             "session_id": getattr(orchestrator, "_active_session_id", None),
             "user_id": getattr(orchestrator, "_active_user_id", None),
+            "per_tool_parameters": dict(per_tool_parameters or {}),
         },
     )
 

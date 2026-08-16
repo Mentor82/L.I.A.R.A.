@@ -215,11 +215,24 @@ async def execute_tools(
     if hasattr(orchestrator, "judge_engine") and orchestrator.judge_engine is not None:
         try:
             input_payload = prepared[0].parameters if (prepared and hasattr(prepared[0], "parameters")) else {}
+            # Issue #13 round 2: input_payload above is only the FIRST
+            # prepared tool's parameters -- fine as the flat `input` shape
+            # single-tool profiles read directly, but wrong for any other
+            # tool in a multi-tool turn if used as-is. Carry each tool's
+            # own parameters separately so JudgeEngine can resolve the
+            # correct payload per sub-action instead of every tool seeing
+            # tool #0's parameters.
+            per_tool_parameters = (
+                {req.tool_name: dict(req.parameters or {}) for req in prepared if hasattr(req, "tool_name")}
+                if prepared
+                else {}
+            )
             ctx = orchestrator._create_judge_context_for_pre_action(
                 run_id=run_id or getattr(orchestrator, "_active_run_id", "") or "",
                 tool_names=selected_tools,
                 query=query,
                 input=input_payload,
+                per_tool_parameters=per_tool_parameters,
             )
             decision = orchestrator.judge_engine.evaluate_pre_action(ctx)
 

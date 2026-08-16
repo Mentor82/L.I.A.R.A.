@@ -109,3 +109,84 @@ class TestJudgeEngineMultiToolDispatch:
         engine = JudgeEngine()
         result = engine.evaluate_pre_action(_ctx("orientation,some_future_tool"))
         assert result.decision == JudgeDecisionType.BLOCK
+
+
+def _multi_tool_ctx(action: str, per_tool_parameters: dict) -> JudgeContext:
+    """Build a JudgeContext the way tool_discovery.execute_tools() does for
+    a real multi-tool turn: metadata.per_tool_parameters carries each
+    tool's own prepared parameters, distinct from the shared `input`."""
+    return JudgeContext(
+        request_id="req-1",
+        stage=JudgeStage.PRE_ACTION,
+        actor="orchestrator",
+        intent="tool_dispatch",
+        action=action,
+        input=next(iter(per_tool_parameters.values()), {}),
+        metadata={"per_tool_parameters": per_tool_parameters},
+    )
+
+
+class TestJudgeEnginePerToolInputResolution:
+    """Nephy round 2: _evaluate_single_action only overrode context.action
+    per sub-action while context.input stayed shared/identical across all
+    tools in a multi-tool turn -- so with two genuinely different tool
+    payloads, one tool would evaluate against the other's parameters. Fixed
+    by resolving each sub-action's own entry from
+    metadata.per_tool_parameters before dispatching."""
+
+    def _distinct_payloads(self) -> dict:
+        return {
+            "sys": {"command": "ls", "args": ["-l", "/home/liara/workspace"]},
+            "wsl_session": {"action": "status", "session_id": "s1"},
+        }
+
+    def test_each_tool_evaluates_against_its_own_payload_sys_first(self):
+        engine = JudgeEngine()
+        result = engine.evaluate_pre_action(_multi_tool_ctx("sys,wsl_session", self._distinct_payloads()))
+        assert result.decision == JudgeDecisionType.ALLOW
+
+    def test_each_tool_evaluates_against_its_own_payload_order_swapped(self):
+        """Same two tools, same payloads, action string order reversed --
+        must produce the same result. Before the fix, whichever tool's
+        parameters happened to be `input` (always the first prepared
+        request) would leak into the other tool's evaluation, making the
+        outcome depend on tool order."""
+        engine = JudgeEngine()
+        result = engine.evaluate_pre_action(_multi_tool_ctx("wsl_session,sys", self._distinct_payloads()))
+        assert result.decision == JudgeDecisionType.ALLOW
+
+    def test_bad_payload_for_one_tool_is_detected_regardless_of_order(self):
+        """wsl_session's payload is missing its required 'action' field.
+        sys's own payload is fine. The revise must come from wsl_session's
+        own (bad) input, not leak into sys or get masked by sys's (good)
+        input overwriting it -- and must hold regardless of action order."""
+        payloads = {
+            "sys": {"command": "ls", "args": ["-l", "/home/liara/workspace"]},
+            "wsl_session": {},
+        }
+        engine = JudgeEngine()
+
+        result_a = engine.evaluate_pre_action(_multi_tool_ctx("sys,wsl_session", payloads))
+        result_b = engine.evaluate_pre_action(_multi_tool_ctx("wsl_session,sys", payloads))
+
+        assert result_a.decision == JudgeDecisionType.REVISE
+        assert result_b.decision == JudgeDecisionType.REVISE
+        assert any(c.reason_code == "judge.wsl_session.action_missing" for c in result_a.checks)
+        assert any(c.reason_code == "judge.wsl_session.action_missing" for c in result_b.checks)
+
+    def test_single_tool_turn_without_per_tool_parameters_still_works(self):
+        """Backward compatibility: a caller that doesn't populate
+        metadata.per_tool_parameters (e.g. existing single-tool call sites)
+        must still fall back to the shared context.input, unchanged."""
+        engine = JudgeEngine()
+        context = JudgeContext(
+            request_id="req-1",
+            stage=JudgeStage.PRE_ACTION,
+            actor="orchestrator",
+            intent="tool_dispatch",
+            action="sys",
+            input={"command": "ls", "args": ["-l", "/home/liara/workspace"]},
+            metadata={},
+        )
+        result = engine.evaluate_pre_action(context)
+        assert result.decision == JudgeDecisionType.ALLOW
