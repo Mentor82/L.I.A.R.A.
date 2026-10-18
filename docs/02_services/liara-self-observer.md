@@ -1,6 +1,6 @@
 # Service: liara-self-observer
 
-Stand: 2026-07-15
+Stand: 2026-10-18
 
 Code: `services/self_observer/`, `services/contracts/self_observer.py`  
 Default-Port: `8060`
@@ -44,6 +44,28 @@ observing -> quiet_candidate -> quiet_stable
 `background_analysis_candidate=true` ist lediglich Evidenz fuer eine spaetere
 Steuerinstanz. Findings, degradierte Quellen oder knappe Kapazitaet setzen den
 Ruhezaehler zurueck.
+
+Eine Ruhefreigabe benoetigt ausserdem explizite Arbeitslast-Telemetrie:
+`StateCurve.metrics[]` muss gueltige `active_work`-Kurven mit Einheit `count`,
+endlichem nichtnegativem `current` und Confidence mindestens 0.75 liefern.
+Die Probe summiert die aktuellen Zaehler der gemeldeten Geraete. Alle gemeldeten
+Arbeitslast-Kurven muessen frisch sein; ein veralteter Geraetewert darf nicht
+aus einer scheinbar leeren Summe verschwinden. `last_observed_at` muss einen
+Zeitzonenbezug haben und darf maximal fuenf Sekunden in der Zukunft liegen.
+`LIARA_SELF_OBSERVER_WORKLOAD_STALE_SECONDS` begrenzt das Alter (Default 15 s,
+Minimum 1 s). Das Alter wird gegen die UTC-Uhr des Observers geprueft;
+mehr als fuenf Sekunden Uhrvorlauf sperren ebenfalls die Ruhefreigabe.
+So kann auch eine alte, intern konsistente Kurve keinen Leerlauf belegen.
+Der Observer prueft beim Auswerten erneut den aeltesten
+Arbeitslast-Zeitstempel, damit wiederverwendete Evidenz nicht dauerhaft idle bleibt.
+
+Fehlende, ungueltige oder veraltete Werte ergeben `active_work=None`,
+`active_work_state=unknown/stale` und ein
+Signal `active_work_unknown`, `active_work_invalid` oder `active_work_stale`.
+Die Hardware kann dabei weiterhin healthy sein, aber die Ruhephase bleibt
+gesperrt. Kapazitaet und `max_parallel_jobs` sind kein Beleg fuer Leerlauf.
+Der native CPU/RAM-Adapter meldet derzeit keine aktive Arbeit: Ohne eine
+explizite Arbeitslast-Quelle ist daher absichtlich keine Ruhefreigabe moeglich.
 
 ## Assurance-Gate
 
@@ -91,7 +113,12 @@ queued/running
 ```
 
 Ein laufender Job erzeugt `attention`, damit kein zweiter Ruhezyklus parallel
-freigegeben wird. Warnungen werden als `attention`, Fehler oder ein gescheiterter
+freigegeben wird. Zusaetzlich blockiert `evaluate()` selbst bei `queued` oder
+`running` mit `validator_job_already_active`, auch nach Ablauf des Mindestabstands
+und bei einem weiterhin gesunden Snapshot. Die bisherige Job-ID und ihr
+Tracking-Kontext bleiben dabei erhalten. Der explizite Canary hat dieselbe
+Aktivjob-Sperre; seine terminalen Recovery-Ausnahmen bleiben unveraendert.
+Warnungen werden als `attention`, Fehler oder ein gescheiterter
 Job als `degraded` zurueckgefuehrt. Ein befundfreier abgeschlossener Lauf wird
 `healthy`. Auch diese Evidenz altert und wird danach sichtbar als `stale`
 markiert. Damit schliesst sich der Pruefkreis, ohne dass Findings durch den
@@ -145,6 +172,12 @@ mit HTTP 403.
 .\scripts\run_self_inspection_canary.ps1 -ResumeExisting -AuthorizationId <id>
 .\scripts\run_self_inspection_canary.ps1 -VerifyPersistenceOnly -AuthorizationId <id>
 ```
+
+Workload-Telemetriesignale `active_work_unknown`, `active_work_stale` und
+`active_work_invalid` blockieren die Ruhephase, aber nicht die explizit
+autorisierte Canary-Recovery oder den Retry nach terminalem Assurance-Fehler.
+Andere Fehlersignale und die Hardware-/Software-Zustandspruefungen bleiben
+auch fuer diese Recovery-Pfade wirksam.
 
 ## Start und Test
 

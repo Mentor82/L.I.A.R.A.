@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
+from services.contracts.heartbeat import MetricCurve
 from services.contracts.self_observer import StateEvidence
 
 
@@ -30,6 +32,7 @@ class SelfObserverProbes:
         timeout_seconds: float = 4.0,
         backend_timeout_seconds: float = 12.0,
         assurance_stale_seconds: int = 86_400,
+        workload_stale_seconds: float = 15.0,
     ) -> None:
         self.api_base_url = api_base_url.rstrip("/")
         self.memory_base_url = memory_base_url.rstrip("/")
@@ -37,6 +40,39 @@ class SelfObserverProbes:
         self.timeout_seconds = max(0.5, timeout_seconds)
         self.backend_timeout_seconds = max(self.timeout_seconds, backend_timeout_seconds)
         self.assurance_stale_seconds = max(60, assurance_stale_seconds)
+        self.workload_stale_seconds = max(1.0, workload_stale_seconds)
+
+    def _active_work(self, payload: dict, now: datetime) -> tuple[float | None, datetime | None, str | None]:
+        """Count work only from fresh canonical metric curves, never capacity.
+
+        All advertised workload curves must be usable; one stale device must
+        not disappear from a total that otherwise looks idle. The oldest
+        timestamp lets the observer recheck freshness when evidence is reused.
+        """
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, list):
+            return None, None, "active_work_unknown"
+        work = [item for item in metrics if isinstance(item, dict) and item.get("metric") == "active_work"]
+        if not work:
+            return None, None, "active_work_unknown"
+        curves = []
+        try:
+            for item in work:
+                curve = MetricCurve.model_validate(item)
+                if (curve.unit != "count" or not math.isfinite(curve.current)
+                        or curve.current < 0 or curve.confidence < 0.75
+                        or curve.last_observed_at.tzinfo is None):
+                    return None, None, "active_work_invalid"
+                age = (now - curve.last_observed_at).total_seconds()
+                if age < -5 or age > self.workload_stale_seconds:
+                    return None, None, "active_work_stale"
+                curves.append(curve)
+        except (ValueError, TypeError):
+            return None, None, "active_work_invalid"
+        total = sum(curve.current for curve in curves)
+        if not math.isfinite(total):
+            return None, None, "active_work_invalid"
+        return total, min(curve.last_observed_at for curve in curves), None
 
     async def collect(self) -> list[StateEvidence]:
         return list(await asyncio.gather(
@@ -57,6 +93,10 @@ class SelfObserverProbes:
                 "critical": "critical", "unknown": "unknown",
             }.get(str(payload.get("state")), "unknown")
             envelope = payload.get("envelope") if isinstance(payload.get("envelope"), dict) else {}
+            active_work, work_observed_at, work_signal = self._active_work(payload, now)
+            work_state = "known" if work_signal is None else (
+                "stale" if work_signal == "active_work_stale" else "unknown"
+            )
             return StateEvidence(
                 domain="hardware",
                 source_id="liara-heartbeat",
@@ -64,10 +104,13 @@ class SelfObserverProbes:
                 state=state,
                 confidence=float(payload.get("confidence", 0.0)),
                 stability=float(payload.get("stability", 0.0)),
-                signals=[str(item) for item in payload.get("signals", [])],
+                signals=[str(item) for item in payload.get("signals", [])] + ([work_signal] if work_signal else []),
                 attributes={
                     "capacity": float(envelope.get("capacity", 0.0)),
                     "max_parallel_jobs": int(envelope.get("max_parallel_jobs", 0)),
+                    "active_work": active_work,
+                    "active_work_state": work_state,
+                    "active_work_observed_at": work_observed_at.isoformat() if work_observed_at else None,
                 },
             )
         except Exception as exc:

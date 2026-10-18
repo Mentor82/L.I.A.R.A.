@@ -213,6 +213,8 @@ class SelfInspectionGate:
             if previous_submission else None
         )
         reasons: list[str] = []
+        if previous_job_state in {"queued", "running"}:
+            reasons.append("validator_job_already_active")
         if self.mode == "disabled":
             reasons.append("inspection_disabled")
         if state.state != "healthy":
@@ -325,6 +327,11 @@ class SelfInspectionGate:
             "validator_evidence_stale",
             "validator_findings",
             "validator_job_failed",
+            # Workload uncertainty prevents quiet phases, not an authorized
+            # recovery of assurance. Domain health checks still apply below.
+            "active_work_unknown",
+            "active_work_stale",
+            "active_work_invalid",
         }
         if not state.signals or not set(state.signals).issubset(allowed_signals):
             return False
@@ -352,6 +359,11 @@ class SelfInspectionGate:
             "validator_evidence_stale",
             "validator_findings",
             "validator_job_failed",
+            # Workload uncertainty prevents quiet phases, not an authorized
+            # recovery of assurance. Domain health checks still apply below.
+            "active_work_unknown",
+            "active_work_stale",
+            "active_work_invalid",
         }
         if not state.signals or not set(state.signals).issubset(allowed_signals):
             return False
