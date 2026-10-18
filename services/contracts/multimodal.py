@@ -91,4 +91,3 @@ def validate_representation_space_compatibility(
             )
 
     return True
-
