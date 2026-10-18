@@ -173,6 +173,12 @@ mit HTTP 403.
 .\scripts\run_self_inspection_canary.ps1 -VerifyPersistenceOnly -AuthorizationId <id>
 ```
 
+Workload-Telemetriesignale `active_work_unknown`, `active_work_stale` und
+`active_work_invalid` blockieren die Ruhephase, aber nicht die explizit
+autorisierte Canary-Recovery oder den Retry nach terminalem Assurance-Fehler.
+Andere Fehlersignale und die Hardware-/Software-Zustandspruefungen bleiben
+auch fuer diese Recovery-Pfade wirksam.
+
 ## Start und Test
 
 ```powershell

@@ -265,7 +265,16 @@ async def test_operator_canary_uses_real_observed_state_and_records_complete_tra
     assert completed.exit_code == 0
 
 
-async def test_operator_canary_can_refresh_stale_terminal_assurance_only(tmp_path):
+@pytest.mark.parametrize("workload", ["known", "missing", "stale", "invalid"])
+@pytest.mark.parametrize("hardware_fault", [False, True])
+async def test_operator_canary_can_refresh_stale_terminal_assurance_only(tmp_path, workload, hardware_fault):
+    metrics = {"known": [_work_curve()], "missing": [], "stale": [_work_curve(age=60)],
+               "invalid": [_work_curve(-1)]}[workload]
+    hardware = await _probe_workload(metrics)
+    if workload != "known":
+        assert hardware.signals
+    if hardware_fault:
+        hardware = hardware.model_copy(update={"signals": [*hardware.signals, "hardware_source_unreachable"]})
     submitter = _FakeSubmitter()
     gate = SelfInspectionGate(
         mode="observe",
@@ -285,7 +294,8 @@ async def test_operator_canary_can_refresh_stale_terminal_assurance_only(tmp_pat
 
     stale_at = datetime.now(UTC) - timedelta(seconds=120)
     stale_evidence = [
-        item for item in _evidence() if item.domain != "assurance"
+        hardware if item.domain == "hardware" else item
+        for item in _evidence() if item.domain != "assurance"
     ] + [StateEvidence(
         domain="assurance",
         source_id="self-inspection-gate",
@@ -306,6 +316,12 @@ async def test_operator_canary_can_refresh_stale_terminal_assurance_only(tmp_pat
     )
 
     assert degraded.state == "degraded"
+    if hardware_fault:
+        assert recovered.action == "none"
+        assert "system_not_healthy" in recovered.reasons
+        assert len(submitter.requests) == 1
+        return
+
     assert recovered.action == "submitted"
     assert "operator_recovery_from_stale_assurance" in recovered.reasons
     assert len(submitter.requests) == 2
@@ -359,7 +375,16 @@ async def test_stale_assurance_recovery_does_not_bypass_software_degradation(tmp
     assert len(submitter.requests) == 1
 
 
-async def test_operator_can_retry_failed_assurance_before_regular_minimum_interval(tmp_path):
+@pytest.mark.parametrize("workload", ["known", "missing", "stale", "invalid"])
+@pytest.mark.parametrize("hardware_fault", [False, True])
+async def test_operator_can_retry_failed_assurance_before_regular_minimum_interval(tmp_path, workload, hardware_fault):
+    metrics = {"known": [_work_curve()], "missing": [], "stale": [_work_curve(age=60)],
+               "invalid": [_work_curve(-1)]}[workload]
+    hardware = await _probe_workload(metrics)
+    if workload != "known":
+        assert hardware.signals
+    if hardware_fault:
+        hardware = hardware.model_copy(update={"signals": [*hardware.signals, "hardware_source_unreachable"]})
     submitter = _FailedSubmitter()
     gate = SelfInspectionGate(
         mode="observe",
@@ -378,7 +403,8 @@ async def test_operator_can_retry_failed_assurance_before_regular_minimum_interv
     failed_evidence = gate.assurance_evidence()
     assert failed_evidence is not None
     degraded = SelfObserverInstance(store_dir=tmp_path / "degraded").observe([
-        item for item in _evidence() if item.domain != "assurance"
+        hardware if item.domain == "hardware" else item
+        for item in _evidence() if item.domain != "assurance"
     ] + [failed_evidence])
 
     retried = await gate.submit_canary(
@@ -387,6 +413,12 @@ async def test_operator_can_retry_failed_assurance_before_regular_minimum_interv
         reason="retry after bounded validator repair",
         now=first.last_submitted_at + timedelta(seconds=1),
     )
+
+    if hardware_fault:
+        assert retried.action == "none"
+        assert "system_not_healthy" in retried.reasons
+        assert len(submitter.requests) == 1
+        return
 
     assert retried.action == "submitted"
     assert "operator_retry_after_failed_assurance" in retried.reasons
