@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import deque
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ class SelfObserverInstance:
         history_limit: int = 240,
         quiet_candidate_cycles: int = 2,
         quiet_stable_cycles: int = 4,
+        workload_stale_seconds: float = 15.0,
     ) -> None:
         self.observer_id = observer_id
         self.node_id = node_id
@@ -34,6 +36,7 @@ class SelfObserverInstance:
         self.history_limit = max(10, min(history_limit, 10_000))
         self.quiet_candidate_cycles = max(1, quiet_candidate_cycles)
         self.quiet_stable_cycles = max(self.quiet_candidate_cycles + 1, quiet_stable_cycles)
+        self.workload_stale_seconds = max(1.0, workload_stale_seconds)
         self._history: deque[SystemStateEnvelope] = deque(maxlen=self.history_limit)
         self._sequence = 0
         self._quiet_cycles = 0
@@ -55,7 +58,7 @@ class SelfObserverInstance:
         state = {0: "healthy", 1: "attention", 2: "degraded", 3: "critical"}[severity]
         confidence = self._weighted(evidence, "confidence")
         stability = self._weighted(evidence, "stability")
-        quiet = self._is_quiet_candidate(evidence, state, confidence, stability)
+        quiet = self._is_quiet_candidate(evidence, state, confidence, stability, now=now)
         self._quiet_cycles = self._quiet_cycles + 1 if quiet else 0
         if self._quiet_cycles >= self.quiet_stable_cycles:
             phase = "quiet_stable"
@@ -104,20 +107,36 @@ class SelfObserverInstance:
         value = sum(values[domain] * _WEIGHTS[domain] for domain in values) / total_weight
         return round(max(0.0, min(1.0, value)), 6)
 
-    @staticmethod
-    def _is_quiet_candidate(evidence: list[StateEvidence], state: str, confidence: float, stability: float) -> bool:
+    def _is_quiet_candidate(
+        self, evidence: list[StateEvidence], state: str, confidence: float,
+        stability: float, *, now: datetime,
+    ) -> bool:
         by_domain = {item.domain: item for item in evidence}
         hardware = by_domain.get("hardware")
         software = by_domain.get("software")
         assurance = by_domain.get("assurance")
         capacity = float(hardware.attributes.get("capacity", 0.0)) if hardware else 0.0
-        active_work = float(hardware.attributes.get("active_work", 0.0)) if hardware else 0.0
+        active_work = hardware.attributes.get("active_work") if hardware else None
+        work_timestamp = hardware.attributes.get("active_work_observed_at") if hardware else None
+        if (isinstance(active_work, bool) or not isinstance(active_work, (int, float))
+                or not math.isfinite(active_work) or active_work < 0
+                or not isinstance(work_timestamp, str)):
+            return False
+        try:
+            observed_at = datetime.fromisoformat(work_timestamp.replace("Z", "+00:00"))
+            if observed_at.tzinfo is None:
+                return False
+            age = (now - observed_at).total_seconds()
+        except (ValueError, TypeError):
+            return False
+        if age < -5 or age > self.workload_stale_seconds:
+            return False
         return bool(
             state == "healthy"
             and confidence >= 0.75
             and stability >= 0.75
             and capacity >= 0.35
-            and active_work <= 0
+            and active_work == 0
             and software and software.state == "healthy"
             and assurance and assurance.state == "healthy"
         )

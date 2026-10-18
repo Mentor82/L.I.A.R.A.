@@ -213,6 +213,8 @@ class SelfInspectionGate:
             if previous_submission else None
         )
         reasons: list[str] = []
+        if previous_job_state in {"queued", "running"}:
+            reasons.append("validator_job_already_active")
         if self.mode == "disabled":
             reasons.append("inspection_disabled")
         if state.state != "healthy":

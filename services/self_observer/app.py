@@ -26,6 +26,7 @@ def create_self_observer_app(
     inspection_gate: SelfInspectionGate | None = None,
     enable_collector: bool | None = None,
 ) -> FastAPI:
+    workload_stale_seconds = float(os.getenv("LIARA_SELF_OBSERVER_WORKLOAD_STALE_SECONDS", "15"))
     instance = instance or SelfObserverInstance(
         observer_id=os.getenv("LIARA_SELF_OBSERVER_INSTANCE_ID", "liara.instance.self-observer.local"),
         node_id=os.getenv("LIARA_SELF_OBSERVER_NODE_ID", "liara-local"),
@@ -33,6 +34,7 @@ def create_self_observer_app(
         history_limit=int(os.getenv("LIARA_SELF_OBSERVER_HISTORY_LIMIT", "240")),
         quiet_candidate_cycles=int(os.getenv("LIARA_SELF_OBSERVER_QUIET_CANDIDATE_CYCLES", "2")),
         quiet_stable_cycles=int(os.getenv("LIARA_SELF_OBSERVER_QUIET_STABLE_CYCLES", "4")),
+        workload_stale_seconds=workload_stale_seconds,
     )
     probes = probes or SelfObserverProbes(
         api_base_url=os.getenv("LIARA_SELF_OBSERVER_API_BASE_URL", "http://127.0.0.1:8010"),
@@ -41,6 +43,7 @@ def create_self_observer_app(
         timeout_seconds=float(os.getenv("LIARA_SELF_OBSERVER_TIMEOUT_SECONDS", "4")),
         backend_timeout_seconds=float(os.getenv("LIARA_SELF_OBSERVER_BACKEND_TIMEOUT_SECONDS", "12")),
         assurance_stale_seconds=int(os.getenv("LIARA_SELF_OBSERVER_ASSURANCE_STALE_SECONDS", "86400")),
+        workload_stale_seconds=workload_stale_seconds,
     )
     inspection_mode = os.getenv("LIARA_SELF_INSPECTION_MODE", "observe").strip().lower()
     if inspection_gate is None:

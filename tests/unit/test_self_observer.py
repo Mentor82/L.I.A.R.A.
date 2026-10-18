@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
+
+import httpx
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -16,6 +20,7 @@ from services.self_observer.app import create_self_observer_app
 from services.self_observer.assurance import SelfInspectionGate
 from services.self_observer.core import SelfObserverInstance
 from services.self_observer.probes import SelfObserverProbes
+from services.contracts.heartbeat import StateCurve
 
 
 def _evidence(*, assurance_state: str = "healthy", capacity: float = 0.8) -> list[StateEvidence]:
@@ -24,7 +29,7 @@ def _evidence(*, assurance_state: str = "healthy", capacity: float = 0.8) -> lis
         StateEvidence(
             domain="hardware", source_id="heartbeat", observed_at=now,
             state="healthy", confidence=0.95, stability=0.9,
-            attributes={"capacity": capacity, "active_work": 0},
+            attributes={"capacity": capacity, "active_work": 0, "active_work_observed_at": now.isoformat()},
         ),
         StateEvidence(
             domain="software", source_id="health", observed_at=now,
@@ -457,3 +462,187 @@ def test_api_is_read_only_and_exposes_state_history_and_human_status(tmp_path):
     assert unauthorized_canary.status_code == 403
     assert "sources=assurance:healthy" in human.text
     assert "inspection=observe:none" in human.text
+
+
+def _work_curve(value=0, *, age=0, device="default"):
+    timestamp = datetime.now(UTC) - timedelta(seconds=age)
+    return {
+        "key": f"system:{device}:active_work", "resource": "system", "metric": "active_work",
+        "unit": "count", "device_id": device, "current": value, "minimum": value,
+        "maximum": value, "mean": value, "slope_per_minute": 0, "sample_count": 4,
+        "duration_seconds": 90, "confidence": 1, "last_observed_at": timestamp.isoformat(),
+    }
+
+
+async def _probe_workload(metrics, *, validate=False):
+    payload = {
+        "instance_id": "test-heartbeat", "node_id": "test-node", "generated_at": datetime.now(UTC).isoformat(),
+        "window_seconds": 300, "state": "healthy", "trend": "stable", "confidence": .95,
+        "stability": 1, "metrics": metrics, "envelope": {"capacity": .8, "max_parallel_jobs": 2},
+    }
+    # The normal fixture is the actual /v1/curve contract, not an invented
+    # envelope.active_work field. Invalid metric cases are intentionally raw.
+    if validate:
+        StateCurve.model_validate(payload)
+    original_client = httpx.AsyncClient
+
+    def handle(request):
+        assert request.url.path == "/v1/curve"
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handle)
+    with patch("services.self_observer.probes.httpx.AsyncClient",
+               side_effect=lambda **kwargs: original_client(transport=transport, **kwargs)):
+        return await SelfObserverProbes().hardware()
+
+
+@pytest.mark.parametrize("value", [0, 0.4, 3])
+async def test_canonical_workload_controls_quiet_phase(tmp_path, value):
+    hardware = await _probe_workload([_work_curve(value)], validate=True)
+    assert hardware.attributes["active_work"] == value
+    assert hardware.attributes["active_work_state"] == "known"
+    assert hardware.attributes["active_work_observed_at"]
+    observer = SelfObserverInstance(store_dir=tmp_path)
+    for _ in range(4):
+        items = _evidence()
+        items[0] = hardware
+        state = observer.observe(items)
+    assert state.background_analysis_candidate is (value == 0)
+
+
+@pytest.mark.parametrize("case", ["missing", "stale", "future", "low_confidence", "negative", "nan", "unit", "malformed", "naive"])
+async def test_unknown_or_invalid_workload_never_proves_idle(tmp_path, case):
+    metric = _work_curve()
+    signal = "active_work_invalid"
+    if case == "stale":
+        metric = _work_curve(age=120)
+        signal = "active_work_stale"
+    elif case == "future":
+        metric = _work_curve(age=-120)
+        signal = "active_work_stale"
+    elif case == "low_confidence":
+        metric["confidence"] = .5
+    elif case == "negative":
+        metric["current"] = -1
+    elif case == "nan":
+        metric["current"] = "NaN"
+    elif case == "unit":
+        metric["unit"] = "ratio"
+    elif case == "malformed":
+        del metric["last_observed_at"]
+    elif case == "naive":
+        metric["last_observed_at"] = datetime.now().isoformat()
+    if case == "missing":
+        signal = "active_work_unknown"
+    hardware = await _probe_workload([] if case == "missing" else [metric])
+    assert hardware.state == "healthy"  # Unknown work is not broken hardware.
+    assert signal in hardware.signals
+    assert hardware.attributes["active_work"] is None
+    assert hardware.attributes["active_work_state"] == ("stale" if signal == "active_work_stale" else "unknown")
+    observer = SelfObserverInstance(store_dir=tmp_path)
+    for _ in range(4):
+        items = _evidence()
+        items[0] = hardware
+        state = observer.observe(items)
+    assert state.phase == "observing"
+    assert not state.background_analysis_candidate
+
+
+async def test_all_advertised_workload_metrics_must_be_fresh():
+    hardware = await _probe_workload([_work_curve(device="cpu"), _work_curve(age=120, device="gpu")])
+    assert hardware.attributes["active_work"] is None
+    hardware = await _probe_workload([_work_curve(0, device="cpu"), _work_curve(2, device="gpu")])
+    assert hardware.attributes["active_work"] == 2
+
+
+def test_workload_freshness_defaults_and_app_configuration(monkeypatch, tmp_path):
+    assert SelfObserverProbes().workload_stale_seconds == 15
+    assert SelfObserverInstance(store_dir=tmp_path).workload_stale_seconds == 15
+    assert SelfObserverProbes(workload_stale_seconds=0).workload_stale_seconds == 1
+    monkeypatch.setenv("LIARA_SELF_OBSERVER_WORKLOAD_STALE_SECONDS", "23")
+    monkeypatch.setenv("LIARA_SELF_OBSERVER_STORE_DIR", str(tmp_path))
+    with patch("services.self_observer.app.SelfObserverProbes", wraps=SelfObserverProbes) as probe_class:
+        app = create_self_observer_app(enable_collector=False)
+    assert probe_class.call_args.kwargs["workload_stale_seconds"] == 23
+    assert app.state.self_observer.workload_stale_seconds == 23
+
+
+@pytest.mark.parametrize("value", [None, -1, float("nan"), True])
+def test_direct_evidence_cannot_default_missing_or_invalid_work_to_idle(tmp_path, value):
+    items = _evidence()
+    if value is None:
+        items[0].attributes.pop("active_work")
+    else:
+        items[0].attributes["active_work"] = value
+    observer = SelfObserverInstance(store_dir=tmp_path)
+    for _ in range(4):
+        state = observer.observe(items)
+    assert state.quiet_cycles == 0
+
+
+async def test_reused_idle_measurement_expires_and_resets_hysteresis(tmp_path):
+    hardware = await _probe_workload([_work_curve()])
+    items = _evidence()
+    items[0] = hardware
+    observer = SelfObserverInstance(store_dir=tmp_path, workload_stale_seconds=60)
+    for _ in range(4):
+        assert observer.observe(items).state == "healthy"
+    assert observer.latest().phase == "quiet_stable"
+    expired = observer.observe(items, now=datetime.now(UTC) + timedelta(seconds=61))
+    assert expired.phase == "observing" and expired.quiet_cycles == 0
+
+
+@pytest.mark.parametrize("timestamp", [None, "bad", datetime.now().isoformat()])
+def test_missing_or_invalid_work_timestamp_is_not_idle(tmp_path, timestamp):
+    items = _evidence()
+    items[0].attributes["active_work_observed_at"] = timestamp
+    observer = SelfObserverInstance(store_dir=tmp_path)
+    for _ in range(4):
+        result = observer.observe(items)
+    assert result.quiet_cycles == 0
+
+
+async def test_collector_preserves_active_job_feedback_and_tracking(tmp_path):
+    observer = SelfObserverInstance(store_dir=tmp_path / "observer")
+    for _ in range(4):
+        state = observer.observe(_evidence())
+    submitter = _FakeSubmitter()
+    gate = SelfInspectionGate(mode="submit", workspace="test-only", minimum_interval_seconds=60,
+                              store_dir=tmp_path / "gate", submitter=submitter)
+    first = await gate.evaluate(state, now=datetime.now(UTC) - timedelta(seconds=61))
+    async def running(request):
+        return ValidatorStatusResponse(job_id=request.job_id, state="running",
+            status=MemoryServiceStatus(status="success", backend="memory-service"))
+    app = create_self_observer_app(observer, probes=_FakeProbes(), inspection_gate=gate, enable_collector=False)
+    with patch.object(submitter, "status", side_effect=running):
+        envelope = await app.state.collect_once()
+    assert envelope.state == "attention" and envelope.quiet_cycles == 0
+    assert "validator_job_in_progress" in envelope.signals
+    assert not gate.latest().eligible
+    assert "validator_job_already_active" in gate.latest().reasons
+    assert gate.latest().job_id == first.job_id
+    assert len(submitter.requests) == 1
+
+
+@pytest.mark.parametrize("mode", ["observe", "submit"])
+@pytest.mark.parametrize("job_state", ["queued", "running"])
+async def test_active_job_blocks_even_after_interval_with_healthy_snapshot(tmp_path, mode, job_state):
+    observer = SelfObserverInstance(store_dir=tmp_path / "observer")
+    for _ in range(4):
+        state = observer.observe(_evidence())
+    submitter = _FakeSubmitter()
+    gate = SelfInspectionGate(mode="submit", workspace="test-only", minimum_interval_seconds=60,
+                              store_dir=tmp_path / "gate", submitter=submitter)
+    old = datetime.now(UTC) - timedelta(seconds=61)
+    first = await gate.evaluate(state, now=old)
+    # Persist/reload the active decision: the guard must survive a restart.
+    gate._last_decision = first.model_copy(update={"job_state": job_state})
+    gate._persist(gate._last_decision)
+    resumed = SelfInspectionGate(mode=mode, workspace="test-only", minimum_interval_seconds=60,
+                                 store_dir=tmp_path / "gate", submitter=submitter)
+    result = await resumed.evaluate(state)
+    assert not result.eligible and result.action == "none"
+    assert result.reasons == ["validator_job_already_active"]
+    assert result.job_id == first.job_id and result.request_id == first.request_id
+    assert result.last_submitted_at == first.last_submitted_at and result.job_state == job_state
+    assert len(submitter.requests) == 1
