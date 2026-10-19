@@ -161,6 +161,18 @@ class QueryPlanner:
             primary_context_kind=request.primary_context_kind,
             has_external_context=bool(tool_section or fact_section or memory_section or relation_section or working_section or evidence_section),
         )
+        routing_instruction += (
+            "\n\nEVIDENCE SCOPE: Retrieval-first and citation rules govern claims about the external world, "
+            "personal memories, repository contents, runtime state, and tool execution. "
+            "They do not prohibit deriving an answer directly from the supplied inputs. "
+            "For self-contained arithmetic, mathematical or logical derivations, verify the calculation "
+            "and give the result directly; missing retrieved context is not a reason to refuse or ask for sources. "
+            "Do not add a fabricated source or [KNOWLEDGE_REFERENCE] to your own calculation. "
+            "Text transformations of supplied text likewise need no external citation. "
+            "If a calculation depends on missing real-world inputs (such as a current price or a measurement), "
+            "request or retrieve those inputs instead of inventing them. "
+            "These scope rules do not relax evidence requirements for empirical claims or permissions for tools."
+        )
         strict_output_contract = self._build_strict_output_contract(request.query)
 
         final_instruction = routing_instruction
@@ -796,7 +808,7 @@ Scope-filtered short-term context from this run:
             "MANDATORY: Every factual claim from [TOOL], [FACT_CONTEXT], [MEMORY_CONTEXT], "
             "[RELATION_CONTEXT], or [CHROMA_CONTEXT] MUST be followed by [KNOWLEDGE_REFERENCE].\n"
             "Do NOT add [KNOWLEDGE_REFERENCE] for [CONVERSATION_HISTORY]. Never invent facts or citations.\n"
-            "SELF-CHECK RULE: Before emitting any factual claim, verify it against available evidence in this order: "
+            "SELF-CHECK RULE: Before emitting an empirical or retrieved factual claim, verify it against available evidence in this order: "
             "[FACT_CONTEXT]/[TOOL] -> [MEMORY_CONTEXT]/[RELATION_CONTEXT] -> [CONVERSATION_HISTORY]. "
             "If evidence is missing, contradictory, or low-confidence, state uncertainty explicitly and ask for clarification "
             "instead of guessing. Do not use hardcoded world facts; rely on retrieved or provided evidence."
