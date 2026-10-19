@@ -20,7 +20,7 @@ from textual.widgets import (
 )
 from textual.screen import Screen
 from textual.reactive import reactive
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from .data_layer import AdminDataLayer
@@ -481,8 +481,10 @@ class AuditTimelinePane(TabPane):
         time_window_label, time_window_minutes = self._current_time_window_filter()
         events = await asyncio.to_thread(self.data_layer.load_audit_events, selected_session_id, 50, event_type_filter)
         if time_window_minutes is not None:
-            cutoff = datetime.now() - timedelta(minutes=time_window_minutes)
-            events = [event for event in events if event.timestamp >= cutoff]
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=time_window_minutes)
+            # Legacy naive timestamps represent local time; aware timestamps
+            # retain their explicit offset when normalized for comparison.
+            events = [event for event in events if event.timestamp.astimezone(timezone.utc) >= cutoff]
         widget = self.query_one("#audit_timeline_content", Static)
 
         if not events:
