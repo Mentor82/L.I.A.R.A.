@@ -1,6 +1,7 @@
 """Unit tests for GeneratedModelRegistry."""
 
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -173,6 +174,36 @@ def test_mark_tested(temp_registry):
     # Verify
     updated = json.loads(metadata_path.read_text())
     assert updated["execution_tested"] is True
+
+
+requires_julia = pytest.mark.skipif(shutil.which("julia") is None, reason="julia not installed")
+
+
+@requires_julia
+def test_syntax_check_does_not_execute_code(tmp_path):
+    """The syntax check parses generated code; top-level statements must not run."""
+    marker = tmp_path / "executed.txt"
+    julia_code = (
+        f"write({json.dumps(marker.as_posix())}, \"ran\")\n"
+        "function compute(inputs::Dict)::Dict\n"
+        "    return Dict(\"y\" => 1)\n"
+        "end\n"
+    )
+
+    valid, message = GeneratedModelRegistry._validate_julia_syntax(julia_code)
+
+    assert valid, message
+    assert not marker.exists()
+
+
+@requires_julia
+def test_syntax_check_rejects_invalid_code():
+    valid, message = GeneratedModelRegistry._validate_julia_syntax(
+        "function compute(inputs::Dict\n    return 1\n"
+    )
+
+    assert not valid
+    assert "ParseError" in message
 
 
 if __name__ == "__main__":

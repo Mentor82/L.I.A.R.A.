@@ -15,6 +15,29 @@ from typing import Optional, Any
 
 __all__ = ["GeneratedModelRegistry", "ModelMetadata"]
 
+# Parses the file named in ARGS[1] without evaluating it. Running the generated
+# file itself (`julia file.jl`) would execute its top-level code on the host.
+_JULIA_PARSE_ONLY = """
+src = read(ARGS[1], String)
+ex = Meta.parseall(src; filename = "generated_model.jl")
+function first_error(e)
+    e isa Expr || return nothing
+    (e.head === :error || e.head === :incomplete) && return e
+    for a in e.args
+        r = first_error(a)
+        r === nothing || return r
+    end
+    return nothing
+end
+err = first_error(ex)
+if err !== nothing
+    a = isempty(err.args) ? err.head : err.args[1]
+    msg = a isa Meta.ParseError ? a.msg : string(a)
+    println(stderr, join(filter(!isempty, strip.(split(msg, '\\n'))), " | "))
+    exit(1)
+end
+"""
+
 
 @dataclass
 class ModelMetadata:
@@ -237,8 +260,8 @@ class GeneratedModelRegistry:
     @staticmethod
     def _validate_julia_syntax(julia_code: str) -> tuple[bool, str]:
         """
-        Validate Julia code syntax.
-        
+        Validate Julia code syntax by parsing it; the code is never run.
+
         Args:
             julia_code: Julia source code.
         
@@ -255,7 +278,7 @@ class GeneratedModelRegistry:
             
             try:
                 result = subprocess.run(
-                    ["julia", "--startup-file=no", temp_path],
+                    ["julia", "--startup-file=no", "--history-file=no", "-e", _JULIA_PARSE_ONLY, temp_path],
                     capture_output=True,
                     text=True,
                     timeout=5
