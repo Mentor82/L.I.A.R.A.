@@ -41,6 +41,7 @@ def test_ruff_details_survive(tmp_path, monkeypatch):
         }]),
     ))
     result = quick.validate(tmp_path)
-    assert result["exit_code"] == 1
+    assert result["exit_code"] == 0
+    assert result["findings"][0]["severity"] == "warning"
     assert result["findings"][0]["file_path"] == "example.py"
     assert result["findings"][0]["rule"] == "F401"
