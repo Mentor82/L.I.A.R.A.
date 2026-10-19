@@ -61,6 +61,16 @@ def _judge_engine(request: Request) -> Any:
     return getattr(orchestrator, "judge_engine", None) or JudgeEngine()
 
 
+def _audit_judge(**entry: Any) -> None:
+    try:
+        log_judge_pre_action(**entry)
+    except Exception:
+        # An unavailable audit must not turn into unaudited generation.
+        raise HTTPException(status_code=503, detail={
+            "reason_code": "judge.audit_unavailable", "request_id": entry["request_id"],
+        }) from None
+
+
 @router.post("/generate")
 async def compute_generate(
     request: Request,
@@ -106,14 +116,17 @@ async def compute_generate(
     try:
         decision = _judge_engine(request).evaluate_pre_action(context)
     except Exception as exc:
-        _LOGGER.error("Pre-action judge failed for compute.generate (fail-closed): %s", exc)
-        log_judge_pre_action(decision="block", issues=["Pre-action judge failure (fail-closed)."], **audit)
-        raise HTTPException(status_code=403, detail="Pre-action judge failure (fail-closed)") from exc
-    log_judge_pre_action(
+        _LOGGER.error("Pre-action judge failed for compute.generate request_id=%s error_type=%s", context.request_id, type(exc).__name__)
+        _audit_judge(decision="block", issues=["Pre-action judge failure (fail-closed)."], **audit)
+        raise HTTPException(status_code=403, detail={
+            "reason_code": "judge.pre_action_failed",
+            "request_id": context.request_id,
+        }) from exc
+    _audit_judge(
         decision=decision.decision.value,
         issues=decision.issues,
         constraints=decision.constraints,
-        **audit,
+        **{**audit, "context": f"api.compute.generate:{decision.decision.value}"},
     )
     if not decision.passed:
         raise HTTPException(
