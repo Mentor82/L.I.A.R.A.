@@ -219,8 +219,13 @@ class MemoryServiceStore(ABC):
     async def query_history(self, request: MemoryHistoryQueryRequest) -> MemoryHistoryResponse:
         raise NotImplementedError
 
-    async def get_session_snapshot(self, session_id: str) -> dict[str, Any]:
-        raise NotImplementedError
+    async def get_session_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        return await self.session_store.get(f"session:{session_id}")
+
+    async def set_session_snapshot(
+        self, session_id: str, snapshot: dict[str, Any], ttl_seconds: int,
+    ) -> None:
+        await self.session_store.set(f"session:{session_id}", snapshot, ttl_seconds=ttl_seconds)
 
     async def upsert_session(
         self,

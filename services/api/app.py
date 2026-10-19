@@ -28,7 +28,7 @@ from services.inference.gateway import InferenceGateway
 from services.inference.tts_adapter import TtsServiceAdapter
 from services.memory.store import BackedMemoryServiceStore, EphemeralMemoryStore, NullMemoryStore
 from services.memory.tier_store import MemoryLayer
-from services.memory_adapter import InProcessMemoryAdapter, MemoryServiceAdapter
+from services.memory_adapter import InProcessMemoryAdapter, MemoryServiceAdapter, ensure_memory_service_adapter
 from services.orchestrator import Orchestrator
 from services.tools.builtin.sys_audit import configure_sys_audit_repository, log_judge_pre_action
 from services.tools.coordinator import ToolCoordinator
@@ -70,7 +70,9 @@ def _cors_allowed_origins() -> list[str]:
 
 
 def create_default_memory_adapter() -> MemoryServiceAdapter:
-    """Create default in-process memory adapter."""
+    """Honor service mode; retain the explicit in-process development path."""
+    if (Settings.MEMORY_MODE or "in_process").strip().lower() == "service":
+        return ensure_memory_service_adapter(None)
     session_store = EphemeralMemoryStore()
     fact_store = EphemeralMemoryStore()
     retrieval_store = EphemeralMemoryStore()

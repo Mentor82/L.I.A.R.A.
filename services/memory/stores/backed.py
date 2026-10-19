@@ -153,6 +153,11 @@ class BackedMemoryServiceStore(MemoryServiceStore):
         if self._uses_qdrant and self.retrieval_index is None:
             self.retrieval_index = RetrievalIndex()
         self.retrieval_store = self.retrieval_index or EphemeralMemoryStore()
+        # Keep one fallback per service instance so writes remain searchable
+        # when Chroma is absent or a backend operation fails.
+        self._context_fallback_store = InMemoryMemoryServiceStore()
+        # All relation operations must share the same per-instance fallback.
+        self._relation_fallback_store = InMemoryMemoryServiceStore()
 
         # Chroma context store — optional; only active when CHROMA_HOST is set.
         self.context_store = context_store
