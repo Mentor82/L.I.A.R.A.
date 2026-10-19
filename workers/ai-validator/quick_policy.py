@@ -66,7 +66,9 @@ def config_digest(root):
     paths = sorted({p.relative_to(root).as_posix() for p in paths
                     if p.name in {"pyproject.toml", "ruff.toml", ".ruff.toml", ".shellcheckrc", "package.json", "package-lock.json"}
                     or (p.name.startswith("tsconfig") and p.suffix == ".json")})
-    return digest([(name, hashlib.sha256((root / name).read_bytes()).hexdigest())
+    # Git checkouts may use CRLF on Windows and LF in Linux containers/CI.
+    # Configuration provenance tracks content, not checkout newline conversion.
+    return digest([(name, hashlib.sha256((root / name).read_text(encoding="utf-8-sig").encode()).hexdigest())
                    for name in paths if (root / name).is_file()])
 
 

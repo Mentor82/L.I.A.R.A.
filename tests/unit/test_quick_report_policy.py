@@ -69,6 +69,13 @@ def test_shared_assurance_verdict(severity, strict, verdict, exit_code):
 
 
 def test_baseline_provenance_and_critical_rules_cannot_be_corrupted(tmp_path):
+    config = tmp_path / "pyproject.toml"
+    config.write_bytes(b"[tool.example]\r\nvalue = 1\r\n")
+    original = policy.config_digest(tmp_path)
+    config.write_bytes(b"[tool.example]\nvalue = 1\n")
+    assert policy.config_digest(tmp_path) == original
+    config.write_text("[tool.example]\nvalue = 2\n")
+    assert policy.config_digest(tmp_path) != original
     path = tmp_path / "baseline.json"
     for b in [dict(schema_version=99), baseline([dict(rule="F821", fingerprint="a" * 64, count=1)])]:
         path.write_text(json.dumps(b))

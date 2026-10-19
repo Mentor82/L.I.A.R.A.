@@ -5,7 +5,7 @@
     "reference_commit": "536938b3a533869e0610d8b10f945fb7c4a6baa3",
     "source_report_sha256": "a93be68513967ded3a1d9a8fb8051a387ce98464dffbc5d31934af4cafe7a040",
     "selection": "Explicit cosmetic allowlist only; tracked paths at reference commit; not syntax/functional/security/EXE002",
-    "config_digest": "5bd3bab3ec677a51a7c02dfd617c6cca6e5bcf65b4e3308213f58333b9e37b8f",
+    "config_digest": "67e27849c99dc2d5c8402efccbe8237f39c5c4be10f8e0a0d9f6c317adffe3aa",
     "checker_versions": {
       "ruff": "ruff 0.16.2",
       "shellcheck": "ShellCheck - shell script analysis tool\nversion: 0.10.0\nlicense: GNU General Public License, version 3\nwebsite: https://www.shellcheck.net",
