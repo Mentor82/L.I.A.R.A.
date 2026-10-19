@@ -376,6 +376,89 @@ class TestQueryPlanner:
         assert "STRICT_OUTPUT_MODE: numeric_only" not in plan.prompt
         assert plan.metadata["strict_output_contract"] is False
 
+    def test_build_plan_enforces_personal_denkraum_contract_for_personal_plan(self):
+        planner = QueryPlanner()
+        plan = planner.build_plan(
+            PlannerRequest(
+                query=(
+                    "Ich plane ein Smart-Home-Projekt. Mein Budget ist 1500 Euro "
+                    "und ich bin unsicher, ob ein Mini-PC oder NAS besser ist."
+                ),
+                tools_used=[],
+                tool_outputs={},
+            )
+        )
+
+        assert "PERSONAL_DENKRAUM_MODE: active." in plan.prompt
+        assert '"Extraktion"' in plan.prompt
+        assert '"Denkraum"' in plan.prompt
+        assert '"Nächster Schritt"' in plan.prompt
+        assert '"Zur Bestätigung"' in plan.prompt
+        assert "Do not claim that anything was stored" in plan.prompt
+        assert plan.metadata["personal_denkraum_contract"] is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "Ich plane ein Smart-Home-Projekt. Mein Budget ist 1500 Euro und ich brauche eine Beratung, wie ich vorgehen soll.",
+            "Ich muss eine Entscheidung für mein Vorhaben treffen: NAS oder Mini-PC? Bitte um Abwägung der Optionen.",
+            "Ich möchte mein Vorhaben strukturieren. Lass uns einen Denkraum öffnen für meine Prioritäten.",
+            "Denkraum: Welche Architektur für das neue Modul?",
+            "In my project I need to decide between SQLite and PostgreSQL, what do you recommend for our budget?",
+            "Denkraum: mein Projekt baut nicht, soll ich alles neu aufsetzen?",
+            "Ich muss mich entscheiden: Fehlerkultur im Team-Projekt verbessern oder Prozesse verschärfen, was empfiehlst du?",
+            "Ich muss mich entscheiden: Fehlerkultur im Team-Projekt verbessern oder neues Ziel setzen?",
+        ],
+    )
+    def test_build_plan_enables_personal_denkraum_for_deliberation_and_explicit_prompts(self, query):
+        planner = QueryPlanner()
+        plan = planner.build_plan(
+            PlannerRequest(
+                query=query,
+                tools_used=[],
+                tool_outputs={},
+            )
+        )
+
+        assert "PERSONAL_DENKRAUM_MODE: active." in plan.prompt
+        assert plan.metadata["personal_denkraum_contract"] is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "What is Home Assistant?",
+            "Wie installiere ich Docker unter Linux?",
+            "Mein Projekt baut nicht, was bedeutet error TS2307?",
+            "Ich bin mir bei dieser Regex unsicher, wie matche ich Zahlen?",
+            "In my project I get a NullPointerException in line 42.",
+            "Mein Ziel ist es, diese Liste mit Python zu sortieren.",
+            "We have a deadline tomorrow and need to fix this crash.",
+            "Ich habe eine Frage zu meinem Git-Commit.",
+            "ich plane den Build, aber CMake schlägt fehl",
+            "Why does my build fail with segfault?",
+            "In my project I have a bug, should I rewrite the module?",
+            "Mein Projekt hat einen Fehler, wie soll ich vorgehen?",
+            "Mein Projekt crasht mit einer Exception, was empfiehlst du?",
+            "My failing test schlägt fehl, wie plane ich den Fix?",
+            "In meinem Code gibt es einen Stacktrace, was rätst du?",
+            "Die Funktion funktioniert nicht in meinem Projekt, wie gehe ich vor?",
+            "Mein Projekt läuft nicht mehr seit dem Update, was rätst du?",
+            "Mein Projekt wirft Fehlermeldungen, soll ich neu installieren?",
+        ],
+    )
+    def test_build_plan_does_not_enable_personal_denkraum_for_technical_or_non_deliberative_queries(self, query):
+        planner = QueryPlanner()
+        plan = planner.build_plan(
+            PlannerRequest(
+                query=query,
+                tools_used=[],
+                tool_outputs={},
+            )
+        )
+
+        assert "PERSONAL_DENKRAUM_MODE: active." not in plan.prompt
+        assert plan.metadata["personal_denkraum_contract"] is False
+
 
 class TestLibrarianRouter:
     def test_liara_architecture_profile_expands_read_context_lanes(self):
