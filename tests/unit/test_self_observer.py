@@ -231,6 +231,85 @@ async def test_inspection_gate_closes_validator_feedback_loop_with_structured_fi
     assert "validator_findings" in observed.signals
 
 
+@pytest.mark.parametrize("tail,exit_code,expected,domain", [
+    ("error", 1, "failed", "degraded"),
+    ("warning", 0, "attention", "attention"),
+    (None, 0, "passed", "healthy"),
+    (None, 1, "failed", "degraded"),
+    (None, None, "unknown", "attention"),
+])
+async def test_full_quality_survives_preview_persistence_and_evaluate(tmp_path, tail, exit_code, expected, domain):
+    findings = [ValidatorFinding(severity="info", message=f"known-{i}", metadata={"disposition": "baseline"}) for i in range(100)]
+    if tail:
+        findings.append(ValidatorFinding(severity=tail, message="beyond-preview"))
+
+    class Submitter(_FakeSubmitter):
+        async def result(self, request):
+            return ValidatorResultResponse(job_id=request.job_id, state="completed", findings=findings,
+                                           summary={"exit_code": exit_code},
+                                           status=MemoryServiceStatus(status="success", backend="memory-service"))
+
+    observer = SelfObserverInstance(store_dir=tmp_path / "observer", quiet_candidate_cycles=1, quiet_stable_cycles=2)
+    observer.observe(_evidence())
+    state = observer.observe(_evidence())
+    gate = SelfInspectionGate(mode="submit", workspace="C:/ai/LIARA", store_dir=tmp_path / "gate", submitter=Submitter())
+    await gate.evaluate(state)
+    result = await gate.refresh()
+    assert result.job_state == "completed"
+    assert len(result.findings) == 100
+    assert result.findings_total == len(findings)
+    assert result.quality_verdict == expected
+    assert result.disposition_counts["baseline"] == 100
+    assert result.disposition_counts["new"] == int(tail is not None)
+    app = create_self_observer_app(observer, probes=_FakeProbes(), inspection_gate=gate, enable_collector=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://observer") as client:
+        response = await client.get("/v1/inspection")
+    assert response.status_code == 200
+    assert response.json()["quality_verdict"] == expected
+    assert response.json()["findings_total"] == len(findings)
+    assert len(response.json()["findings"]) == 100
+    for candidate in (gate, SelfInspectionGate(mode="observe", workspace="C:/ai/LIARA", store_dir=tmp_path / "gate")):
+        evidence = candidate.assurance_evidence()
+        assert evidence.state == domain
+        assert evidence.attributes["quality_verdict"] == expected
+        assert evidence.attributes["findings_count"] == len(findings)
+        decision = await candidate.evaluate(state)
+        assert decision.quality_verdict == expected
+        assert decision.findings_total == len(findings)
+        observed = observer.observe([e for e in _evidence() if e.domain != "assurance"] + [evidence])
+        if expected != "passed":
+            assert observed.phase != "quiet_stable"
+            assert observed.background_analysis_candidate is False
+            assert (await candidate.evaluate(observed)).eligible is False
+        if expected in {"failed", "attention", "unknown"}:
+            # Technical completion cannot disable the explicit operator-only
+            # recovery path; cyclic submission remains blocked by assurance.
+            assert candidate._is_failed_assurance_retry(observed)
+            retry = await candidate.submit_canary(observed, authorization_id="operator-test-authorization",
+                                                 reason="operator requested quality refresh")
+            if candidate.submitter is not None:
+                assert retry.action == "submitted"
+                assert retry.quality_verdict is None
+
+
+async def test_legacy_or_inconsistent_quality_cannot_be_healthy(tmp_path):
+    observer = SelfObserverInstance(store_dir=tmp_path / "observer", quiet_candidate_cycles=1, quiet_stable_cycles=2)
+    observer.observe(_evidence())
+    state = observer.observe(_evidence())
+    gate = SelfInspectionGate(mode="submit", workspace="C:/ai/LIARA", store_dir=tmp_path / "gate", submitter=_FakeSubmitter())
+    await gate.evaluate(state)
+    result = await gate.refresh()
+    for update in [
+        {"quality_verdict": None, "findings_total": None, "severity_counts": {}, "highest_severity": None},
+        {"quality_verdict": "passed"},
+        {"findings_total": 0},
+    ]:
+        gate._last_decision = result.model_copy(update=update)
+        gate._persist(gate._last_decision)
+        loaded = SelfInspectionGate(mode="observe", workspace="C:/ai/LIARA", store_dir=tmp_path / "gate")
+        assert loaded.assurance_evidence().state != "healthy"
+
+
 async def test_operator_canary_uses_real_observed_state_and_records_complete_transitions(tmp_path):
     state = SelfObserverInstance(store_dir=tmp_path / "observer").observe(_evidence(capacity=0.1))
     assert state.state == "healthy"

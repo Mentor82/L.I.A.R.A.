@@ -260,54 +260,11 @@ quick_find() {
 }
 
 quick_validate() {
-    log_info "==== Quick Multi-Language Check ===="
-    log_info "Scope: first-party source roots; vendor/generated/runtime directories pruned"
+    # Do not suppress checker failures or write pyc files into /workspace:ro.
+    python3 "$(dirname "${BASH_SOURCE[0]}")/quick_validate.py" \
+        --workspace "${WORKSPACE}" --report "${REPORT_DIR}/quick-report.json"
+    return $?
 
-    log_lang "Python"
-    local py_count
-    py_count=$(quick_find -type f -name "*.py" | tr -cd '\0' | wc -c)
-    if [ "${py_count}" -gt 0 ]; then
-        log_info "  ${py_count} files: syntax check..."
-        quick_find -type f -name "*.py" | xargs -0 -r python3 -m py_compile \
-            2>&1 | tee -a "${REPORT_DIR}/python-syntax.log" >/dev/null || true
-        log_info "  Ruff linting..."
-        quick_find -type f -name "*.py" | xargs -0 -r ruff check --output-format=concise \
-            2>&1 | tee -a "${REPORT_DIR}/python-ruff.log" >/dev/null || true
-        log_success "  Python quick validation complete"
-    else
-        log_warn "No Python files found"
-    fi
-    echo ""
-
-    log_lang "JavaScript/TypeScript"
-    local js_count
-    js_count=$(quick_find -type f \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) | tr -cd '\0' | wc -c)
-    if [ "${js_count}" -gt 0 ]; then
-        local web_root="${WORKSPACE}/frontend/web-ui"
-        if [ -x "${web_root}/node_modules/.bin/tsc" ] && [ -f "${web_root}/tsconfig.json" ]; then
-            log_info "  ${js_count} files: project TypeScript check..."
-            (cd "${web_root}" && ./node_modules/.bin/tsc --noEmit --incremental false) \
-                2>&1 | tee -a "${REPORT_DIR}/typescript.log" >/dev/null || true
-            log_success "  TypeScript quick validation complete"
-        else
-            log_warn "Project-local TypeScript runtime unavailable; skipped in quick scope"
-        fi
-    else
-        log_warn "No JavaScript/TypeScript files found"
-    fi
-    echo ""
-
-    log_lang "Bash/Shell"
-    local sh_count
-    sh_count=$(quick_find -type f -name "*.sh" | tr -cd '\0' | wc -c)
-    if [ "${sh_count}" -gt 0 ]; then
-        log_info "  ${sh_count} files: ShellCheck scanning..."
-        quick_find -type f -name "*.sh" | xargs -0 -r shellcheck --format=json \
-            > "${REPORT_DIR}/bash-shellcheck.json" 2>&1 || true
-        log_success "  Bash quick validation complete"
-    else
-        log_warn "No Bash scripts found"
-    fi
 }
 
 langs_only() {

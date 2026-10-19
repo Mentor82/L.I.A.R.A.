@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { inspectionEvidence, type InspectionSnapshot } from "./inspection-quality";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Network, RefreshCw } from "lucide-react";
 import LiaraLogo from "../components/LiaraLogo";
@@ -133,7 +134,7 @@ type LiveEvidenceState = {
       signals?: string[];
     } | null;
     history?: Array<{ sequence?: number; state?: string; phase?: string }>;
-    inspection?: {
+    inspection?: InspectionSnapshot & {
       mode?: string;
       eligible?: boolean;
       action?: string;
@@ -336,20 +337,7 @@ export default function ArchitectureMap() {
       ];
       if (live.selfObserver.inspection) {
         const inspection = live.selfObserver.inspection;
-        const findingCount = inspection.findings?.length ?? 0;
-        const gateValue = inspection.job_id
-          ? `${inspection.mode ?? "unknown"}:${inspection.job_state ?? inspection.action ?? "none"}`
-          : `${inspection.mode ?? "unknown"}:${inspection.action ?? "none"}`;
-        items.push({
-          label: "Assurance-Gate",
-          value: gateValue,
-          detail: findingCount > 0
-            ? `${findingCount} strukturierte Findings · ${inspection.findings?.[0]?.severity ?? "unknown"}`
-            : inspection.reasons?.length
-              ? inspection.reasons.join(", ")
-              : "Pruefzyklus waere freigegeben",
-          state: inspection.action === "failed" || findingCount > 0 ? "attention" : "healthy",
-        });
+        items.push(...inspectionEvidence(inspection));
       }
       return items;
     }

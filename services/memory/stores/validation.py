@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import os
+import json
+import importlib.util
+import hashlib
+from pathlib import Path
+from uuid import uuid4
 import re
 import shutil
 import subprocess
@@ -278,6 +283,52 @@ def _execute_docker_compose_validator_job(*, job_id: str, workspace: str, scope:
 
     validator_command = _validator_scope_to_command(scope, checks)
     command = [docker_cli, "compose", "-f", compose_file, "run", "--rm", "ai-validator", validator_command]
+    if validator_command == "quick":
+        # Each execution/retry has its own output directory and identity.
+        artifacts_dir = os.path.join(artifacts_dir, "attempt-" + uuid4().hex)
+        os.makedirs(artifacts_dir, exist_ok=False)
+        log_path = os.path.join(artifacts_dir, "run.log")
+        runner = os.path.abspath(os.path.join(worker_root, "quick_validate.py"))
+        spec = importlib.util.spec_from_file_location("liara_quick_runner", runner)
+        quick = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(quick)
+        baseline_path = os.path.join(worker_root, "quick-baseline.json")
+        baseline = quick.policy.load_baseline(baseline_path)
+        policy_path = os.path.join(worker_root, "quick_policy.py")
+        binding = dict(job_id=job_id, attempt_id=os.path.basename(artifacts_dir),
+                       workspace_digest=quick.workspace_digest(validator_workspace),
+                       runner_digest=hashlib.sha256(Path(runner).read_bytes()).hexdigest(),
+                       policy_digest=hashlib.sha256(Path(policy_path).read_bytes()).hexdigest(),
+                       config_digest=quick.policy.config_digest(validator_workspace),
+                       required_checks=quick.required_checks(validator_workspace))
+        context = dict(host_platform=os.name, direct_windows_bind=(os.name == "nt"
+                       and bool(re.match(r"^[A-Za-z]:[\\/]", validator_workspace))
+                       and not workspace_staging.get("staged", False)),
+                       git_modes={})
+        if context["direct_windows_bind"]:
+            try:
+                git = subprocess.run(["git", "ls-files", "--stage", "-z"], cwd=validator_workspace,
+                                     capture_output=True, text=True, timeout=10, check=True)
+                for row in git.stdout.split("\0"):
+                    if "\t" in row:
+                        meta, name = row.split("\t", 1)
+                        if meta.split()[2] == "0":
+                            context["git_modes"][name] = meta.split()[0]
+            except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+                pass  # No Git-mode evidence means no EXE002 exception.
+        context_path = os.path.join(artifacts_dir, "execution-context.json")
+        Path(context_path).write_text(json.dumps(context), encoding="utf-8")
+        command = [docker_cli, "compose", "-f", compose_file, "run", "--rm", "--no-deps",
+                   "-v", f"{runner}:/opt/liara-quick.py:ro",
+                   "-v", f"{policy_path}:/opt/quick_policy.py:ro",
+                   "-v", f"{baseline_path}:/opt/quick-baseline.json:ro",
+                   "-v", f"{context_path}:/opt/quick-context.json:ro",
+                   "-v", f"{artifacts_dir}:/reports", "--entrypoint", "python3",
+                   "ai-validator", "/opt/liara-quick.py", "--workspace", "/workspace",
+                   "--report", "/reports/quick-report.json", "--binding", json.dumps(binding),
+                   "--execution-context-file", "/opt/quick-context.json"]
+        if strict_mode:
+            command.append("--strict")
     env = os.environ.copy()
     env["WORKSPACE_PATH"] = validator_workspace
     env["STRICT_MODE"] = "true" if strict_mode else "false"
@@ -330,7 +381,27 @@ def _execute_docker_compose_validator_job(*, job_id: str, workspace: str, scope:
 
     state: Literal["completed", "failed"] = "completed" if completed.returncode == 0 else "failed"
     findings: list[dict[str, Any]] = []
-    if completed.returncode != 0:
+    if validator_command == "quick":
+        try:
+            with open(os.path.join(artifacts_dir, "quick-report.json"), encoding="utf-8") as report_file:
+                report = json.load(report_file)
+            quick.policy.validate_report(report, binding, baseline, context, strict_mode)
+            if quick.workspace_digest(validator_workspace) != binding["workspace_digest"]:
+                raise ValueError("Workspace changed after checker execution")
+            if completed.returncode != report["exit_code"]:
+                raise ValueError("Process/report exit code mismatch")
+            findings = [{"file_path": f["file_path"], "line": f.get("line"), "rule": f["rule"],
+                         "severity": f["severity"], "message": f["message"],
+                         "metadata": {k: v for k, v in f.items() if k not in {
+                             "file_path", "line", "rule", "severity", "message"}}}
+                        for f in report["findings"]]
+            # Technical completion is independent of the quality verdict.
+            state = "completed"
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            state = "failed"
+            findings.append({"severity": "error", "rule": "quick_report_invalid",
+                             "message": f"Missing or invalid quick report: {exc}"})
+    if completed.returncode != 0 and not (validator_command == "quick" and state == "completed"):
         findings.append(
             {
                 "severity": "error",
@@ -351,11 +422,14 @@ def _execute_docker_compose_validator_job(*, job_id: str, workspace: str, scope:
             "workspace_staging": workspace_staging,
             "scope": validator_command,
             "duration_ms": duration_ms,
-            "exit_code": completed.returncode,
+            "exit_code": (report["exit_code"] if validator_command == "quick" and state == "completed" else completed.returncode),
+            "quality_verdict": (report["verdict"] if validator_command == "quick" and state == "completed" else "failed"),
             "findings_count": len(findings),
         },
         "findings": findings,
-        "artifacts": [log_path],
+        "artifacts": [log_path] + (
+            [os.path.join(artifacts_dir, "quick-report.json")] if validator_command == "quick" else []
+        ),
     }
 
 
@@ -551,17 +625,9 @@ def _validator_assurance_verdict(result: ValidatorResultResponse) -> Literal["pe
     if result.state == "failed" or result.status.status == "failed":
         return "failed"
 
-    severities = {finding.severity for finding in result.findings}
-    raw_exit_code = result.summary.get("exit_code")
-    try:
-        exit_code = int(raw_exit_code) if raw_exit_code is not None else None
-    except (TypeError, ValueError):
-        exit_code = None
-    if "error" in severities or (exit_code is not None and exit_code != 0):
-        return "failed"
-    if "warning" in severities or exit_code is None:
-        return "attention"
-    return "passed"
+    from services.validator.quality import project_result
+    quality = project_result(result)["quality_verdict"]
+    return "attention" if quality == "unknown" else quality
 
 
 def _validator_assurance_evidence(

@@ -1,5 +1,6 @@
 import asyncio
 import time
+import threading
 import pytest
 from unittest.mock import patch
 
@@ -8,11 +9,54 @@ from services.memory.stores.in_memory import InMemoryMemoryServiceStore
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["completed", "failed"])
+async def test_lease_is_cleared_for_each_terminal_execution(state):
+    store = InMemoryMemoryServiceStore()
+    with patch("services.memory.stores.in_memory._validator_async_enabled", return_value=False), \
+         patch("services.memory.store._execute_validator_job", return_value={
+             "state": state, "summary": {}, "findings": [], "artifacts": [],
+         }):
+        result = await store.validator_submit(ValidatorSubmitRequest(workspace="C:/workspace", scope="quick"))
+    payload = store._validator_jobs[result.job_id]
+    assert payload["state"] == state
+    assert payload["lease_owner"] is None
+    assert payload["lease_expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_old_fencing_token_cannot_overwrite_reclaimed_result():
+    store = InMemoryMemoryServiceStore()
+    entered, release = threading.Event(), threading.Event()
+
+    def old_worker(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return {"state": "failed", "summary": {"owner": "old"}, "findings": [], "artifacts": []}
+
+    with patch("services.memory.stores.in_memory._validator_async_enabled", return_value=True), \
+         patch("services.memory.store._execute_validator_job", side_effect=old_worker):
+        result = await store.validator_submit(ValidatorSubmitRequest(workspace="C:/workspace", scope="quick"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            payload = store._validator_jobs[result.job_id]
+            payload.update(fencing_token=payload.get("fencing_token", 1) + 1, state="completed",
+                           summary={"owner": "new"}, lease_owner=None, lease_expires_at=None)
+        finally:
+            release.set()
+        await store._validator_tasks[result.job_id]
+    assert payload["state"] == "completed"
+    assert payload["summary"] == {"owner": "new"}
+
+
+@pytest.mark.asyncio
 async def test_validator_job_lease_and_fencing_token():
     store = InMemoryMemoryServiceStore()
     
     # Submit job in sync mode to inspect lease lifecycle
-    with patch("services.memory.stores.in_memory._validator_async_enabled", return_value=False):
+    with patch("services.memory.stores.in_memory._validator_async_enabled", return_value=False), \
+         patch("services.memory.store._execute_validator_job", return_value={
+             "state": "completed", "summary": {"exit_code": 0}, "findings": [], "artifacts": [],
+         }):
         res = await store.validator_submit(
             ValidatorSubmitRequest(
                 workspace="C:/workspace",
