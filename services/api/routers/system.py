@@ -14,6 +14,12 @@ from services.memory.store import BackedMemoryServiceStore
 router = APIRouter(tags=["system"])
 
 
+@router.get("/health/workload")
+async def workload(request: Request, response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    return request.app.state.workload_tracker.snapshot()
+
+
 def _postgres_backend_usable() -> bool:
     return bool(getattr(Settings, "POSTGRES_URL", os.getenv("POSTGRES_URL")))
 

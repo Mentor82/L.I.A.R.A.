@@ -84,6 +84,22 @@ in der Architekturkarte bewusst nicht ausgebreitet.
 .\.venv\Scripts\python.exe -m pytest -q tests\unit\test_heartbeat_service.py
 ```
 
+## API-Arbeitsmelder
+
+Der native Adapter liest `GET http://127.0.0.1:8010/health/workload`
+und liefert `system:liara-api:active_work` (`count`). Der API-Melder zaehlt
+laufende HTTP-Arbeit bis zum Ende des ASGI-Aufrufs, einschliesslich Streams,
+Fehlern und Abbruechen. Reine Health-/Heartbeat-/Observer-Abfragen zaehlen
+nicht selbst als Arbeit. Der Quellzeitstempel bleibt erhalten; fehlende,
+ungueltige oder ueber 15 Sekunden alte Daten werden nicht als Null gemeldet.
+Der Observer nutzt diese kanonische Kurve mit seiner bestehenden Frischepolicy.
+
+Die Abdeckung ist ausdruecklich `single_api_worker`: vorgesehen fuer die lokale
+API mit einem Uvicorn-Worker. Dies ist keine globale Queue-/Cluster-Leerlaufgarantie.
+Direkte Inferenz ausserhalb der API sowie Jobs nach dem Ende eines HTTP-Aufrufs
+sind nicht enthalten. Vor Multiworker-/Queue-Betrieb ist ein aggregierter Melder
+erforderlich; die Prozessmetrik darf dort nicht als globale Ruhefreigabe dienen.
+
 ## Noch offen
 
 - HWiNFO-Livequelle konfigurieren oder einen kanonischen Export-Bridgeprozess
