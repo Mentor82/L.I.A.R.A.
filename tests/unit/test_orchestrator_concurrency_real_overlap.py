@@ -193,7 +193,7 @@ async def test_shared_orchestrator_instance_concurrency_no_attribute_leakage():
     orch_ref.append(orchestrator)
 
     async def run_worker(idx: int):
-        sim_mode = f"sim_mode_{idx}"
+        sim_mode = (idx % 2 == 0)
         req = OrchestratorRequest(
             session_id=f"shared_session_{idx}",
             user_id=f"shared_user_{idx}",
@@ -212,13 +212,14 @@ async def test_shared_orchestrator_instance_concurrency_no_attribute_leakage():
     # Validate that all 10 parallel runs observed strictly isolated attributes without cross-leakage
     for i in range(10):
         obs = observed_states[i]
+        expected_sim = (i % 2 == 0)
         assert obs["active_session"] == f"shared_session_{i}"
         assert obs["active_user"] == f"shared_user_{i}"
         assert obs["active_run"] == f"shared_run_{i}"
         assert obs["active_sandbox"] == f"/sandbox/{i}"
-        assert obs["simulation_mode"] == f"sim_mode_{i}"
+        assert obs["simulation_mode"] == expected_sim
         assert obs["current_context"].session_id == f"shared_session_{i}"
-        assert obs["current_context"].simulation_mode == f"sim_mode_{i}"
+        assert obs["current_context"].simulation_mode == expected_sim
 
         res = results[i]
         assert res.session_id == f"shared_session_{i}"
