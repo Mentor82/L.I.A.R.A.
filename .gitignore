@@ -44,3 +44,18 @@ data/
 ._*
 .vscode/
 .idea/
+
+# Local runtime databases in the repository root only
+# (db/**/*.db are tracked data and must stay visible)
+/vinox.db
+/vinox.db-shm
+/vinox.db-wal
+
+# Frontend build output
+.next/
+.next-*/
+node_modules/
+*.tsbuildinfo
+
+# Rust build output (already tracked files under target/ stay tracked)
+target/
