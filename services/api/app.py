@@ -176,6 +176,9 @@ def create_api_app(
         await _maybe_close(adapter)
 
     app = FastAPI(title="liara-api", lifespan=_lifespan)
+    from services.api.workload import WorkloadMiddleware, WorkloadTracker
+    app.state.workload_tracker = WorkloadTracker()
+    app.add_middleware(WorkloadMiddleware, tracker=app.state.workload_tracker)
     app.add_exception_handler(GovernanceError, _governance_domain_exception_handler)
     app.add_middleware(
         CORSMiddleware,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import httpx
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -21,6 +22,30 @@ class NativeSystemAdapter:
     """Portable direct reader. Optional psutil expands available measurements."""
 
     source_id = "native-system"
+
+    def __init__(self, workload_url: str = "http://127.0.0.1:8010/health/workload") -> None:
+        self.workload_url = workload_url
+
+    def _workload_observations(self, now: datetime) -> list[ResourceObservation]:
+        """Unavailable/invalid telemetry is omitted, never replaced with zero."""
+        try:
+            response = httpx.get(self.workload_url, timeout=1.0, trust_env=False,
+                                 headers={"Cache-Control": "no-cache"})
+            response.raise_for_status()
+            payload = response.json()
+            value = payload["active_work"]
+            observed_at = datetime.fromisoformat(payload["observed_at"])
+            if (payload.get("scope") != "single_api_worker" or type(value) is not int or value < 0
+                    or observed_at.tzinfo is None
+                    or not -5 <= (now - observed_at).total_seconds() <= 15):
+                return []
+            return [ResourceObservation(
+                resource="system", device_id="liara-api", metric="active_work", value=value,
+                unit="count", source_id="liara-api-workload", observed_at=observed_at,
+                attributes={"scope": "single_api_worker"},
+            )]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, OverflowError):
+            return []
 
     def collect(self, *, node_id: str) -> ObservationBatch:
         try:
@@ -64,6 +89,7 @@ class NativeSystemAdapter:
                     device_id=f"{group}:{index}", source_id=self.source_id, observed_at=now,
                     attributes={"label": entry.label or group},
                 ))
+        observations.extend(self._workload_observations(datetime.now(UTC)))
         return ObservationBatch(node_id=node_id, observations=observations)
 
 
