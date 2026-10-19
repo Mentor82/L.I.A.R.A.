@@ -1,12 +1,16 @@
+#Requires -RunAsAdministrator
+
 param(
-    [string]$DumpFolder = "C:\ai\LIARA\logs\dumps",
-    [int]$DumpCount = 5,
+    [string]$DumpFolder = "C:\ai\LIARA\logs\dumps\embedding",
+    [ValidateRange(1, 10)]
+    [int]$DumpCount = 3,
+    [ValidateSet(1, 2)]
     [int]$DumpType = 2
 )
 
 $ErrorActionPreference = "Stop"
 
-$dumpKey = "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\LiaraEmbeddingService.exe"
+$dumpKey = "HKLM:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\LiaraEmbeddingService.exe"
 
 New-Item -ItemType Directory -Force -Path $DumpFolder | Out-Null
 New-Item -Force -Path $dumpKey | Out-Null
@@ -16,7 +20,7 @@ New-ItemProperty -Path $dumpKey -Name DumpType -Value $DumpType -PropertyType DW
 
 [pscustomobject]@{
     ok = $true
-    scope = "HKCU"
+    scope = "HKLM"
     executable = "LiaraEmbeddingService.exe"
     dump_folder = $DumpFolder
     dump_count = $DumpCount
