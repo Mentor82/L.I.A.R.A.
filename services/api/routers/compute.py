@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
-from fastapi import APIRouter, HTTPException, Request, Response
+from uuid import uuid4
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from services.api.security import Principal, get_verified_principal
+from services.judge.contracts import JudgeContext, JudgeStage
+from services.judge.engine import JudgeEngine
 from services.simulation.bridge import JuliaBridge
 from services.simulation.runner import SimulationRunner
 from services.tools.builtin.compute_generate import ComputeGenerateTool
@@ -49,8 +53,17 @@ async def compute_models(response: Response) -> dict[str, Any]:
     return {"models": bridge.list_available()}
 
 
+def _judge_engine(request: Request) -> Any:
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    return getattr(orchestrator, "judge_engine", None) or JudgeEngine()
+
+
 @router.post("/generate")
-async def compute_generate(request: Request, response: Response) -> dict[str, Any]:
+async def compute_generate(
+    request: Request,
+    response: Response,
+    principal: Principal = Depends(get_verified_principal),
+) -> dict[str, Any]:
     """Generate a new Julia computation model from natural language.
 
     Body JSON:
@@ -62,11 +75,33 @@ async def compute_generate(request: Request, response: Response) -> dict[str, An
     """
     response.headers["Cache-Control"] = "no-store"
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
 
     # Validate required fields
     for required in ["model_name", "description", "inputs", "outputs"]:
         if required not in body:
             raise HTTPException(status_code=422, detail=f"'{required}' field is required")
+
+    # Same pre-action gate as the orchestrator's tool path; fail closed.
+    context = JudgeContext(
+        request_id=f"api-compute-{uuid4().hex[:12]}",
+        stage=JudgeStage.PRE_ACTION,
+        actor=principal.actor_id,
+        intent="compute.generate",
+        action="compute.generate",
+        input=body,
+        metadata={"source": "api", "principal_source": principal.source},
+    )
+    try:
+        decision = _judge_engine(request).evaluate_pre_action(context)
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail=f"Pre-action judge failure (fail-closed): {exc}") from exc
+    if not decision.passed:
+        raise HTTPException(
+            status_code=403,
+            detail={"decision": decision.decision.value, "issues": decision.issues},
+        )
 
     tool = ComputeGenerateTool()
     result = await tool.execute(**body)
