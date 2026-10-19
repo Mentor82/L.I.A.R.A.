@@ -102,9 +102,21 @@ POST /embedding/generate
 From `C:\ai\LIARA`:
 
 ```powershell
-cmake -S src/emeddingserver -B src/emeddingserver/build -DOpenVINO_DIR=C:\Users\WM\AppData\Roaming\Python\Python312\site-packages\openvino\cmake
-cmake --build src/emeddingserver/build --target LiaraEmbeddingService
+cmake -S src/emeddingserver -B artifacts/builds/embedding-msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DOpenVINO_DIR=C:\ai\LIARA\.venv\Lib\site-packages\openvino\cmake
+cmake --build artifacts/builds/embedding-msvc --target LiaraEmbeddingService
 ```
+
+MSVC Release builds stay optimized and emit a matching
+`LiaraEmbeddingService.pdb`. Deploy the EXE and PDB together; WinDbg rejects a
+PDB whose signature does not match the executable.
+
+Enable up to three full WER dumps from an elevated PowerShell:
+
+```powershell
+.\scripts\enable_embedding_localdumps.ps1
+```
+
+The dumps are written to `C:\ai\LIARA\logs\dumps\embedding`.
 
 ## Run
 
