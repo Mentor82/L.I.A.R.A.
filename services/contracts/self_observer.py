@@ -90,6 +90,11 @@ class SelfInspectionDecision(BaseModel):
     job_state: str | None = None
     completed_at: datetime | None = None
     exit_code: int | None = None
+    quality_verdict: Literal["passed", "attention", "failed", "unknown"] | None = None
+    findings_total: int | None = Field(default=None, ge=0)
+    severity_counts: dict[str, int] = Field(default_factory=dict)
+    disposition_counts: dict[str, int] = Field(default_factory=dict)
+    highest_severity: Literal["none", "info", "warning", "error"] | None = None
     transitions: list[InspectionTransition] = Field(default_factory=list, max_length=32)
     findings: list[ValidatorFinding] = Field(default_factory=list, max_length=100)
     artifacts: list[str] = Field(default_factory=list, max_length=100)

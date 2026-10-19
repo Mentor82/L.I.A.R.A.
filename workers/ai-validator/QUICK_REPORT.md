@@ -68,7 +68,7 @@ $env:PERSISTENCE_POLICY = 'development'
 python -m pytest tests/unit/test_quick_report_policy.py tests/unit/test_validator_quick_findings.py tests/unit/test_validator_job_recovery.py tests/unit/test_self_observer.py tests/unit/test_memory_service_app.py -k 'not test_backed_store_persists_staging_and_proposals' -q
 ```
 
-119 passed, 1 deselected at this revision. The deselected test fails on the PR's
+Initial schema/policy validation: 119 passed, 1 deselected. The deselected test failed on the original PR's
 unchanged base due to missing `_relation_fallback_store`; its separate fix is not
 included here. Lease tests now stub execution, test both terminal outcomes, retain
 shutdown recovery coverage, and explicitly verify that an old fenced worker cannot
@@ -83,3 +83,58 @@ Python syntax error -> completed/failed. Source hashes stayed unchanged and no
 `__pycache__` appeared. Reports/logs are in the review worktree's ignored
 `artifacts/validator_jobs/container-*/attempt-*/` directories. No production
 services were restarted and no deployment was performed.
+
+## Observer and UI quality projection
+
+Rebased on main `9794bf5` (includes the separate Relations fix). The shared
+`services/validator/quality.py` now computes quality from the **full** typed result
+for both memory assurance and the Observer. The persisted SelfInspectionDecision
+keeps `quality_verdict`, `findings_total`, complete `severity_counts` and
+`disposition_counts`, and `highest_severity`; only the display preview is capped
+at 100. Gate re-evaluation preserves this projection; submitting a new job resets
+it. Nonzero exit remains an independent failure safeguard. Legacy/malformed or
+inconsistent summaries are unknown/attention, never implicitly passed. Full
+quality survives storage reload and is exposed through `/v1/inspection`.
+
+Cyclic submission and quiet remain blocked for failed/unknown/attention assurance.
+An explicit operator Canary may retry terminal failed, attention or unknown quality even if
+technical execution was completed; the existing healthy hardware/software,
+job-identity, active-job and endpoint authorization checks remain in force. This
+avoids trapping legacy records indefinitely without granting automatic work.
+
+Architecture UI now uses `inspection-quality.ts`: separate execution and quality
+labels, highest severity from the full summary, `100 von N`, and separate new vs
+accepted counts. Completed is not displayed as a passed quality verdict. Accepted
+info-only reports can display passed, while missing or inconsistent full data
+cannot. No production frontend process was restarted.
+
+Validation after rebase: 198 Python tests passed, 2 deselected. Those two unchanged
+storage tests depend on environment beyond this isolated checkout: the configured
+Qdrant health test expects globally healthy optional backends, and the graph
+cleanup stub test constructs SessionStore without REDIS_URL. The initial full run
+showed exactly those two failures (198 passed). They were not altered or silently
+given production credentials. Observer/API/persistence regressions include the
+100-info-plus-error and 100-info-plus-warning cases, info-only, nonzero exit without
+a preview error, missing exit/legacy quality, contradictory counts, re-evaluation,
+operator-only recovery and quiet blocking. A focused follow-up passed 93 tests.
+
+Five Node frontend formatting regressions passed; the TypeScript helper passed
+strict no-emit typechecking using the already installed TypeScript 5.9.3. Commands:
+
+```powershell
+$env:LIARA_TYPESCRIPT_PATH = 'C:\ai\LIARA\frontend\web-ui\node_modules\typescript'
+node --test tests/frontend/inspection-quality.test.cjs
+node "$env:LIARA_TYPESCRIPT_PATH\bin\tsc" --noEmit --strict --skipLibCheck --target ES2020 --module commonjs frontend/web-ui/src/app/architecture/inspection-quality.ts
+```
+
+This is formatter/contract verification, not a claimed production browser test or
+full Next.js build (the isolated tracked checkout lacks the complete frontend
+package/dependency setup). Baseline hashes/provenance remain integrity bindings,
+not signatures or independent proof of human approval. Cosmetic acceptance is
+reviewed nonblocking lint debt, not permission to auto-fix import side effects or
+proof that every diagnostic is an actual bug.
+
+A later full rerun encountered one transient Windows `os.replace` sharing/access
+error in an unchanged collector persistence test (197 passed, 2 deselected).
+Repeating the complete Self-Observer suite in a fresh temp directory passed 61/61;
+no unrelated persistence implementation was changed to mask this environment issue.

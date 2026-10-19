@@ -625,17 +625,9 @@ def _validator_assurance_verdict(result: ValidatorResultResponse) -> Literal["pe
     if result.state == "failed" or result.status.status == "failed":
         return "failed"
 
-    severities = {finding.severity for finding in result.findings}
-    raw_exit_code = result.summary.get("exit_code")
-    try:
-        exit_code = int(raw_exit_code) if raw_exit_code is not None else None
-    except (TypeError, ValueError):
-        exit_code = None
-    if "error" in severities or (exit_code is not None and exit_code != 0):
-        return "failed"
-    if "warning" in severities or exit_code is None:
-        return "attention"
-    return "passed"
+    from services.validator.quality import project_result
+    quality = project_result(result)["quality_verdict"]
+    return "attention" if quality == "unknown" else quality
 
 
 def _validator_assurance_evidence(

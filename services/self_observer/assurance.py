@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import uuid4
 
 import httpx
+from services.validator.quality import project_result, decision_quality, copy_quality
 
 from services.contracts.self_observer import (
     InspectionTransition,
@@ -116,6 +117,7 @@ class SelfInspectionGate:
                 raw_exit_code = result.summary.get("exit_code")
                 exit_code = int(raw_exit_code) if isinstance(raw_exit_code, (int, float)) else None
                 current = current.model_copy(update={
+                    **project_result(result),
                     "action": "completed" if result.state == "completed" else "failed",
                     "job_state": result.state,
                     "completed_at": now,
@@ -154,13 +156,14 @@ class SelfInspectionGate:
             )
         observed_at = current.completed_at or current.evaluated_at
         age = max(0.0, (now - observed_at).total_seconds())
-        highest = self._highest_severity(current)
+        highest = current.highest_severity or "unknown"
+        quality = decision_quality(current)
         stale = age > self.evidence_stale_seconds
         if current.job_state == "failed" or current.action == "failed":
             state = "degraded"
-        elif highest == "error":
+        elif quality == "failed":
             state = "degraded"
-        elif highest == "warning" or stale:
+        elif quality in {"attention", "unknown"} or stale:
             state = "attention"
         else:
             state = "healthy"
@@ -169,6 +172,8 @@ class SelfInspectionGate:
             signals.append("validator_job_failed")
         if current.findings:
             signals.append("validator_findings")
+        if quality == "unknown":
+            signals.append("validator_quality_unknown")
         if stale:
             signals.append("validator_evidence_stale")
         return StateEvidence(
@@ -182,7 +187,11 @@ class SelfInspectionGate:
             attributes={
                 "job_id": current.job_id,
                 "job_state": current.job_state,
-                "findings_count": len(current.findings),
+                "findings_count": current.findings_total,
+                "findings_preview_count": len(current.findings),
+                "quality_verdict": quality,
+                **{f"findings_{k}": v for k, v in current.severity_counts.items()},
+                **{f"disposition_{k}": v for k, v in current.disposition_counts.items()},
                 "highest_severity": highest,
                 "exit_code": current.exit_code,
                 "age_seconds": round(age, 3),
@@ -229,6 +238,7 @@ class SelfInspectionGate:
         eligible = not reasons
         action = "would_submit" if eligible and self.mode == "observe" else "none"
         decision = SelfInspectionDecision(
+            **copy_quality(self._last_decision),
             evaluated_at=now,
             mode=self.mode,
             eligible=eligible,
@@ -286,6 +296,7 @@ class SelfInspectionGate:
         if next_eligible_at and now < next_eligible_at and not failed_assurance_retry:
             blockers.append("minimum_interval_not_elapsed")
         decision = SelfInspectionDecision(
+            **copy_quality(current),
             evaluated_at=now,
             mode=self.mode,
             eligible=not blockers,
@@ -297,7 +308,7 @@ class SelfInspectionGate:
             reasons=blockers or [
                 f"operator_authorized:{reason}",
                 *(["operator_recovery_from_stale_assurance"] if stale_assurance_recovery else []),
-                *(["operator_retry_after_failed_assurance"] if failed_assurance_retry else []),
+                *([f"operator_retry_after_{decision_quality(current)}_assurance"] if failed_assurance_retry else []),
             ],
             minimum_interval_seconds=self.minimum_interval_seconds,
             last_submitted_at=last_submitted_at,
@@ -327,6 +338,7 @@ class SelfInspectionGate:
             "validator_evidence_stale",
             "validator_findings",
             "validator_job_failed",
+            "validator_quality_unknown",
             # Workload uncertainty prevents quiet phases, not an authorized
             # recovery of assurance. Domain health checks still apply below.
             "active_work_unknown",
@@ -351,14 +363,16 @@ class SelfInspectionGate:
         )
 
     def _is_failed_assurance_retry(self, state: SystemStateEnvelope) -> bool:
-        """Permit one authorized retry when a terminal validator failure is the only fault."""
+        """Permit an operator-only retry of terminal non-passing assurance."""
         current = self._last_decision
-        if current is None or current.job_state != "failed" or not current.job_id:
+        if (current is None or current.job_state not in {"completed", "failed"} or not current.job_id
+                or (current.job_state != "failed" and decision_quality(current) not in {"failed", "attention", "unknown"})):
             return False
         allowed_signals = {
             "validator_evidence_stale",
             "validator_findings",
             "validator_job_failed",
+            "validator_quality_unknown",
             # Workload uncertainty prevents quiet phases, not an authorized
             # recovery of assurance. Domain health checks still apply below.
             "active_work_unknown",
@@ -378,7 +392,7 @@ class SelfInspectionGate:
             and software.state == "healthy"
             and assurance.state in {"attention", "degraded"}
             and assurance.attributes.get("job_id") == current.job_id
-            and assurance.attributes.get("job_state") == "failed"
+            and assurance.attributes.get("job_state") == current.job_state
         )
 
     async def _submit(
@@ -432,6 +446,11 @@ class SelfInspectionGate:
             "job_state": submitted.state,
             "completed_at": None,
             "exit_code": None,
+            "quality_verdict": None,
+            "findings_total": None,
+            "severity_counts": {},
+            "disposition_counts": {},
+            "highest_severity": None,
             "transitions": transitions,
             "findings": [],
             "artifacts": [],
