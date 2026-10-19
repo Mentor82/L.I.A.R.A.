@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import gzip
 import json
 import os
 import socket
@@ -48,6 +49,9 @@ SERVICES: Dict[str, ServiceDef] = {
 }
 
 STALE_HEARTBEAT_SECONDS = 120
+AUDIT_ROTATE_BYTES = 16 * 1024 * 1024
+AUDIT_BACKUP_COUNT = 4
+AUDIT_STATUS_INTERVAL_SECONDS = 300
 
 
 class GuardError(RuntimeError):
@@ -93,6 +97,10 @@ class ServiceGuard:
         self.lock_dir = repo_root / "logs" / "service_locks"
         self.crash_dir = repo_root / "logs" / "crash_reports"
         self.guard_audit_path = self.logs_dir / "service_guard.jsonl"
+        self.audit_status_state_path = self.logs_dir / "service_guard.status_state.json"
+        self.audit_rotate_bytes = AUDIT_ROTATE_BYTES
+        self.audit_backup_count = AUDIT_BACKUP_COUNT
+        self.audit_status_interval_seconds = AUDIT_STATUS_INTERVAL_SECONDS
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         self.crash_dir.mkdir(parents=True, exist_ok=True)
@@ -110,12 +118,97 @@ class ServiceGuard:
             "result": str(outcome or "unknown"),
             "payload": result,
         }
+        line = json.dumps(event, ensure_ascii=True) + "\n"
         try:
-            with open(self.guard_audit_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+            with NamedMutex("liara-service-guard-audit-log"):
+                if not self._should_write_audit_event(command, service, str(outcome or "unknown")):
+                    return
+                self._rotate_audit_log_if_needed(len(line.encode("utf-8")))
+                with open(self.guard_audit_path, "a", encoding="utf-8") as handle:
+                    handle.write(line)
         except Exception:
             # Never fail service control operations just because audit logging failed.
             return
+
+    def _should_write_audit_event(self, command: str, service: str, outcome: str) -> bool:
+        """Keep status transitions plus a bounded heartbeat; retain all other actions."""
+        if command != "status":
+            return True
+
+        now = time.time()
+        state: dict = {}
+        try:
+            if self.audit_status_state_path.exists():
+                state = json.loads(self.audit_status_state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    state = {}
+        except Exception:
+            state = {}
+
+        previous = state.get(service, {})
+        previous_outcome = str(previous.get("result", "")) if isinstance(previous, dict) else ""
+        try:
+            previous_timestamp = float(previous.get("timestamp", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            previous_timestamp = 0.0
+
+        if (
+            previous_outcome == outcome
+            and now - previous_timestamp < self.audit_status_interval_seconds
+        ):
+            return False
+
+        state[service] = {"result": outcome, "timestamp": now}
+        temporary = self.audit_status_state_path.with_name(
+            f".{self.audit_status_state_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
+            os.replace(temporary, self.audit_status_state_path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            # If state persistence fails, prefer a duplicate audit event over losing one.
+        return True
+
+    def _audit_backup_path(self, index: int) -> Path:
+        return self.guard_audit_path.with_name(
+            f"{self.guard_audit_path.stem}.{index}{self.guard_audit_path.suffix}.gz"
+        )
+
+    def _rotate_audit_log_if_needed(self, incoming_bytes: int) -> None:
+        """Rotate the audit log while the caller holds the audit mutex."""
+        if not self.guard_audit_path.exists():
+            return
+        if self.guard_audit_path.stat().st_size + incoming_bytes <= self.audit_rotate_bytes:
+            return
+
+        oldest = self._audit_backup_path(self.audit_backup_count)
+        oldest.unlink(missing_ok=True)
+        for index in range(self.audit_backup_count - 1, 0, -1):
+            source = self._audit_backup_path(index)
+            if source.exists():
+                os.replace(source, self._audit_backup_path(index + 1))
+
+        staging = self.guard_audit_path.with_name(
+            f".{self.guard_audit_path.name}.{os.getpid()}.rotating"
+        )
+        compressed_temp = self.guard_audit_path.with_name(
+            f".{self.guard_audit_path.name}.{os.getpid()}.gz.tmp"
+        )
+        os.replace(self.guard_audit_path, staging)
+        try:
+            with open(staging, "rb") as source, gzip.open(
+                compressed_temp, "wb", compresslevel=6
+            ) as target:
+                while chunk := source.read(1024 * 1024):
+                    target.write(chunk)
+            os.replace(compressed_temp, self._audit_backup_path(1))
+            staging.unlink()
+        except Exception:
+            compressed_temp.unlink(missing_ok=True)
+            if staging.exists() and not self.guard_audit_path.exists():
+                os.replace(staging, self.guard_audit_path)
+            raise
 
     def lock_path(self, service: ServiceDef) -> Path:
         return self.lock_dir / f"{service.name}.lock.json"

@@ -29,7 +29,28 @@ async def _proxy_request(request: Request, path: str):
         content=body,
     )
 
-    response = await client.send(req, stream=True)
+    try:
+        response = await client.send(req, stream=True)
+    except httpx.ConnectError:
+        await client.aclose()
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Backend Service Unavailable",
+                "message": f"Could not connect to LIARA API at {TARGET_BASE_URL}. Ensure LIARA API (port 8010) is started.",
+                "path": path,
+            },
+        )
+    except Exception as exc:
+        await client.aclose()
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Bad Gateway",
+                "message": f"Proxy request failed: {exc}",
+                "path": path,
+            },
+        )
 
     resp_headers = dict(response.headers)
     resp_headers.pop("content-length", None)
