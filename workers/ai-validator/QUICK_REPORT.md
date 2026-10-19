@@ -102,6 +102,22 @@ technical execution was completed; the existing healthy hardware/software,
 job-identity, active-job and endpoint authorization checks remain in force. This
 avoids trapping legacy records indefinitely without granting automatic work.
 
+For this explicit operator recovery only, a terminal non-passing result bypasses
+`minimum_interval_seconds`; ordinary cyclic submission and other Canary attempts
+still enforce the interval. Recovery requires healthy hardware and software,
+matching assurance job ID/state, only the allowed recovery signals, and no queued
+or running validator job. The Canary endpoint must also be enabled and supplied
+with its valid bearer token; the retry is not triggered automatically.
+
+The endpoint consumes its single-use authorization after a successful submission
+in the current Observer process. This consumed flag is in memory: restarting the
+Observer resets it. With Canary enabled and a valid token, repeated explicit
+operator retries across process restarts can therefore bypass the interval again.
+This is an intentional operator recovery exception, not a persistent rate limit.
+Deployments requiring a retry limit across restarts need a separate persisted
+authorization/rate-limit mechanism. This PR does not introduce that mechanism or
+change stored configuration.
+
 Architecture UI now uses `inspection-quality.ts`: separate execution and quality
 labels, highest severity from the full summary, `100 von N`, and separate new vs
 accepted counts. Completed is not displayed as a passed quality verdict. Accepted
