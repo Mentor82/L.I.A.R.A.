@@ -1497,7 +1497,10 @@ class ContextStore:
             }
             # Chroma requires where to be non-empty or omitted entirely.
             if where:
-                kwargs["where"] = where
+                kwargs["where"] = (
+                    {"$and": [{key: value} for key, value in where.items()]}
+                    if len(where) > 1 else where
+                )
 
             results = self._collection.query(**{k: v for k, v in kwargs.items() if v is not None})
 

@@ -84,6 +84,7 @@ from services.contracts import (
 )
 from services.memory.governance import MemoryLifecycleGovernance
 from services.memory.stores.base import (
+    EphemeralMemoryStore,
     MemoryServiceStore,
     _append_embedding_request_audit,
     _build_session_summary_candidate,
@@ -121,6 +122,7 @@ class InMemoryMemoryServiceStore(MemoryServiceStore):
     """Small in-memory backing store for liara-memory endpoints."""
 
     def __init__(self):
+        self.session_store = EphemeralMemoryStore()
         self.history_by_session: Dict[str, List[MemoryMessageRecord]] = {}
         self.facts: Dict[Tuple[str, str], MemoryFactRecord] = {}
         self.retrieval_docs: Dict[str, RetrievalDocument] = {}
@@ -1069,6 +1071,9 @@ class InMemoryMemoryServiceStore(MemoryServiceStore):
         query_terms = self._tokenize(request.query)
         hits: List[ContextDocument] = []
         for doc_id, item in self._context_docs.items():
+            filters = request.scope.model_dump(exclude_none=True, exclude={"time_decay"})
+            if any(item.get("scope", {}).get(key) != value for key, value in filters.items()):
+                continue
             score = self._score_content(item["content"], query_terms)
             if request.min_score is not None and score < request.min_score:
                 continue

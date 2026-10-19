@@ -323,8 +323,11 @@ async def _write_session_snapshot(
             },
             ttl_seconds=getattr(SessionStore, "DEFAULT_TTL_SECONDS", 86400 * 30),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _CHAT_RUN_LOGGER.warning(
+            "Session snapshot write failed: session_id=%s run_id=%s error_type=%s",
+            session_id, last_run_id, type(exc).__name__,
+        )
 
 
 async def _emit_stream_progress(
@@ -550,8 +553,11 @@ async def _run_chat(
                 sandbox_root=effective_sandbox_root,
             )
             api_timings_ms["session_snapshot_write"] = round((time.perf_counter() - snapshot_write_started) * 1000, 3)
-        except Exception:
-            pass
+        except Exception as exc:
+            _CHAT_RUN_LOGGER.warning(
+                "Session snapshot write failed: session_id=%s run_id=%s error_type=%s",
+                request.session_id, run_id, type(exc).__name__,
+            )
 
         api_timings_ms["total"] = round((time.perf_counter() - run_started) * 1000, 3)
         metadata = {
@@ -778,8 +784,11 @@ async def _run_chat(
             session_id=request.session_id,
             user_id=request.user_id,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _CHAT_RUN_LOGGER.warning(
+            "Session snapshot write failed: session_id=%s run_id=%s error_type=%s",
+            request.session_id, run_id, type(exc).__name__,
+        )
 
     if context_debug.get("mode") == "MEMORY":
         await _emit_stream_progress(

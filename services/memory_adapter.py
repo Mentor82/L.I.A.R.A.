@@ -747,12 +747,28 @@ class RemoteMemoryAdapter(MemoryServiceAdapter):
         self._owns_client = client is None
 
     async def get(self, tier: MemoryTier, key: str, default: Any = None) -> Any:
-        del tier, key, default
-        raise NotImplementedError("RemoteMemoryAdapter does not expose generic tier get(); use typed memory contracts")
+        session_id = self._snapshot_session_id(tier, key)
+        payload = await self._post_json("/sessions/snapshot/read", {"session_id": session_id})
+        from services.contracts.session_snapshot import SessionSnapshotResponse
+        snapshot = SessionSnapshotResponse.model_validate(payload).snapshot
+        return default if snapshot is None else snapshot
 
     async def set(self, tier: MemoryTier, key: str, value: Any, ttl_seconds: Optional[int] = None) -> None:
-        del tier, key, value, ttl_seconds
-        raise NotImplementedError("RemoteMemoryAdapter does not expose generic tier set(); use typed memory contracts")
+        from services.contracts.session_snapshot import SessionSnapshotWriteRequest, SessionSnapshotResponse
+        from services.memory.tier_store import SessionStore
+        request = SessionSnapshotWriteRequest(
+            session_id=self._snapshot_session_id(tier, key), snapshot=value,
+            ttl_seconds=ttl_seconds if ttl_seconds is not None else SessionStore.DEFAULT_TTL_SECONDS,
+        )
+        SessionSnapshotResponse.model_validate(await self._post_json(
+            "/sessions/snapshot/write", request.model_dump(mode="json"),
+        ))
+
+    @staticmethod
+    def _snapshot_session_id(tier: MemoryTier, key: str) -> str:
+        if tier != MemoryTier.SESSION or not key.startswith("session:") or not key[len("session:"):]:
+            raise NotImplementedError("Use typed memory contracts; remote generic access is limited to session snapshots")
+        return key[len("session:"):]
 
     async def delete(self, tier: MemoryTier, key: str) -> None:
         del tier, key

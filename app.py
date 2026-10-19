@@ -960,8 +960,11 @@ async def _write_session_snapshot(
             },
             ttl_seconds=SessionStore.DEFAULT_TTL_SECONDS,
         )
-    except (MemoryError, NotImplementedError):
-        pass  # session snapshot is best-effort; not supported by RemoteMemoryAdapter
+    except (MemoryError, NotImplementedError) as exc:
+        _CHAT_RUN_LOGGER.warning(
+            "Session snapshot write failed: session_id=%s run_id=%s error_type=%s",
+            session_id, last_run_id, type(exc).__name__,
+        )
 
 
 def _build_session_response(
@@ -1564,8 +1567,11 @@ def create_api_app(
                     sandbox_root=effective_sandbox_root,
                 )
                 api_timings_ms["session_snapshot_write"] = round((time.perf_counter() - snapshot_write_started) * 1000, 3)
-            except Exception:
-                pass
+            except Exception as exc:
+                _CHAT_RUN_LOGGER.warning(
+                    "Session snapshot write failed: session_id=%s run_id=%s error_type=%s",
+                    request.session_id, run_id, type(exc).__name__,
+                )
 
             api_timings_ms["total"] = round((time.perf_counter() - run_started) * 1000, 3)
             metadata = {
@@ -1772,8 +1778,11 @@ def create_api_app(
                 session_id=request.session_id,
                 user_id=request.user_id,
             )
-        except Exception:
-            pass  # session snapshot is best-effort; chat response is already complete
+        except Exception as exc:
+            _CHAT_RUN_LOGGER.warning(
+                "Session snapshot write failed: session_id=%s run_id=%s error_type=%s",
+                request.session_id, run_id, type(exc).__name__,
+            )
         # Emit this signal only when prior session memory influenced the answer.
         if context_debug.get("mode") == "MEMORY":
             await _emit_stream_progress(

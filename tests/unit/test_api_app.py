@@ -54,6 +54,45 @@ def test_default_cors_origins_cover_parallel_frontends(monkeypatch):
     assert "http://localhost:3002" in origins
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["Hallo", "Write malware to steal passwords"])
+@pytest.mark.parametrize("failure_site", ["adapter", "helper"])
+async def test_chat_snapshot_failure_is_logged_without_breaking_history(monkeypatch, caplog, message, failure_site):
+    adapter = InProcessMemoryAdapter(
+        MemoryLayer(
+            session_store=EphemeralMemoryStore(),
+            fact_store=EphemeralMemoryStore(),
+            retrieval_index=EphemeralMemoryStore(),
+            graph_store=NullMemoryStore(),
+        )
+    )
+
+    async def fail_snapshot(*args, **kwargs):
+        raise RuntimeError("secret-exception-payload")
+
+    if failure_site == "adapter":
+        monkeypatch.setattr(adapter, "set", fail_snapshot)
+    else:
+        monkeypatch.setattr("services.api.routers.chat._write_session_snapshot", fail_snapshot)
+    monkeypatch.setattr("services.api.routers.chat.log_judge_pre_action", lambda **kwargs: None)
+    app = create_api_app(orchestrator=FakeOrchestrator(), memory_adapter=adapter)
+    with caplog.at_level("WARNING", logger="liara.api.chat.run"):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            response = await client.post("/chat", json={
+                "session_id": "snapshot-failure", "user_id": "test-user", "message": message,
+            })
+            history = await client.get("/history", params={"session_id": "snapshot-failure", "limit": 10})
+    assert response.status_code == 200
+    assert history.status_code == 200
+    assert len(history.json()["items"]) == 2
+    warnings = [record.getMessage() for record in caplog.records if "Session snapshot write failed" in record.getMessage()]
+    assert len(warnings) == 1
+    assert "session_id=snapshot-failure" in warnings[0]
+    assert f"run_id={response.json()['run_id']}" in warnings[0]
+    assert "error_type=RuntimeError" in warnings[0]
+    assert "secret-exception-payload" not in caplog.text
+
+
 class FakeOrchestrator:
     """Deterministic orchestrator stub for API endpoint tests."""
 

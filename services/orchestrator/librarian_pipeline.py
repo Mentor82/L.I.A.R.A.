@@ -300,8 +300,8 @@ async def upsert_memory_commit_embedding(
         return False
     try:
         upsert_req = ContextUpsertRequest(
-            scope=ContextScope.SESSION,
-            session_id=session_id,
+            document_id=f"memory_commit:{session_id}:{run_id}",
+            scope=ContextScope(session_id=session_id, run_id=run_id),
             content=content,
             metadata={
                 "user_id": user_id,
@@ -310,8 +310,8 @@ async def upsert_memory_commit_embedding(
                 **(metadata or {}),
             },
         )
-        res = await orchestrator.memory.upsert_context(upsert_req)
-        return bool(res and getattr(res, "status", None) == "success")
+        res = await orchestrator.memory.context_upsert(upsert_req)
+        return bool(res and res.status.status == "success")
     except Exception as exc:
         _LOGGER.warning("Failed to commit memory embedding: %s", exc)
         return False

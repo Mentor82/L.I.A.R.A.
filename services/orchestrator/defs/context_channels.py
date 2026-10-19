@@ -3,7 +3,12 @@ from typing import Any, Callable, Dict, List
 
 
 def merge_context_channels(channels: Dict[str, str]) -> str:
+    history = "\n".join(
+        f"{item.role}: {item.content}" for item in channels.get("history", [])
+        if getattr(item, "content", None)
+    )
     ordered = [
+        history,
         channels.get("fact_context", ""),
         channels.get("memory_context", ""),
         channels.get("relation_context", ""),

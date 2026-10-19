@@ -439,6 +439,8 @@ class Orchestrator:
 
         # 5. LLM Generation
         formatted_context = merge_context_channels(context_channels)
+        if profile_history and not context_channels.get("history"):
+            formatted_context = "\n".join(part for part in (profile_history, formatted_context) if part)
         gen_res = await self._generate_llm_response(
             run_id,
             request.query,

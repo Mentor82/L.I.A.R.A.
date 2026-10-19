@@ -8,6 +8,12 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from services.contracts.session_snapshot import (
+	SessionSnapshotReadRequest,
+	SessionSnapshotWriteRequest,
+	SessionSnapshotResponse,
+)
+
 from services.contracts import (
 	MemoryEmbeddingRequest,
 	MemoryEmbeddingResponse,
@@ -80,6 +86,15 @@ def create_memory_service_app(store: MemoryServiceStore | None = None) -> FastAP
 	"""Build a typed FastAPI app for liara-memory endpoints."""
 	app = FastAPI(title="liara-memory")
 	backing_store = store or create_default_memory_service_store()
+
+	@app.post("/sessions/snapshot/read", response_model=SessionSnapshotResponse)
+	async def read_session_snapshot(request: SessionSnapshotReadRequest) -> SessionSnapshotResponse:
+		return SessionSnapshotResponse(snapshot=await backing_store.get_session_snapshot(request.session_id))
+
+	@app.post("/sessions/snapshot/write", response_model=SessionSnapshotResponse)
+	async def write_session_snapshot(request: SessionSnapshotWriteRequest) -> SessionSnapshotResponse:
+		await backing_store.set_session_snapshot(request.session_id, request.snapshot, request.ttl_seconds)
+		return SessionSnapshotResponse(snapshot=request.snapshot)
 
 	@app.post("/history/append", response_model=MemoryHistoryResponse)
 	async def append_history(request: MemoryHistoryAppendRequest) -> MemoryHistoryResponse:
