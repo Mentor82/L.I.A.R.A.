@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from services.api.exceptions import UnauthorizedPrincipalError
 from services.api.routers import compute as compute_router
+from services.config import Settings
 from services.judge.contracts import JudgeDecision
 
 _BODY = {
@@ -38,9 +39,20 @@ class _FakeTool:
 
 
 @pytest.fixture
-def client_for(monkeypatch):
+def audit_log(monkeypatch):
+    entries = []
+    monkeypatch.setattr(compute_router, "log_judge_pre_action", lambda **kwargs: entries.append(kwargs))
+    return entries
+
+
+@pytest.fixture
+def client_for(monkeypatch, audit_log):
     _FakeTool.calls = []
     monkeypatch.setattr(compute_router, "ComputeGenerateTool", _FakeTool)
+    # Development auth unless a test opts into fail-closed explicitly.
+    monkeypatch.delenv("LIARA_ENV", raising=False)
+    monkeypatch.setenv("LIARA_FAIL_CLOSED_AUTH", "false")
+    monkeypatch.setattr(Settings, "LIARA_FAIL_CLOSED_AUTH", False)
 
     def build(judge):
         app = FastAPI()
@@ -57,13 +69,17 @@ def client_for(monkeypatch):
     return build
 
 
-def test_judge_block_stops_generation(client_for):
+def test_judge_block_stops_generation(client_for, audit_log):
     judge = _FakeJudge(JudgeDecision.block(issues=["Model name is empty."]))
     resp = client_for(judge).post("/compute/generate", json=_BODY)
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["decision"] == "block"
     assert _FakeTool.calls == []
+    (entry,) = audit_log
+    assert entry["tool_name"] == "compute.generate"
+    assert entry["decision"] == "block"
+    assert entry["issues"] == ["Model name is empty."]
 
 
 def test_judge_allow_runs_generation_with_verified_actor(client_for):
@@ -78,19 +94,22 @@ def test_judge_allow_runs_generation_with_verified_actor(client_for):
     assert context.input == _BODY
 
 
-def test_judge_failure_fails_closed(client_for):
+def test_judge_failure_fails_closed_without_leaking_error(client_for, audit_log):
     class _BrokenJudge:
         def evaluate_pre_action(self, context):
-            raise RuntimeError("judge down")
+            raise RuntimeError("judge down at /secret/path")
 
     resp = client_for(_BrokenJudge()).post("/compute/generate", json=_BODY)
 
     assert resp.status_code == 403
+    assert "secret" not in resp.text
     assert _FakeTool.calls == []
+    assert [entry["decision"] for entry in audit_log] == ["block"]
 
 
 def test_missing_credentials_rejected_when_fail_closed(client_for, monkeypatch):
     monkeypatch.setenv("LIARA_FAIL_CLOSED_AUTH", "true")
+    monkeypatch.setattr(Settings, "LIARA_FAIL_CLOSED_AUTH", True)
     judge = _FakeJudge(JudgeDecision.allow())
     resp = client_for(judge).post("/compute/generate", json=_BODY)
 

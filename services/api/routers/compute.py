@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -12,8 +13,10 @@ from services.judge.engine import JudgeEngine
 from services.simulation.bridge import JuliaBridge
 from services.simulation.runner import SimulationRunner
 from services.tools.builtin.compute_generate import ComputeGenerateTool
+from services.tools.builtin.sys_audit import log_judge_pre_action
 
 
+_LOGGER = logging.getLogger(__name__)
 router = APIRouter(prefix="/compute", tags=["compute"])
 
 
@@ -93,10 +96,25 @@ async def compute_generate(
         input=body,
         metadata={"source": "api", "principal_source": principal.source},
     )
+    audit = {
+        "tool_name": "compute.generate",
+        "request_id": context.request_id,
+        "run_id": context.request_id,
+        "source": "api",
+        "context": "api.compute.generate",
+    }
     try:
         decision = _judge_engine(request).evaluate_pre_action(context)
     except Exception as exc:
-        raise HTTPException(status_code=403, detail=f"Pre-action judge failure (fail-closed): {exc}") from exc
+        _LOGGER.error("Pre-action judge failed for compute.generate (fail-closed): %s", exc)
+        log_judge_pre_action(decision="block", issues=["Pre-action judge failure (fail-closed)."], **audit)
+        raise HTTPException(status_code=403, detail="Pre-action judge failure (fail-closed)") from exc
+    log_judge_pre_action(
+        decision=decision.decision.value,
+        issues=decision.issues,
+        constraints=decision.constraints,
+        **audit,
+    )
     if not decision.passed:
         raise HTTPException(
             status_code=403,
