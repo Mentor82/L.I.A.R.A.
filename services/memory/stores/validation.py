@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -278,6 +279,13 @@ def _execute_docker_compose_validator_job(*, job_id: str, workspace: str, scope:
 
     validator_command = _validator_scope_to_command(scope, checks)
     command = [docker_cli, "compose", "-f", compose_file, "run", "--rm", "ai-validator", validator_command]
+    if validator_command == "quick":
+        runner = os.path.abspath(os.path.join(worker_root, "quick_validate.py"))
+        command = [docker_cli, "compose", "-f", compose_file, "run", "--rm", "--no-deps",
+                   "-v", f"{runner}:/opt/liara-quick.py:ro",
+                   "-v", f"{artifacts_dir}:/reports", "--entrypoint", "python3",
+                   "ai-validator", "/opt/liara-quick.py", "--workspace", "/workspace",
+                   "--report", "/reports/quick-report.json"]
     env = os.environ.copy()
     env["WORKSPACE_PATH"] = validator_workspace
     env["STRICT_MODE"] = "true" if strict_mode else "false"
@@ -330,6 +338,17 @@ def _execute_docker_compose_validator_job(*, job_id: str, workspace: str, scope:
 
     state: Literal["completed", "failed"] = "completed" if completed.returncode == 0 else "failed"
     findings: list[dict[str, Any]] = []
+    if validator_command == "quick":
+        try:
+            with open(os.path.join(artifacts_dir, "quick-report.json"), encoding="utf-8") as report_file:
+                report = json.load(report_file)
+            findings = list(report["findings"])
+            if report["exit_code"] != 0 or findings:
+                state = "failed"
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            state = "failed"
+            findings.append({"severity": "error", "rule": "quick_report_invalid",
+                             "message": f"Missing or invalid quick report: {exc}"})
     if completed.returncode != 0:
         findings.append(
             {
@@ -355,7 +374,9 @@ def _execute_docker_compose_validator_job(*, job_id: str, workspace: str, scope:
             "findings_count": len(findings),
         },
         "findings": findings,
-        "artifacts": [log_path],
+        "artifacts": [log_path] + (
+            [os.path.join(artifacts_dir, "quick-report.json")] if validator_command == "quick" else []
+        ),
     }
 
 
