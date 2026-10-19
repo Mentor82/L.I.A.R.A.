@@ -1,4 +1,6 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 import asyncio
 
@@ -187,7 +189,8 @@ class TestAuditTimelinePaneHelpers:
         assert captured == {"session_id": None, "limit": 50, "event_types": ["score_feedback"]}
         assert "Event type filter: score_feedback" in widget.content
 
-    def test_refresh_applies_time_window_filter(self, monkeypatch):
+    @pytest.mark.parametrize("timestamp_zone", [None, timezone.utc, timezone(timedelta(hours=2))])
+    def test_refresh_applies_time_window_filter(self, monkeypatch, timestamp_zone):
         pane = AuditTimelinePane()
 
         class _FakeScreen:
@@ -201,7 +204,7 @@ class TestAuditTimelinePaneHelpers:
                 self.content = text
 
         widget = _FakeWidget()
-        now = datetime.now()
+        now = datetime.now(timestamp_zone)
         fresh = AuditEvent(
             event_id="fresh",
             session_id="session-a",
